@@ -16,8 +16,8 @@ from drivemerge.config import Config, RemoteConfig, SafetyConfig, sync_remotes
 Q = ".drive-merge-quarantine"
 
 
-def md5(text: str) -> str:
-    return hashlib.md5(text.encode()).hexdigest()
+def sha256(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()
 
 
 @pytest.fixture
@@ -26,9 +26,9 @@ def world(conn, catalog):
     g = catalog.remote("gd", "drive")
     d = catalog.remote("dbx", "dropbox")
     for name in ("one.docx", "two.docx", "three.docx"):
-        catalog.file(g, f"Research/Thesis/{name}", size=10, md5=md5(name))
-        catalog.file(d, f"{Q}/7/School/Thesis/{name}", size=10, md5=md5(name))
-    catalog.file(d, "School/keep.txt", size=5, md5=md5("keep"))
+        catalog.file(g, f"Research/Thesis/{name}", size=10, sha256=sha256(name))
+        catalog.file(d, f"{Q}/7/School/Thesis/{name}", size=10, sha256=sha256(name))
+    catalog.file(d, "School/keep.txt", size=5, sha256=sha256("keep"))
     identity.rebuild_groups(conn)
     dirstats.refresh(conn)
     return conn, g, d
@@ -85,9 +85,9 @@ def test_a_group_forgets_a_file_that_moves_into_quarantine(world):
     conn, g, d = world
     e = conn.execute("SELECT id FROM entries WHERE remote_id = ? AND path = 'School/keep.txt'", (d,)).fetchone()[0]
     twin = conn.execute("INSERT INTO entries(remote_id, entry_key, path, parent, name, name_norm, ext, category, "
-                        "is_dir, size, md5, present, first_seen_scan, last_seen_scan, row_version) "
+                        "is_dir, size, sha256, present, first_seen_scan, last_seen_scan, row_version) "
                         "SELECT remote_id, 'p:Docs/keep.txt', 'Docs/keep.txt', 'Docs', 'keep.txt', 'keep.txt', 'txt', "
-                        "category, 0, size, md5, 1, first_seen_scan, last_seen_scan, row_version "
+                        "category, 0, size, sha256, 1, first_seen_scan, last_seen_scan, row_version "
                         "FROM entries WHERE id = ? RETURNING id", (e,)).fetchone()[0]
     identity.rebuild_groups(conn)
     assert len(identity.duplicate_groups(conn)) == 1

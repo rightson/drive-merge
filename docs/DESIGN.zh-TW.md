@@ -33,10 +33,11 @@ rclone 負責所有雲端 I/O；drive-merge 負責目錄、身分判定、規劃
 
 | 事實 | 後果 |
 |---|---|
-| **四朵雲沒有共同的 hash**：Drive = md5/sha1/sha256、Dropbox = dropbox content hash、OneDrive = QuickXorHash、iCloud = 無（rclone v1.75 overview） | 跨雲去重無法單靠清單比對。採 **hash bridging**：同一內容只下載**一份**，本機一次算出 5 種 hash，即可用其他雲各自原生的 hash 證明它們是同一內容，不必再下載它們。 |
+| **四朵雲沒有共同的 hash**：Drive = md5/sha1/sha256、Dropbox = dropbox content hash、OneDrive = QuickXorHash、iCloud = 無（rclone v1.75 overview） | 跨雲去重無法單靠清單比對。採 **hash bridging**：同一內容只下載**一份**，本機一次算出 5 種 hash，即可用其他雲各自原生的強 hash（見下列）證明它們是同一內容，不必再下載它們。 |
+| **不是每種 hash 都能證明身分**：md5 與 sha1 都已有實用的碰撞攻擊（每個回報 sha1 的雲端，也就是 Drive，也都會回報 sha256，所以不信任它不會損失什麼），QuickXorHash 則是 160 位元的 XOR 折疊（同大小、且 160 位元組的資料列只是彼此排列重組的檔案，會得到相同的值；在以紀錄為單位的資料中可能偶然發生，也可能是刻意製造） | 只有 **sha256 與 Dropbox hash**（以 SHA-256 為基礎）算作證明（*強*類型）。md5、sha1 與 QuickXorHash（*弱*類型）可以證明兩個檔案不同、縮小 bridging 的候選，但兩者相符並不能證明任何事。因此只有 QuickXorHash 的 OneDrive 檔案，與 iCloud 檔案一樣，必須在**它自己**的位元組被下載並計算 hash 之後才算 exact；以 Drive 副本做出的 bridge 不能為它作保。 |
 | 「大小不同 ⇒ 內容必不同」 | 大小是免費的第一層篩選。只有「同大小且跨 hash 網域」的檔案才需要 bridging，下載量遠小於總量。 |
 | **Drive 允許同一路徑有多個檔案** | 目錄中 entry 的身分是 provider ID（`entry_key = id:<ID>`），不是路徑；同路徑多檔會被標為 `AMBIGUOUS_PATH`，在解決前不允許對它下任何操作。 |
-| Dropbox/OneDrive **不分大小寫**，Drive/iCloud 分 | 跨雲搬移會產生大小寫衝突；模擬器檢查 `CASE_COLLISION`。 |
+| Dropbox/OneDrive **不分大小寫**，Drive/iCloud 分；本機磁碟則看平台（macOS 與 Windows 不分，Linux 分） | 跨雲搬移會產生大小寫衝突；模擬器檢查 `CASE_COLLISION`。`[[remotes]]` 項目可用 `case_insensitive` 覆寫提供者的預設值（例如 exFAT 磁碟上的 `local` remote）；`local` 的預設值依平台而定。在這種 remote 上只改大小寫的更名（`Docs` 改成 `docs`）無法逐檔執行，所以 executor 會拒絕它，而不是把該檔案當成它自己的重複檔。 |
 | macOS/iCloud 檔名常為 **Unicode NFD** | 比對用 `name_norm = NFC + casefold`。 |
 | **Google 原生文件**（Docs/Sheets）沒有位元組也沒有 hash | 標記 `is_native_doc`；不參與去重；不允許跨雲複製或刪除；在 Drive 內移動可以。 |
 | **iCloud（rclone `iclouddrive`）** 屬實驗性後端：無 hash、無伺服器端複製/搬移、trust token 30 天到期、Photos 唯讀 | iCloud 視為「來源」而非目標；其檔案只能是「疑似重複」，直到被 bridging 證明。替代接入方式見 D7。 |
@@ -73,12 +74,14 @@ rclone 負責所有雲端 I/O；drive-merge 負責目錄、身分判定、規劃
 | `scans` | 每次掃描一筆；只有 `complete` 的掃描會把沒看到的檔案標為 tombstone |
 | `entries` | 每個檔案/資料夾一筆：路徑、名稱、`name_norm`、副檔名、類別、大小、mtime、MIME、provider ID、5 種 hash、`content_group`、`present`、`row_version` |
 | `entries_fts` | FTS5 **trigram** 索引（name, path）：子字串搜尋、支援中日文；少於 3 字元的查詢退回 LIKE |
-| `hash_bridges` | 由本機下載計算的 5 種 hash（一列 = 一份內容），把不同 hash 網域串起來 |
+| `hash_bridges` / `bridge_sources` | 由本機下載計算的 5 種 hash（一列 = 一份內容），把不同 hash 網域串起來；`bridge_sources` 記錄哪些 catalog 項目的位元組本身被算過 hash，這個連結只在該項目的大小與 mtime 都沒變時才成立 |
 | `plans` / `plan_ops` | 計畫與其操作（copy / move / delete），寫入後不可變 |
 | `simulations` | 每次模擬的完整報告（JSON）與 digest |
 | `journal` | 只增不改的稽核紀錄：核准、每次實際雲端操作、錯誤 |
 
 **增量掃描**：upsert by `(remote_id, entry_key)`；只有「可觀察的變化」才遞增 `row_version`，所以重掃一個沒變的雲端不會產生任何變更事件。內容（大小/hash）改變時 `content_group` 清空，等待重算。
+
+**掃描安全**：同一個 remote 同一時間只會跑一個掃描；啟動另一個會把較舊的標為失敗，較舊的那個在下一次寫入時就會停止（`ScanSuperseded`），不會把較新的列表仍看得到的檔案標為已刪除。列表若少掉先前存在的大部分項目，會引發 `SuspiciousScan`，且除非加 `--force`，否則不標記任何刪除；這也包括：在被掃描的子樹中，先前看過 5 個以上的項目、列表卻一個都沒有的情況。掃描子路徑（`--root`）時也會一併儲存該路徑上方的資料夾，讓 catalog 仍可瀏覽。同一份列表中若有多個項目的 key 相同（例如只差在無效 UTF-8 位元組、但 rclone 印出來完全一樣的名稱），每個項目都會保留成獨立的一列，key 存成 `<key>#2`、`<key>#3`……，並像 Drive 的重複路徑一樣標上 `AMBIGUOUS_PATH`；掃描會回報共有幾個。掃描若在已提交部分批次後失敗，資料夾計數（`dir_stats`）仍會與那些列保持一致。在不分大小寫的 remote 上，你輸入的子路徑會改寫成 catalog 已有的拼法。
 
 ## 5. 內容身分與去重
 
@@ -86,13 +89,13 @@ rclone 負責所有雲端 I/O；drive-merge 負責目錄、身分判定、規劃
 
 | 等級 | 判定 | 可以作為刪除依據？ |
 |---|---|---|
-| **exact** | 同大小且共享任一同類 hash 值（遞移），或經 `hash_bridges` 連通 | 可以 |
-| **probable** | 同大小 + 同 `name_norm`，但沒有 hash 證明（例如 iCloud） | **不行**（預設）；需先 bridging 升級為 exact |
+| **exact** | 同大小且共享**強** hash 值（sha256 或 Dropbox hash）而類型相同（遞移），或經 `hash_bridges` 連通；沒有強 hash 的檔案，只有透過以它自己的下載做出的 bridge 才算 exact | 可以 |
+| **probable** | 同大小 + 同 `name_norm`，沒有 hash 證明（例如 iCloud，或只有 QuickXorHash 的 OneDrive），且副本之中沒有任何兩份已被證明不同 | **不行**（預設）；需先 bridging 升級為 exact |
 | （size-only） | 只有大小相同 | 僅作為 bridging 候選 |
 
-演算法：對 live 檔案做 union-find，邊為 `(hash 類型, 值, 大小)` 相同，以及 bridge 列連接的所有 hash；`content_group` = 連通分量中最小的 entry id（決定性）。百萬級 entries 以 SQL 排序後線性合併，不做 O(n²) 比對。
+演算法：對 live 檔案做 union-find，邊為 `(強 hash 類型, 值, 大小)` 相同，以及 bridge 列連接的所有強 hash；`content_group` = 連通分量中最小的 entry id（決定性）。百萬級 entries 以 SQL 排序後線性合併，不做 O(n²) 比對。md5、sha1 與 QuickXorHash 絕不會把任何東西連起來；它們只會拒絕連結（同一種 hash 類型回報不同值的兩個檔案就是不同，所以共享的 sha256 不能把它們融合），並用來修剪 bridging 候選與 probable 清單。以某檔案自己的下載做出的 bridge，只在該檔案的大小與 mtime 仍與當時計算 hash 時相同的期間才連結它；任何重掃只要看到變化，連結就中斷。由舊版（md5、sha1 或 QuickXorHash 曾能連結檔案的版本）分好群組的 catalog，會在被這個版本第一次開啟時重新分組一次。
 
-**Bridging 工作流**（只讀）：`bridge_candidates` 找出「同大小且跨 hash 網域、尚未被證明」的類別，每類挑一個最便宜下載的副本，依「可省空間 = 大小 × 未決副本數」排序，受 `--max-bytes` 預算限制；下載 → 本機一次算 5 種 hash → 驗證與該檔原生 hash 一致 → 寫入 `hash_bridges` → 重算群組。
+**Bridging 工作流**（只讀）：`bridge_candidates` 找出「同大小且跨 hash 網域、尚未被證明」的類別，每類挑一個最便宜下載的副本，依「可省空間 = 大小 × 未決副本數」排序，受 `--max-bytes` 預算限制；下載 → 本機一次算 5 種 hash → 驗證與該檔原生 hash 一致 → 寫入 `hash_bridges` → 重算群組。Drive 與 Dropbox 的副本，下載其中一份就能確定。沒有強 hash、且在另一朵雲上有同大小對應檔的每個檔案（OneDrive、iCloud）都需要自己的下載，因為由另一份副本做出的 bridge 只能為「強 hash 與它相符」的副本作保；已被共享的 md5、sha1 或 QuickXorHash 值證明不同的對應檔不計入，而強 hash 與 mtime 兩者都沒有的檔案絕不會被提出，因為下載後也無法把結果對回該檔案。
 
 **保留哪一份（keeper policy，D5）**：目標雲 > `prefer_remotes` 指定的雲（依序）> 非「副本樣式」路徑（`Copy of`、`(1)`、`conflicted copy`、`副本`…）> 提供者（drive > onedrive > dropbox > local > other > iclouddrive：有原生 hash 與伺服器端搬移的副本最便宜驗證、也最便宜保留，靠 bridging 才證明的 iCloud 副本墊底）> 較淺路徑 > 較早 mtime > 較小 entry id。
 
@@ -127,14 +130,16 @@ rclone 負責所有雲端 I/O；drive-merge 負責目錄、身分判定、規劃
 報告含每朵雲 before/after 的檔案數與位元組、跨雲傳輸量、內容數 before/after、變更樣本。
 
 ### 7.2 核准
-- 核准綁定 **digest = sha256(plan id + 所有 ops + 目錄快照)**。任何重掃（快照改變）或重新模擬都會讓核准失效。
-- 必須輸入 digest 前 8 碼確認，且 **CLI 只在互動式 TTY 接受核准**。
+- 核准綁定 **digest = HMAC-SHA256(plan id + 所有 ops + 目錄快照)**，以一把只存在這份 catalog 的 `meta` 資料表、絕不外送的隨機祕密金鑰作為金鑰。任何重掃（快照改變）或重新模擬都會讓核准失效。金鑰是讓確認碼無法被猜出的關鍵：ops 與快照任何 API 用戶端都讀得到，所以對它們做的無金鑰雜湊，沒看過確認碼的人也能自行重算。
+- 必須輸入 digest 前 8 碼確認，且 **CLI 只在互動式 TTY 接受核准**。digest、確認碼與快照只會顯示給真人（CLI 的 `plan approve`，或已啟用核准的瀏覽器 session 的工作區預覽）；REST API 的每個計畫路由、MCP 工具與 `--json` 輸出都會把它們去掉。
 - **MCP server 不提供 approve/execute 工具**；repo 內的 `.claude/settings.json` 也拒絕 Claude Code 執行 `drivemerge plan approve` / `execute` / `purge`。
 - 總開關 `safety.execution_enabled = false`（預設），未開啟時 executor 拒絕執行。
 
 ### 7.3 執行（`executor.py`）
 - 逐 op、遇錯即停（fail-closed）。每個 op 執行前**即時 stat** 來源，大小/hash 與計畫快照不符就停止。
 - **copy**：`rclone copyto --ignore-existing`，完成後驗證目的地；跨 hash 網域時用 bridge 或下載目的地重算來驗證，**驗證通過前，依賴它的 delete 不會執行**。
+- **執行當下的身分證明。** 在 delete（它的見證）之前、在搬移或複製到已存在的檔案之前，以及在 purge 重新檢查它的見證之前，executor 都會即時比對兩個檔案：先看兩朵雲都回報的強原生 hash，再看 bridge，最後才是把沒有強 hash 的每一邊下載下來、比對 sha256。弱 hash（md5、sha1、QuickXorHash）相符絕不算「相同」，而它不同仍然代表「不同」。伺服器端搬移之後，新路徑上的物件也會以大小與 md5/sha1/QuickXorHash 對照來源，因為分辨一個物件是不是它自己不需要抗碰撞性（OneDrive 資料庫可以重新整理而不必下載每個檔案）。
+- **不信任路徑一定指向兩個物件。** 搬移到已存在的檔案上、或見證的路徑與來源只差在大小寫或 Unicode 形式時，它可能就是該檔案本身（不分大小寫的雲端，或設定檔沒有標示、但在 macOS 或 Windows 上的本機磁碟）。executor 會把它視為同一個物件，除非列出兩種拼法開始分歧的第一層資料夾後，能看到兩個名稱都在；列表失敗則該操作失敗。因此只改大小寫的更名會被拒絕，絕不會被當成「刪除重複檔」執行。
 - **delete = 移到同一朵雲的隔離區** `.drive-merge-quarantine/<plan-id>/<原路徑>`（伺服器端搬移，可還原；`drivemerge plan restore` 一鍵還原）。真正刪除是另一個指令 `purge`，預設保留 30 天，同樣需要 TTY 核准。
 - 每一步寫入 `journal`。
 - **隔離區內的檔案不算 live 內容**：重掃會看到它們，但身分判定（群組、重複清單、bridging 候選）與資料夾建議一律略過，所以被清掉的副本不會又變成「重複檔」。它們仍計入檔案數與容量。隔離資料夾名稱（`[safety] quarantine_dir`）由 `sync_remotes` 記在 catalog 的 `meta`，讓只拿到連線的模組也能一致判斷。
@@ -161,7 +166,7 @@ LLM（Claude Code、其他聊天介面）能做的：搜尋、看統計與 folde
 ## 9. 介面
 
 - **CLI** `drivemerge`：`init`、`remotes`、`scan`、`identity rebuild`、`bridge`、`search`、`stats`、`duplicates`、`profiles`、`rules check/preview`、`plan dedupe|consolidate|reorganize|show|simulate|approve|execute|restore|purge`、`changes`、`serve`、`mcp`、`rclone-combine`。
-- **REST API**（只綁 127.0.0.1，Bearer token）：`/v1/stats`、`/v1/search`、`/v1/entries/{id}`、`/v1/entries/{id}/locations`、`/v1/duplicates`、`/v1/profiles`、`/v1/changes`、`/v1/plans`（建立/列出/模擬/報告）。核准與執行**不經 API**（只能在 CLI/TTY）。
+- **REST API**（只綁 127.0.0.1，Bearer token）：`/v1/stats`、`/v1/search`、`/v1/entries/{id}`、`/v1/entries/{id}/locations`、`/v1/duplicates`、`/v1/profiles`、`/v1/changes`、`/v1/plans`（建立/列出/模擬/報告）。核准與執行**不經 API**（只能在 CLI/TTY）。沒有任何計畫路由（列出、顯示、建立、模擬，或工作區伺服器的進度 journal）會回傳 digest、確認碼或快照；建立計畫時也會拒絕參數 `draft_id` 與 `draft_version`，它們只有工作區預覽才會設定：只有當計畫就是某份草稿自己的預覽時，執行該計畫才會結束那份工作區草稿。
 - **MCP（給 Claude Code）**：`search_files`、`catalog_stats`、`find_duplicates`、`file_locations`、`folder_profiles`、`validate_rules`、`preview_layout`、`propose_plan`、`simulate_plan`、`get_plan`。
 
 ## 10. 同步到外部資料庫
@@ -211,6 +216,10 @@ LLM（Claude Code、其他聊天介面）能做的：搜尋、看統計與 folde
 - **跨雲複製會經過本機頻寬**（rclone 串流，不落地）；大量遷移需時間與頻寬規劃。
 - **Drive 同路徑多檔**：需先用 `rclone dedupe` 或人工處理，drive-merge 不會對其操作。
 - **隔離區佔用容量**：收斂期間目標雲需預留空間；模擬報告的 `QUOTA` 檢查會提示。
+- **hash 碰撞是明文的不變式。** 身分判定只依賴抗碰撞的 hash（sha256、Dropbox hash）；md5、sha1 與 QuickXorHash 可以排除檔案，但絕不能納入檔案。代價是 OneDrive 的重複檔在每一份副本都被下載過一次之前，一直是*疑似*（`drivemerge bridge` 會做這件事，每個 OneDrive 檔案下載一次，而不是每份內容一次）；計畫中 OneDrive 到 OneDrive 的複製，要把副本讀回來驗證；而 OneDrive 比重高的 catalog，身分統計中的已計算 hash 檔案數會變少。sha1 歸類為弱，因為已有實用的碰撞攻擊；由於每個回報它的雲端（Drive）也都會回報 sha256，所以沒有任何檔案因此失去證明。由舊版分好群組的 catalog 會在第一次開啟時重新分組。
+- **由舊版模擬過的計畫，升級後不能核准**：digest 現在有金鑰了（§7.2），所以這種計畫必須先重新模擬。
+- **同一個 remote 不能平行掃描**：對同一個 remote 的第二次掃描會停掉第一次（`ScanSuperseded`），所以同一個 remote 的兩個子路徑要一個接一個掃。掃描子路徑時會一併儲存該路徑上方的資料夾。
+- **用過 bridge 的無 hash 檔案，靠大小與 mtime 被信任。** 為完全沒有 hash 的檔案（iCloud）以其下載做出的 bridge，只在該檔案的大小與修改時間仍與當時計算 hash 時相同的期間才為它作保，這與 rclone 本身判斷檔案「沒變」所用的證據相同。若改寫後兩者都不變（`cp -p`、保留時間戳記的還原），在該檔案再次被讀取之前不會被發現。損害有限：delete 只是把檔案移到可還原的隔離區，而且 iCloud 沒有伺服器端搬移，所以重新檢查見證的 purge 會把被隔離的檔案視為沒有連結的新 catalog 項目，先下載再比對，因此會發現位元組不同。唯一可能繞過這點的情況，是在搬移後仍保留項目 id 與 mtime 的無 hash 後端，而支援的提供者中沒有這種。
 
 ## 15. 視覺化工作區（詳見 [WORKSPACE.zh-TW.md](WORKSPACE.zh-TW.md)）
 

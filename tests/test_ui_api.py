@@ -90,15 +90,25 @@ def _rid(conn, name):
     return conn.execute("SELECT id FROM remotes WHERE name = ?", (name,)).fetchone()[0]
 
 
-def _simulated_plan(conn, service, **params):
-    """A copy plan that passes simulation; returns (plan_id, approval code)."""
-    pid = plans.create_plan(conn, "copy budget", "manual", [
+def _simulated_plan(conn, service, *, made_by=None, **params):
+    """A copy plan that passes simulation; returns (plan_id, approval code).
+
+    With `draft_id` in `params` it is made the way workspace.preview makes a draft's plan (kind and creator
+    'workspace'): that is what links a plan to a draft. `made_by` forces another creator, as a proposer would be."""
+    previewed = "draft_id" in params and made_by is None
+    pid = plans.create_plan(conn, "copy budget", "workspace" if previewed else "manual", [
         Op("copy", _rid(conn, "gdrive"), "Docs/budget-2024.pdf",
            dst_remote_id=_rid(conn, "dropbox"), dst_path="Docs/budget-2024.pdf"),
-    ], created_by="test", params=params)
+    ], created_by="workspace" if previewed else made_by or "test", params=params)
     report = service.simulate(pid)
     assert report["ok"], report
     return pid, report["approval_code"]
+
+
+def _approved_plan_by(conn, service, made_by, **params):
+    pid, code = _simulated_plan(conn, service, made_by=made_by, **params)
+    plans.approve_plan(conn, pid, code, approved_by="test")
+    return pid
 
 
 def _draft_row(conn, version=1, status="open"):
@@ -188,6 +198,32 @@ def test_config_reports_remotes_and_hands_a_session_its_csrf_token(browser, bear
     assert gd["provider"] == "drive" and gd["writable"] is True and gd["case_insensitive"] is False
     assert cfg["version"]
     assert bearer.get("/v1/ui/config").json()["csrf"] is None  # a bearer caller never learns a csrf token
+
+
+def test_config_names_the_clouds_a_run_changed_since_their_last_completed_scan(browser, service, conn):
+    """The executor never touches the catalog, so the page must be able to say "behind the cloud" after a reload."""
+    client, _ = browser
+    outdated = lambda: client.get("/v1/ui/config").json()["outdated"]
+    assert outdated() == []
+    pid, _ = _simulated_plan(conn, service)
+    (op_id,) = conn.execute("SELECT id FROM plan_ops WHERE plan_id = ?", (pid,)).fetchone()
+    assert outdated() == []                                    # a plan that has not run changed nothing
+    plans.set_op_status(conn, op_id, "skipped")
+    assert outdated() == []                                    # neither did a step that was skipped
+    plans.set_op_status(conn, op_id, "done")
+    assert outdated() == ["gdrive", "dropbox"]                 # the source and the destination of the copy
+    time.sleep(0.01)
+    conn.execute("INSERT INTO scans(remote_id, status, started_at, finished_at) VALUES (?, 'failed', ?, ?)",
+                 (_rid(conn, "gdrive"), db.utcnow(), db.utcnow()))
+    assert outdated() == ["gdrive", "dropbox"]                 # a scan that did not finish brings nothing up to date
+    conn.execute("INSERT INTO scans(remote_id, status, started_at, finished_at) VALUES (?, 'complete', ?, ?)",
+                 (_rid(conn, "dropbox"), db.utcnow(), db.utcnow()))
+    assert outdated() == ["gdrive"]                            # rescanned clouds drop out one by one
+    conn.execute("INSERT INTO scans(remote_id, status, started_at, finished_at) VALUES (?, 'complete', ?, ?)",
+                 (_rid(conn, "gdrive"), db.utcnow(), db.utcnow()))
+    assert outdated() == []
+    plans.set_op_status(conn, op_id, "failed")                 # a step that failed part way may have changed the cloud
+    assert outdated() == ["gdrive", "dropbox"]
 
 
 def test_empty_api_token_disables_bearer_but_not_the_session(service, config):
@@ -313,18 +349,25 @@ def test_workspace_and_value_errors_map_to_http_statuses(bearer, monkeypatch):
 
     r = failing(workspace.WorkspaceError("DST_NOT_DIR", "gdrive:a.txt is not a folder"))
     assert r.status_code == 409 and r.json() == {"error": "gdrive:a.txt is not a folder", "code": "DST_NOT_DIR"}
+    # The facts behind the message travel with it, so that the page can word the refusal itself.
+    r = failing(workspace.WorkspaceError("NAME_EXISTS", "'gdrive:a' already exists", item={"remote": "gdrive", "path": "a"}))
+    assert r.json() == {"error": "'gdrive:a' already exists", "code": "NAME_EXISTS",
+                        "params": {"item": {"remote": "gdrive", "path": "a"}}}
     r = failing(workspace.WorkspaceError("NOT_FOUND", "no draft 1"))
     assert r.status_code == 404 and r.json()["code"] == "NOT_FOUND"
     r = failing(workspace.WorkspaceError("BAD_REQUEST", "a move needs items"))
     assert r.status_code == 400 and r.json()["code"] == "BAD_REQUEST"
     r = failing(workspace.WorkspaceError("NOT_OPEN", "draft 1 is applied"))
     assert r.status_code == 409 and r.json()["code"] == "NOT_OPEN"
+    # Every error of this app has a code, even the ones that come from the shared handlers.
     r = failing(ValueError("bad value"))
-    assert r.status_code == 400 and r.json() == {"error": "bad value"}
+    assert r.status_code == 400 and r.json() == {"error": "bad value", "code": "BAD_REQUEST"}
     r = failing(KeyError("unknown remote 'x'"))
-    assert r.status_code == 404 and r.json() == {"error": "unknown remote 'x'"}
-    assert bearer.post("/v1/drafts/1/actions", content=b"[]",
-                       headers={"Content-Type": "application/json"}).status_code == 422
+    assert r.status_code == 404 and r.json() == {"error": "unknown remote 'x'", "code": "NOT_FOUND"}
+    r = bearer.post("/v1/drafts/1/actions", content=b"[]", headers={"Content-Type": "application/json"})
+    assert r.status_code == 422 and r.json()["code"] == "BAD_REQUEST" and r.json()["error"]
+    r = bearer.get("/v1/no-such-route")
+    assert r.status_code == 404 and r.json()["code"] == "NOT_FOUND"
 
 
 def test_real_workspace_errors_reach_the_client(bearer, service):
@@ -534,6 +577,33 @@ def test_the_real_preview_goes_stale_when_the_draft_changes(browser, service):
     assert r.status_code == 409 and r.json()["code"] == "STALE_PREVIEW"
 
 
+def test_a_plan_that_only_claims_a_draft_is_not_judged_by_it(browser, service):
+    """`draft_id` in a proposer's params is a claim, not a link: it must neither block the human's approval of
+    that plan (an unknown or finished draft) nor make the plan stand in for a draft it never previewed."""
+    client, headers = browser
+    conn = service.conn
+    open_draft = _draft_row(conn, version=3)
+    for claim in ({"draft_id": 9999, "draft_version": 1}, {"draft_id": open_draft, "draft_version": 2}):
+        pid, code = _simulated_plan(conn, service, made_by="api", **claim)
+        assert plans.get_plan(conn, pid, with_ops=False).kind == "manual"
+        r = client.post(f"/v1/ui/plans/{pid}/approve", headers=headers, json={"code": code})
+        assert r.status_code == 200, (claim, r.text)
+        assert plans.get_plan(conn, pid, with_ops=False).status == "approved"
+    assert ui_api._stale_reason(conn, plans.get_plan(conn, pid, with_ops=False)) is None
+
+
+def test_real_previews_stay_linked_to_their_draft(service):
+    """The other half: a plan made by workspace.preview is still judged by its draft."""
+    conn = service.conn
+    draft = _draft_row(conn, version=3)
+    for version, expected in ((3, None), (2, f"draft {draft} changed after this preview was made")):
+        pid, _ = _simulated_plan(conn, service, draft_id=draft, draft_version=version)
+        assert ui_api._stale_reason(conn, plans.get_plan(conn, pid, with_ops=False)) == expected
+    gone = _draft_row(conn, version=1, status="applied")
+    pid, _ = _simulated_plan(conn, service, draft_id=gone, draft_version=1)
+    assert ui_api._stale_reason(conn, plans.get_plan(conn, pid, with_ops=False)) == f"draft {gone} is applied"
+
+
 # ----------------------------------------------------------------- execute and jobs
 
 class _Executor:
@@ -608,6 +678,18 @@ def test_a_finished_draft_plan_marks_the_draft_applied(browser, service, monkeyp
     assert job["result"]["failed"] == 1 and len(applied) == 1  # a failed run leaves the draft open
 
 
+def test_a_finished_plan_that_only_claims_a_draft_leaves_it_open(browser, service, monkeypatch):
+    client, headers = browser
+    _Executor(monkeypatch)
+    applied = _record(monkeypatch, workspace, "mark_applied")
+    draft = _draft_row(service.conn, version=4)
+    pid = _approved_plan_by(service.conn, service, "api", draft_id=draft, draft_version=4)
+
+    job = _wait(client, client.post(f"/v1/ui/plans/{pid}/execute", headers=headers).json()["job_id"])
+    assert job["status"] == "done" and "draft_applied" not in job["result"]
+    assert applied == []
+
+
 def test_a_draft_that_cannot_be_closed_does_not_turn_a_finished_run_into_a_failure(browser, service, monkeypatch):
     client, headers = browser
     _Executor(monkeypatch)
@@ -642,6 +724,7 @@ def test_only_one_execute_job_runs_at_a_time(browser, service, monkeypatch):
     for plan in (first, second):
         r = client.post(f"/v1/ui/plans/{plan}/execute", headers=headers)
         assert r.status_code == 409 and r.json()["code"] == "JOB_BUSY", plan
+        assert r.json()["params"] == {"job": job_id, "kind": "execute"}            # what the page words it with
     r = client.post("/v1/ui/rescan", headers=headers, json={})  # a scan would race the executor on the catalog
     assert r.status_code == 409 and r.json()["code"] == "JOB_BUSY"
     assert len(fake.calls) == 1
@@ -682,7 +765,9 @@ def test_execute_checks_the_plan_before_starting_a_job(browser, service, config,
     simulated, _ = _simulated_plan(service.conn, service)
     r = client.post(f"/v1/ui/plans/{simulated}/execute", headers=headers)
     assert r.status_code == 409 and r.json()["code"] == "NOT_APPROVED"
-    assert client.post("/v1/ui/plans/999/execute", headers=headers).status_code == 404
+    assert r.json()["params"] == {"plan": simulated, "plan_status": "simulated"} and r.json()["error"]
+    r = client.post("/v1/ui/plans/999/execute", headers=headers)
+    assert r.status_code == 404 and r.json()["code"] == "NOT_FOUND"
 
     draft = _draft_row(service.conn, version=1)
     pid = _approved_plan(service.conn, service, draft_id=draft, draft_version=1)
@@ -822,6 +907,41 @@ def test_plan_progress_reports_op_counts_the_current_op_and_the_journal(bearer, 
     assert r["status"] == "failed" and r["current"] is None and r["pending"] == 0 and r["done"] == 4
 
     assert bearer.get("/v1/plans/999/progress").status_code == 404
+
+
+def test_no_plan_route_of_the_workspace_server_hands_out_the_approval_code(bearer, browser, service):
+    """The preview withholds the digest from a bearer caller, but its `plan_id` opens every other plan route:
+    none of them may give back the digest, the snapshot or an approval code, nor may the journal."""
+    conn = service.conn
+    d = bearer.post("/v1/drafts", json={"title": "docs"}).json()["id"]
+    move = {"kind": "move", "items": [{"remote": "gdrive", "path": "Docs"}], "dst": {"remote": "dropbox", "path": ""}}
+    assert bearer.post(f"/v1/drafts/{d}/actions", json=move).status_code == 201
+    preview = bearer.post(f"/v1/drafts/{d}/preview").json()
+    pid = preview["plan_id"]
+    assert pid and preview["simulation"]["ok"] and "approval_code" not in preview, preview
+    digest = plans.get_plan(conn, pid, with_ops=False).digest
+    code = plans.short_code(digest)
+
+    def secret_keys(value):
+        if isinstance(value, dict):
+            return ({"digest", "approval_code", "snapshot"} & value.keys()).union(*map(secret_keys, value.values()))
+        if isinstance(value, list):
+            return set().union(*map(secret_keys, value))
+        return set()
+
+    for client in (bearer, browser[0]):
+        for r in (client.get(f"/v1/plans/{pid}"), client.get("/v1/plans"), client.post(f"/v1/plans/{pid}/simulate")):
+            assert r.status_code == 200
+            assert not secret_keys(r.json()) and code not in r.text and digest not in r.text, r.request.url
+    assert bearer.get(f"/v1/plans/{pid}").json()["simulation"]["ok"] is True
+
+    # An approved plan's journal names the digest it was approved against, and the executor logs it again.
+    plans.approve_plan(conn, pid, code, approved_by="ui:human")
+    db.journal(conn, "execute", plan_id=pid, detail=json.dumps({"ops": 3, "digest": digest}))
+    for client in (bearer, browser[0]):
+        r = client.get(f"/v1/plans/{pid}/progress")
+        assert r.status_code == 200 and code not in r.text and digest not in r.text
+        assert [j["detail"] for j in r.json()["recent_journal"]] == [{"by": "ui:human"}, {"ops": 3}]
 
 
 # ----------------------------------------------------------------- static files

@@ -12,7 +12,8 @@ import pytest
 
 from drivemerge import builders, db, dirstats, plans, workspace
 from drivemerge.config import parse_config
-from drivemerge.service import Service, ServiceError
+from drivemerge.models import Plan
+from drivemerge.service import Service, ServiceError, draft_of
 
 requires_rclone = pytest.mark.skipif(shutil.which("rclone") is None, reason="rclone not on PATH")
 
@@ -164,6 +165,71 @@ def test_a_plan_without_a_draft_touches_no_draft(world):
     svc.approve(res["plan_id"], plans.short_code(plan.digest), approved_by="test")
     out = svc.execute(res["plan_id"])
     assert "draft_applied" not in out and svc.get_draft(d)["status"] == "open"
+
+
+@requires_rclone
+def test_running_a_plan_that_only_claims_a_draft_does_not_close_that_draft(world):
+    """A proposer's params can say anything; only a plan made by workspace.preview is tied to a draft. Here a
+    plan a client labelled with the human's open draft is approved and run: the draft stays open."""
+    svc, roots = world
+    _scan_all(svc)
+    d = svc.create_draft("thesis")["id"]
+    _move(svc, d, "dbx:School/Thesis", "gd:Research")                       # staged, never previewed
+    version = svc.get_draft(d)["version"]
+
+    for created_by, kind in (("api", "manual"), ("mcp", "manual"), ("api", "dedupe")):
+        # Written straight to the store: propose_plan refuses these params, but rows from before that exist,
+        # and the guard must not depend on how the plan got there.
+        pid = plans.create_plan(svc.conn, "forged", kind, [builders.build_manual(svc.conn, [
+            {"op": "copy", "src": "gd:Research/Thesis/notes.md", "dst": f"gd:Research/{created_by}-{kind}.md"},
+        ]).ops[0]], created_by=created_by, params={"draft_id": d, "draft_version": version})
+        assert svc.simulate(pid)["ok"]
+        svc.approve(pid, plans.short_code(plans.get_plan(svc.conn, pid, with_ops=False).digest), approved_by="test")
+        result = svc.execute(pid)
+        assert result["status"] == "done" and "draft_applied" not in result, (created_by, kind, result)
+        assert svc.get_draft(d)["status"] == "open"
+    assert _live(roots["gd"])["Research/mcp-manual.md"] == b"notes\n"
+    assert any(k.startswith("School/Thesis") for k in _live(roots["dbx"])), "the human's staged move never ran"
+
+
+@requires_rclone
+def test_only_the_drafts_own_preview_closes_it(world):
+    """The positive control: an unrelated plan finishing does not touch the draft, its own preview does."""
+    svc, _ = world
+    _scan_all(svc)
+    d = svc.create_draft("thesis")["id"]
+    _move(svc, d, "dbx:School/Thesis", "gd:Research")
+    pv = svc.preview_draft(d)
+    other = svc.propose_plan("manual", {"ops": [{"op": "copy", "src": "gd:Research/Thesis/notes.md",
+                                                 "dst": "gd:Research/notes-copy.md"}]}, created_by="api")
+    for pid in (other["plan_id"], pv["plan_id"]):
+        svc.approve(pid, plans.short_code(plans.get_plan(svc.conn, pid, with_ops=False).digest), approved_by="test")
+    assert "draft_applied" not in svc.execute(other["plan_id"]) and svc.get_draft(d)["status"] == "open"
+    assert svc.execute(pv["plan_id"])["draft_applied"] is True and svc.get_draft(d)["status"] == "applied"
+
+
+@pytest.mark.parametrize("kind", ["dedupe", "consolidate", "reorganize", "manual"])
+@pytest.mark.parametrize("claim", [{"draft_id": 1}, {"draft_version": 1}, {"draft_id": 1, "draft_version": 1}])
+def test_propose_plan_refuses_params_that_claim_a_draft(conn, catalog, kind, claim):
+    catalog.remote("gd", "drive")
+    cfg = parse_config({"remotes": [{"name": "gd", "provider": "drive", "read": "gd:", "write": "gd:"}]})
+    svc = Service(cfg, conn=conn)
+    with pytest.raises(ServiceError, match="reserved for workspace previews"):
+        svc.propose_plan(kind, {"ops": [], "target": "gd", "remote": "gd", **claim}, created_by="api")
+    assert plans.list_plans(conn) == []
+
+
+def test_draft_of_follows_only_plans_that_workspace_preview_made(conn):
+    params = {"draft_id": 5, "draft_version": 2}
+
+    def plan(kind, created_by, p=params):
+        return Plan(id=1, title="t", kind=kind, status="draft", created_by=created_by, params=p, digest=None,
+                    snapshot=None, created_at="")
+
+    assert draft_of(plan("workspace", "workspace")) == 5
+    assert draft_of(plan("workspace", "workspace", {})) is None
+    for kind, created_by in (("manual", "api"), ("manual", "workspace"), ("workspace", "api"), ("dedupe", "mcp")):
+        assert draft_of(plan(kind, created_by)) is None, (kind, created_by)
 
 
 def test_builders_are_told_where_quarantine_is(conn, catalog, monkeypatch):

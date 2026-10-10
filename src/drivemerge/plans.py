@@ -11,6 +11,7 @@ Rules enforced here (independently of any UI):
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import socket
@@ -38,12 +39,16 @@ class StaleSimulation(PlanError):
     """The catalog or the plan changed since it was simulated."""
 
 
-def compute_digest(plan_id: int, ops: list[Op], snapshot: dict) -> str:
+def compute_digest(conn: sqlite3.Connection, plan_id: int, ops: list[Op], snapshot: dict) -> str:
+    """HMAC-SHA256 of the plan id, its ops and the catalog snapshot, keyed with this catalog's secret.
+
+    Keyed so that the 8-character approval code cannot be worked out from what a client may read.
+    """
     payload = json.dumps(
         {"plan": plan_id, "ops": [o.canonical() for o in ops], "snapshot": snapshot},
         sort_keys=True, ensure_ascii=False, separators=(",", ":"),
     )
-    return hashlib.sha256(payload.encode()).hexdigest()
+    return hmac.new(db.digest_secret(conn), payload.encode(), hashlib.sha256).hexdigest()
 
 
 def short_code(digest: str) -> str:
@@ -131,7 +136,7 @@ def latest_simulation(conn: sqlite3.Connection, plan_id: int) -> SimulationRepor
 
 def current_digest(conn: sqlite3.Connection, plan_id: int) -> str:
     """Digest of the plan's ops against the catalog as it is *now*."""
-    return compute_digest(plan_id, load_ops(conn, plan_id), db.snapshot(conn))
+    return compute_digest(conn, plan_id, load_ops(conn, plan_id), db.snapshot(conn))
 
 
 def approve_plan(conn: sqlite3.Connection, plan_id: int, code: str, *, approved_by: str) -> None:

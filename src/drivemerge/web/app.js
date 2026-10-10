@@ -3,16 +3,16 @@
 import {
   html, render, useEffect, useRef, useState,
 } from './vendor/htm-preact-standalone.mjs';
-import { getLang, setLang, t } from './i18n.js';
+import { getLang, htmlLang, setLang, t } from './i18n.js';
 import * as api from './api.js';
 import { Icon } from './icons.js';
 import { AppCtx } from './ctx.js';
 import { Pane } from './tree.js';
-import { StagedDrawer, SuggestionsDrawer } from './panels.js';
+import { CatalogBanner, StagedDrawer, SuggestionsDrawer } from './panels.js';
 import { PreviewModal } from './preview.js';
 import { DialogHost, Toasts } from './ui.js';
 import {
-  baseName, errorText, fmtBytes, fmtNum, keepBothName, parentOf, safeStorage, todayStamp,
+  baseName, errorText, fmtBytes, fmtLoc, fmtNum, keepBothName, lastMove, parentOf, safeStorage, todayStamp, wordParams,
 } from './util.js';
 
 const POLL_MS = 3000;
@@ -53,6 +53,8 @@ function App() {
   const [previewOpen, setPreviewOpen] = useState(false);
   const [toasts, setToasts] = useState([]);
   const [dialog, setDialog] = useState(null);
+  // The clouds the last run changed while the catalog still shows what they held before ({remotes}); null once rescanned.
+  const [outdated, setOutdated] = useState(null);
   const [frac, setFrac] = useState(() => {
     const v = parseFloat(safeStorage('get', SPLIT_KEY));
     return v >= 0.25 && v <= 0.75 ? v : 0.5;
@@ -66,6 +68,7 @@ function App() {
   const panesBox = useRef(null);
   const modalOpen = useRef(false);
   const replacing = useRef(false);
+  const ranHere = useRef(new Set());
   modalOpen.current = previewOpen || !!dialog;
 
   useEffect(() => { safeStorage('set', SPLIT_KEY, String(frac)); }, [frac]);
@@ -89,6 +92,11 @@ function App() {
 
   // ---------------------------------------------------------------- draft state
   function adopt(d) {
+    const prev = draftRef.current;
+    // Applied by someone else (a terminal): the clouds changed and this catalog has not heard of it.
+    if (prev && prev.id === d.id && prev.status === 'open' && d.status === 'applied' && !ranHere.current.has(d.id)) {
+      markOutdated((d.summary || prev.summary || {}).remotes_touched, d.id);
+    }
     draftRef.current = d;
     setDraft(d);
     safeStorage('set', DRAFT_KEY, String(d.id));
@@ -144,12 +152,12 @@ function App() {
     (warnings || []).forEach((w) => {
       if (seen.has(w.code)) return;
       seen.add(w.code);
-      toast('warn', t(`warn.${w.code}`, { dst: dst ? `${dst.remote}:${dst.path}` : '' }, w.message));
+      toast('warn', t(`warn.${w.code}`, { dst: dst ? `${dst.remote}:${dst.path}` : '', ...wordParams('warn', w.params) }, w.message));
     });
   }
 
   async function failStaging(e, items, dst, opts) {
-    if (e.code === 'NOT_OPEN' || (e.code === 'NOT_FOUND' && /draft/.test(e.message))) {
+    if (e.code === 'NOT_OPEN' || (e.code === 'NOT_FOUND' && (e.params ? e.params.draft !== undefined && e.params.action === undefined : /draft/.test(e.message)))) {
       await replaceDraft(t('draft.closed'));
       return;
     }
@@ -257,10 +265,42 @@ function App() {
       const r = await api.removeAction(draftRef.current.id, id);
       await syncDraft();
       if (r.removed && r.removed.length > 1) toast('info', t('staged.alsoRemoved', { n: r.removed.length - 1 }));
+      return true;
     } catch (e) {
       toast('error', errorText(e));
+      return false;
     }
   });
+
+  /**
+   * One row holds two different files under one name (a merge clash). Renaming the row renames both, so the clash
+   * would stay; each file can only be addressed before the step that put them together. Offer taking that step back.
+   */
+  async function resolveClash(side, origins, name) {
+    const steps = draftRef.current.actions;
+    const last = origins.map((o) => ({ o, hit: lastMove(steps, o) })).filter((x) => x.hit)
+      .sort((a, b) => b.hit.step.seq - a.hit.step.seq)[0];
+    if (!last) { toast('warn', t('clash.explain')); return; }
+    const { step, before } = last.hit;
+    const ok = await confirmDialog({
+      title: t('clash.title'), message: t('clash.text', { name, seq: step.seq, from: fmtLoc(before) }),
+      okLabel: t('clash.remove', { seq: step.seq }),
+    });
+    if (!ok || !(await removeAction(step.id))) return;
+    toast('info', t('clash.removed', { name }), { label: t('clash.show'), run: () => reveal(side, before) });
+  }
+
+  /**
+   * A run changed these clouds (or failed part way): the catalog is behind them until a scan finishes. `ranDraft` is
+   * the draft this page ran itself, so that the poll does not announce the same run a second time after a rescan.
+   */
+  const markOutdated = (remotes, ranDraft) => {
+    if (ranDraft) ranHere.current.add(ranDraft);
+    setOutdated((o) => ({
+      remotes: [...new Set([...(o ? o.remotes : []), ...(remotes && remotes.length ? remotes : (config.remotes || []).map((r) => r.name))])],
+    }));
+  };
+  const catalogRefreshed = () => { setOutdated(null); setTick((x) => x + 1); };
 
   async function clearDraft() {
     const ok = await confirmDialog({
@@ -329,6 +369,8 @@ function App() {
         if (cfg.csrf && !api.hasCsrf()) api.setCsrf(cfg.csrf);
         if (cfg.approvals_enabled === undefined) cfg.approvals_enabled = !!approvals;
         setConfig(cfg);
+        // A run that changed a cloud since its last scan: say so again after a reload, as the page did right after the run.
+        if (cfg.outdated && cfg.outdated.length) setOutdated({ remotes: cfg.outdated });
         const list = await api.listDrafts();
         setDrafts(list);
         const saved = Number(safeStorage('get', DRAFT_KEY));
@@ -395,7 +437,7 @@ function App() {
     const next = getLang() === 'zh-TW' ? 'en' : 'zh-TW';
     setLang(next);
     setLangState(next);
-    document.documentElement.lang = next === 'zh-TW' ? 'zh-Hant-TW' : 'en';
+    document.documentElement.lang = htmlLang(next);
     document.title = t('app.title');
   };
 
@@ -410,7 +452,8 @@ function App() {
   const sum = draft.summary || {};
   const ctx = {
     config, draft, toast, confirm: confirmDialog, prompt: promptDialog, reveal,
-    stageMove, stageMkdir, stageMany, rename: renameItem, afterExecution,
+    stageMove, stageMkdir, stageMany, rename: renameItem, afterExecution, resolveClash,
+    outdated, markOutdated, catalogRefreshed,
     undo: () => stepHistory('undo'), redo: () => stepHistory('redo'), removeAction, clearDraft,
   };
   const toggleDrawer = (name) => setDrawer((d) => (d === name ? null : name));
@@ -422,6 +465,8 @@ function App() {
         <span><strong>${t('banner.title')}</strong> ${t('banner.text')}
           <code>drivemerge plan approve ${'<id>'}</code> ${t('banner.and')} <code>drivemerge plan execute ${'<id>'}</code> ${t('banner.after')}</span>
       </div>`}
+      ${outdated && html`<${CatalogBanner} remotes=${outdated.remotes} onFresh=${() => { catalogRefreshed(); toast('success', t('prog.rescanned')); }}
+        onDismiss=${() => setOutdated(null)} />`}
       <header class="topbar">
         <div class="brand"><${Icon} name="folder" size=${20} /><span>drive-merge</span>
           ${config.version && html`<small title=${t('app.version')}>${config.version}</small>`}</div>
@@ -477,5 +522,5 @@ function App() {
 }
 
 document.title = t('app.title');
-document.documentElement.lang = getLang() === 'zh-TW' ? 'zh-Hant-TW' : 'en';
+document.documentElement.lang = htmlLang(getLang());
 render(html`<${App} />`, document.getElementById('root'));

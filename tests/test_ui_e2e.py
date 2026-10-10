@@ -557,7 +557,8 @@ def test_a_merge_with_different_content_is_a_conflict_that_cannot_be_approved(ma
     first = modal.get_by_test_id("conflict").first
     expect(first).to_have_attribute("data-code", "DIFFERENT_CONTENT")
     expect(first).to_contain_text("同名但內容不同的檔案")              # the engine's code, in the person's language ...
-    expect(first.get_by_test_id("problem-raw")).to_contain_text("a different file already has that name")  # ... raw kept
+    expect(first.get_by_test_id("problem-raw")).to_have_text(                      # ... the code kept beside its detail,
+        "DIFFERENT_CONTENT 已經有另一個內容不同的檔案使用這個名稱。")             # which is in that language too
     expect(modal.get_by_test_id("summary-conflicts")).to_contain_text("1")
     expect(modal.get_by_test_id("approval-code")).to_have_count(0)
     expect(modal.get_by_test_id("approval-button")).to_have_count(0)
@@ -683,6 +684,11 @@ def test_without_browser_approval_the_terminal_finishes_the_job_and_the_page_fol
     # The page was open the whole time; its polling sees that the draft was applied and starts a fresh one.
     expect(page.get_by_test_id("staged-count")).to_have_text("0", timeout=15_000)
     expect(page.get_by_test_id("draft-select")).to_contain_text("#2")
+    # The clouds changed under this page's catalog; it cannot rescan without approvals, so the banner names the commands.
+    banner = page.get_by_test_id("catalog-banner")
+    expect(banner).to_contain_text("drivemerge scan gd")
+    expect(banner).to_contain_text("drivemerge scan dbx")
+    expect(banner.get_by_test_id("catalog-rescan")).to_have_count(0)
     me.shot("31-draft-applied-elsewhere")
     assert (world.roots["gd"] / "Research/Thesis/refs.bib").read_bytes() == world.files["dbx"]["School/NTU/Thesis/refs.bib"]
     quarantine = world.roots["dbx"] / QUARANTINE / str(plan_id) / "School/NTU/Thesis"
@@ -731,6 +737,30 @@ def test_a_duplicate_folder_suggestion_stages_in_one_click_and_dedupes_with_witn
     me.finish()
 
 
+def test_suggestion_cards_follow_the_ui_language_when_the_real_server_sends_the_facts(make_world, person):
+    """The server writes title and reason in English and also sends a `code` and `params`; the page words the card
+    itself in either language. The folder names are plain English, so any CJK in the English card would be the
+    server's own wording, and any English sentence in the Chinese card would be too."""
+    me = person(make_world())
+    me.open()
+    page = me.page
+    page.get_by_test_id("lang-toggle").click()
+    expect(page.get_by_test_id("lang-toggle")).to_have_text("中文")
+    page.get_by_test_id("suggestions-toggle").click()
+    cards = page.get_by_test_id("suggestion-card")
+    expect(cards.first).to_be_visible()
+    assert cards.count() >= 1
+    for i in range(cards.count()):
+        text = cards.nth(i).locator(".sug-title, .sug-reason").all_inner_texts()
+        assert text and not any(re.search(r"[㐀-鿿]", t) for t in text), f"Chinese text in the English UI: {text}"
+    page.get_by_test_id("lang-toggle").click()                    # and back: the same cards in Chinese
+    expect(cards.first.locator(".sug-title")).to_contain_text("個資料夾")
+    for i in range(cards.count()):
+        said = " ".join(cards.nth(i).locator(".sug-title, .sug-reason").all_inner_texts())
+        assert not re.search(r"\b(folders|related|similarity|Suggested)\b", said), f"English in the Chinese UI: {said}"
+    me.finish()
+
+
 def test_the_ui_command_serves_the_catalog_that_the_cli_built(tmp_path, browser):
     """`drivemerge scan`, `identity rebuild` and `ui` as a person runs them: folder counts and duplicate hints are
     there without any extra step, the one-time URL opens a session, and without a terminal there is no approval."""
@@ -741,7 +771,7 @@ def test_the_ui_command_serves_the_catalog_that_the_cli_built(tmp_path, browser)
     cfg = tmp_path / "config.toml"
     cfg.write_text(f'[database]\npath = "{tmp_path / "catalog.db"}"\n' + "".join(
         f'[[remotes]]\nname = "{n}"\nprovider = "local"\nread = "{tmp_path / n}"\nwrite = "{tmp_path / n}"\n'
-        'hash_types = ["md5"]\n' for n in ("gd", "dbx")))
+        'hash_types = ["sha256"]\n' for n in ("gd", "dbx")))  # md5 alone no longer proves identity (identity.STRONG_TYPES)
     cli = [sys.executable, "-c", "import sys; from drivemerge.cli import main; sys.exit(main(sys.argv[1:]))"]
     for args in (["scan", "--all"], ["identity", "rebuild"]):
         done = subprocess.run([*cli, *args, "--config", str(cfg)], capture_output=True, text=True, timeout=120)
@@ -817,6 +847,7 @@ def test_a_file_that_changed_behind_the_scenes_stops_the_run_and_a_retry_after_a
     assert modal.get_by_test_id("progress").get_attribute("data-phase") == "failed"
     expect(modal.get_by_test_id("progress-failures")).to_be_visible()
     expect(modal.get_by_test_id("failure-help")).to_be_visible()
+    expect(page.get_by_test_id("catalog-banner")).to_be_visible()  # a run that stopped part way leaves the catalog behind too
     me.shot("50-run-stopped")
 
     assert _live(world.roots["dbx"]) == dbx_now, "no source was deleted or changed by the stopped run"
@@ -835,6 +866,7 @@ def test_a_file_that_changed_behind_the_scenes_stops_the_run_and_a_retry_after_a
     # Rescan, and the same draft is still there to preview again.
     modal.get_by_test_id("rescan-button").click()
     expect(modal.get_by_test_id("progress")).to_have_attribute("data-phase", "rescanned", timeout=120_000)
+    expect(page.get_by_test_id("catalog-banner")).to_have_count(0)
     modal.get_by_test_id("preview-close").click()
     me.staged(1)
     page.get_by_test_id("preview-button").click()
@@ -853,4 +885,358 @@ def test_a_file_that_changed_behind_the_scenes_stops_the_run_and_a_retry_after_a
     for name in ("chapter1.docx", "chapter2.docx"):
         assert (world.roots["gd"] / "Research/Thesis" / name).read_bytes() == orig["dbx"][f"School/NTU/Thesis/{name}"]
     assert {k: v for k, v in _live(world.roots["gd"]).items() if k in gd_before} == gd_before
+    me.finish()
+
+
+# --------------------------------------------------------------------------- follow-ups of the review (ux)
+
+def _run_the_preview(me, *, timeout: int = 60_000) -> str:
+    """Type the approval code of the open preview, approve, and wait for the run to end: its final phase."""
+    modal = me.page.get_by_test_id("preview-modal")
+    expect(modal.get_by_test_id("approval-code")).to_be_visible()
+    modal.get_by_test_id("approval-input").fill(modal.get_by_test_id("approval-code").inner_text().strip())
+    modal.get_by_test_id("approval-button").click()
+    progress = modal.get_by_test_id("progress")
+    expect(progress).to_have_attribute("data-phase", re.compile("^(done|failed)$"), timeout=timeout)
+    return progress.get_attribute("data-phase")
+
+
+def _merge_thesis_over_a_clashing_refs_bib(world, me) -> None:
+    """Dropbox's Thesis folder into Drive's Research: both hold a refs.bib, with different bytes."""
+    page = me.page
+    page.get_by_test_id("root-select-right").select_option("gd")
+    page.get_by_test_id("root-select-left").select_option("dbx")
+    for key in ("dbx:School", "dbx:School/NTU"):
+        me.expand("left", key)
+    me.expand("right", "gd:Research")
+    me.drag(("left", "dbx:School/NTU/Thesis"), ("right", "gd:Research"))
+    me.staged(1)
+    me.expand("right", "gd:Research/Thesis")
+    expect(me.node("right", "gd:Research/Thesis/refs.bib").locator('[data-badge="conflict"]')).to_be_visible()
+
+
+CLASH = {"gd": {"Research/Thesis/refs.bib": b"this is NOT the bibliography that is on Dropbox"}}
+
+
+def test_a_name_clash_inside_a_merge_is_not_renamed_for_both_files_and_the_way_out_is_one_click(make_world, person):
+    """Both files of the clash map through the one merged row, so renaming it renames both (and renames the
+    person's existing Drive file too). The row says so instead, and offers to take back the merge step; after
+    renaming the incoming file where it lives, dragging the folder again previews clean."""
+    world = make_world(extra=CLASH)
+    me = person(world)
+    me.open()
+    page = me.page
+    _merge_thesis_over_a_clashing_refs_bib(world, me)
+    row = me.node("right", "gd:Research/Thesis/refs.bib")
+
+    row.click()
+    row.press("F2")
+    dialog = page.get_by_test_id("dialog")
+    expect(dialog).to_be_visible()
+    expect(dialog).to_contain_text("refs.bib")
+    expect(dialog).to_contain_text("取消第 1 步")
+    expect(page.get_by_test_id("rename-input")).to_have_count(0)
+    me.shot("70-clash-explained")
+    page.get_by_test_id("dialog-cancel").click()
+    row.locator(".name").dblclick()  # the mouse route says the same
+    expect(dialog).to_be_visible()
+    page.get_by_test_id("dialog-cancel").click()
+    me.staged(1)  # nothing was staged by either gesture
+
+    row.click()
+    row.press("F2")
+    page.get_by_test_id("dialog-ok").click()
+    me.staged(0)
+    page.get_by_test_id("toast").filter(has_text="重新拖放").get_by_test_id("toast-action").click()
+    incoming = me.node("right", "dbx:School/NTU/Thesis/refs.bib")  # the file is back where it came from
+    expect(incoming).to_have_attribute("aria-selected", "true")
+    incoming.click()
+    incoming.press("F2")
+    box = page.get_by_test_id("rename-input")
+    box.fill("refs-dropbox.bib")
+    box.press("Enter")
+    me.staged(1)
+
+    page.get_by_test_id("root-select-right").select_option("gd")
+    me.drag(("left", "dbx:School/NTU/Thesis"), ("right", "gd:Research"))
+    me.staged(2)
+    page.get_by_test_id("preview-button").click()
+    modal = page.get_by_test_id("preview-modal")
+    expect(modal.get_by_test_id("sim-status")).to_have_attribute("data-ok", "true")
+    expect(modal.get_by_test_id("conflict")).to_have_count(0)
+    me.shot("71-clash-resolved")
+    modal.get_by_test_id("preview-close").click()
+    me.finish()
+
+
+def test_the_conflict_card_of_the_preview_offers_the_same_way_out(make_world, person):
+    world = make_world(extra=CLASH)
+    me = person(world)
+    me.open()
+    page = me.page
+    _merge_thesis_over_a_clashing_refs_bib(world, me)
+    page.get_by_test_id("preview-button").click()
+    modal = page.get_by_test_id("preview-modal")
+    card = modal.locator('[data-testid="conflict"][data-code="DIFFERENT_CONTENT"]')
+    expect(card).to_have_count(1)
+    expect(card.locator(".problem-text")).to_contain_text("先取消把它們放在一起的那一步")
+    card.get_by_test_id("conflict-fix").click()
+    expect(modal).to_have_count(0)
+    page.get_by_test_id("dialog-ok").click()
+    me.staged(0)
+    expect(me.node("left", "dbx:School/NTU/Thesis")).to_be_visible()
+    me.finish()
+
+
+DEEP = "Documents/University Coursework/Semester 2 Spring 2024/Advanced Algorithms/Homework Assignments"
+
+
+def _open_deep(make_world, person):
+    world = make_world({"gd": {f"{DEEP}/hw{i}.pdf": f"homework {i}".encode() for i in (1, 2, 3)}})
+    me = person(world)
+    me.open()
+    me.page.set_viewport_size({"width": 1000, "height": 700})
+    me.page.get_by_test_id("root-select-right").select_option("gd")
+    path = ""
+    for part in DEEP.split("/"):
+        path = f"{path}/{part}" if path else part
+        me.expand("right", f"gd:{path}")
+    expect(me.node("right", f"gd:{DEEP}/hw3.pdf")).to_be_visible()
+    me.settle()
+    return me
+
+
+def test_pressing_a_deep_row_does_not_move_the_tree_and_the_drag_starts_on_that_row(make_world, person):
+    """Pressing a row focuses it and the breadcrumb then shows its path. A path that wrapped to a second line used
+    to push every row down under the pointer, so Chromium started the drag on the row that slid into its place."""
+    me = _open_deep(make_world, person)
+    page = me.page
+    hw3 = f"gd:{DEEP}/hw3.pdf"
+    crumbs = page.get_by_test_id("crumbs-right")
+    idle = crumbs.bounding_box()["height"]
+    y = me.node("right", hw3).bounding_box()["y"]
+    page.evaluate("""() => { window.__dragged = null;
+        document.addEventListener('dragstart', (e) => { const r = e.target.closest && e.target.closest('[role=treeitem]');
+          window.__dragged = r ? r.dataset.key : String(e.target); }, true); }""")
+    row = me.node("right", hw3).bounding_box()
+    page.mouse.move(row["x"] + 150, row["y"] + 14)
+    page.mouse.down()
+    page.wait_for_timeout(300)
+    assert crumbs.bounding_box()["height"] == idle, "the breadcrumb must keep its height whatever is focused"
+    assert me.node("right", hw3).bounding_box()["y"] == y, "the tree moved under the pointer"
+    page.mouse.move(row["x"] + 160, row["y"] + 20, steps=3)
+    assert page.evaluate("window.__dragged") == hw3
+    page.mouse.up()
+    me.shot("72-deep-row-drag")
+
+
+def test_a_second_page_of_a_big_folder_survives_staging(make_world, person):
+    """"Load more" opens page two of a folder with over 500 children. Staging anything refetches every open folder:
+    it must ask for as many children as are open, not fall back to the first 500 (and lose the person's place)."""
+    world = make_world({"gd": {f"Big/f{i:04d}.txt": f"content {i}".encode() for i in range(620)}})
+    me = person(world)
+    me.open()
+    page = me.page
+    page.get_by_test_id("root-select-right").select_option("gd")
+    me.expand("right", "gd:Big")
+    right = page.locator('[data-testid="pane-right"]')
+    expect(me.node("right", "gd:Big/f0000.txt")).to_be_visible()
+    right.get_by_test_id("load-more").click()
+    last = me.node("right", "gd:Big/f0610.txt")
+    expect(last).to_have_count(1)
+
+    me.drag(("right", "gd:Old"), ("right", "gd:Research"))  # unrelated, in the same pane
+    me.staged(1)
+    page.wait_for_timeout(1500)
+    assert me.node("right", "gd:Big/f0610.txt").count() == 1, "the folder fell back to its first page"
+    expect(right.get_by_test_id("load-more")).to_have_count(0)
+
+    me.drag(("right", "gd:Big/f0610.txt"), ("right", "gd:Research"))  # a drop from page two lands and is shown
+    me.staged(2)
+    expect(me.node("right", "gd:Research/f0610.txt")).to_be_visible()
+    expect(right.get_by_test_id("load-more")).to_have_count(0)
+    me.finish()
+
+
+def _squeezed_world(make_world, person, *, english: bool = False):
+    world = make_world()
+    me = person(world)
+    me.open()
+    page = me.page
+    if english:
+        page.get_by_test_id("lang-toggle").click()
+    page.set_viewport_size({"width": 1000, "height": 700})
+    page.get_by_test_id("root-select-right").select_option("gd")
+    page.get_by_test_id("root-select-left").select_option("dbx")
+    me.drag(("left", "dbx:School"), ("right", "gd:Research"))  # School merges into nothing: "moved in" ...
+    me.staged(1)
+    page.get_by_test_id("staged-toggle").click()
+    expect(page.get_by_test_id("staged-drawer")).to_be_visible()
+    page.wait_for_timeout(600)
+    return me
+
+
+@pytest.mark.parametrize("english", [False, True])
+def test_a_pane_squeezed_by_a_drawer_keeps_its_names_whole_and_its_sizes_inside(make_world, person, english):
+    """At 1000px with a drawer open each pane is about 325px. The name used to give way to everything else (two
+    letters and an ellipsis) and a row that was both moved-in and a duplicate pushed its size out of the pane."""
+    me = _squeezed_world(make_world, person, english=english)
+    me.shot(f"73-squeezed-{'en' if english else 'zh'}")
+    rows = me.page.evaluate("""() => [...document.querySelectorAll('[data-testid=pane-right] [role=treeitem]')].map(r => {
+        const tree = r.closest('.tree').getBoundingClientRect();
+        const name = r.querySelector('.name');
+        return [r.dataset.key, name.scrollWidth - name.clientWidth,
+                r.querySelector('.meta-size').getBoundingClientRect().right - tree.right]; })""")
+    assert len(rows) >= 6, rows
+    cut = {k: over for k, over, _ in rows if over > 0}
+    out = {k: round(px) for k, _, px in rows if px > 1}
+    assert not cut, f"names cut short by an ellipsis (px hidden): {cut}"
+    assert not out, f"the size column sticks out of the pane (px): {out}"
+    # What was given up is still said: the file count stays for assistive technology, the badges keep a tooltip.
+    school = me.node("right", "gd:Research/School")
+    assert school.locator(".meta-files").inner_text().strip() != ""
+    assert school.locator('[data-badge="moved"]').get_attribute("title")
+    me.finish()
+
+
+def test_enter_that_picks_an_ime_candidate_does_not_commit_the_rename(make_world, person):
+    """The Enter that confirms a Zhuyin/Pinyin candidate arrives with isComposing true. It belongs to the IME: the
+    rename stays open on whatever is being composed, and the next Enter, after the candidate is in, commits."""
+    me = person(make_world())
+    me.open()
+    page = me.page
+    page.get_by_test_id("root-select-right").select_option("gd")
+    me.expand("right", "gd:Research")
+    row = me.node("right", "gd:Research/Papers")
+    row.click()
+    row.press("F2")
+    box = page.get_by_test_id("rename-input")
+    box.fill("")
+    cdp = page.context.new_cdp_session(page)
+    page.evaluate("""() => { window.__enter = [];
+        document.addEventListener('keydown', (e) => { if (e.key === 'Enter') window.__enter.push(e.isComposing); }, true); }""")
+    cdp.send("Input.imeSetComposition", {"text": "ㄌㄨㄣˋ", "selectionStart": 3, "selectionEnd": 3})
+    page.keyboard.press("Enter")
+    page.wait_for_timeout(500)
+    assert page.evaluate("window.__enter") == [True], "the test did not reach the composing state"
+    me.staged(0)
+    expect(box).to_be_visible()
+    cdp.send("Input.insertText", {"text": "論文"})  # the candidate is in
+    page.keyboard.press("Enter")
+    me.staged(1)
+    expect(me.node("right", "gd:Research/論文")).to_be_visible()
+    me.finish()
+
+
+def test_after_a_run_the_page_keeps_saying_the_catalog_is_out_of_date_until_a_rescan(make_world, person):
+    """The executor does not touch the catalog. Closing the finished-run dialog used to leave a tree that looked as
+    if nothing had happened, no marker, and the same move could be previewed 'ok' and approved again (it then
+    failed at run time). Now a banner stays, approval waits for a rescan, and the banner's button does it."""
+    world = make_world()
+    me = person(world)
+    me.open()
+    page = me.page
+    page.get_by_test_id("root-select-left").select_option("gd")
+    page.get_by_test_id("root-select-right").select_option("gd")
+    me.drag(("left", "gd:Photos"), ("right", "gd:Old"))
+    me.staged(1)
+    page.get_by_test_id("preview-button").click()
+    assert _run_the_preview(me) == "done"
+    assert (world.roots["gd"] / "Old" / "Photos" / "trip.jpg").exists(), "the run really moved the file"
+    page.get_by_test_id("preview-modal").get_by_test_id("preview-close").click()  # the obvious thing: no rescan
+
+    banner = page.get_by_test_id("catalog-banner")
+    expect(banner).to_be_visible()
+    expect(banner).to_contain_text("重新掃描")
+    expect(banner).to_contain_text("gd")
+    me.staged(0)
+    me.shot("74-catalog-out-of-date")
+    assert me.node("right", "gd:Photos").count() == 1, "(the tree is the old catalog: that is what the banner says)"
+
+    # The same drag previews, but approving is held back until the catalog catches up.
+    me.drag(("left", "gd:Photos"), ("right", "gd:Old"))
+    me.staged(1)
+    page.get_by_test_id("preview-button").click()
+    modal = page.get_by_test_id("preview-modal")
+    expect(modal.get_by_test_id("outdated-note")).to_be_visible()
+    expect(modal.get_by_test_id("approval-input")).to_have_count(0)
+    modal.get_by_test_id("preview-close").click()
+    expect(banner).to_be_visible()  # closing the dialog does not clear it
+
+    banner.get_by_test_id("catalog-rescan").click()
+    expect(banner).to_have_count(0, timeout=60_000)
+    if me.node("right", "gd:Old").get_attribute("aria-expanded") != "true":
+        me.expand("right", "gd:Old")
+    expect(me.node("right", "gd:Old/Photos")).to_be_visible()
+    assert me.node("right", "gd:Photos").count() == 0, "after the scan the view shows the new layout"
+    me.finish()
+
+
+def test_the_banner_can_be_dismissed_and_a_rescan_in_the_dialog_clears_it(make_world, person):
+    world = make_world()
+    me = person(world)
+    me.open()
+    page = me.page
+    page.get_by_test_id("root-select-left").select_option("gd")
+    page.get_by_test_id("root-select-right").select_option("gd")
+    me.drag(("left", "gd:Photos"), ("right", "gd:Old"))
+    page.get_by_test_id("preview-button").click()
+    assert _run_the_preview(me) == "done"
+    modal = page.get_by_test_id("preview-modal")
+    modal.get_by_test_id("rescan-button").click()
+    expect(modal.get_by_test_id("progress")).to_have_attribute("data-phase", "rescanned", timeout=60_000)
+    modal.get_by_test_id("preview-close").click()
+    expect(page.get_by_test_id("catalog-banner")).to_have_count(0)  # the dialog's own rescan counts, and is not re-announced
+    page.wait_for_timeout(3500)  # a poll or two later
+    expect(page.get_by_test_id("catalog-banner")).to_have_count(0)
+    me.finish()
+
+
+def test_one_clashing_file_is_one_problem(make_world, person):
+    """The simulator (DST_EXISTS) and the workspace (DIFFERENT_CONTENT) both name the clash; it is shown once."""
+    world = make_world({"gd": {"Merge/notes.md": b"gd version"}, "dbx": {"Merge/notes.md": b"dbx version, longer"}})
+    me = person(world)
+    me.open()
+    page = me.page
+    page.get_by_test_id("root-select-right").select_option("gd")
+    page.get_by_test_id("root-select-left").select_option("dbx")
+    me.drag(("left", "dbx:Merge"), ("right", "gd:"))
+    me.staged(1)
+    page.get_by_test_id("preview-button").click()
+    modal = page.get_by_test_id("preview-modal")
+    expect(modal.get_by_test_id("sim-status")).to_have_attribute("data-ok", "false")
+    expect(modal.get_by_test_id("sim-status")).to_contain_text("1 個問題")
+    assert modal.get_by_test_id("violation").count() + modal.get_by_test_id("conflict").count() == 1
+    expect(modal.get_by_test_id("summary-conflicts")).to_contain_text("1")
+    me.finish()
+
+
+def test_a_read_only_destination_is_reported_once_and_without_its_cascade(make_world, person):
+    """READ_ONLY_REMOTE on every op, and then NO_WITNESS ('dedupe has no witness copy') for the delete that waited
+    for a copy that could never be made: the root cause is one card, not a pile of echoes."""
+    world = make_world({"gd": {"Merge/notes.md": b"gd version"},
+                        "dbx": {"Merge/notes.md": b"dbx version, longer", "Merge/other.md": b"zzz"}})
+    world.service.conn.execute("UPDATE remotes SET write_remote = NULL WHERE name = 'gd'")
+    world.service.conn.commit()
+    me = person(world)
+    me.open()
+    page = me.page
+    page.get_by_test_id("root-select-right").select_option("gd")
+    page.get_by_test_id("root-select-left").select_option("dbx")
+    me.drag(("left", "dbx:Merge"), ("right", "gd:"))
+    me.staged(1)
+    page.get_by_test_id("preview-button").click()
+    modal = page.get_by_test_id("preview-modal")
+    expect(modal.get_by_test_id("sim-status")).to_have_attribute("data-ok", "false")
+    codes = [c.get_attribute("data-code") for c in modal.get_by_test_id("violation").all()]
+    assert codes == ["READ_ONLY_REMOTE"], codes
+    expect(modal.get_by_test_id("sim-status")).to_contain_text("2 個問題")  # that card, and the one clash
+    # The simulator's own sentence reaches the page as a code plus params, and reads in the language of the page.
+    raw = modal.get_by_test_id("violation").first.get_by_test_id("problem-raw")
+    expect(raw).to_have_text("READ_ONLY_REMOTE 「gd:」沒有設定 write_remote（沒有寫入權限）。")
+    page.keyboard.press("Escape")
+    page.get_by_test_id("lang-toggle").click()
+    page.get_by_test_id("preview-button").click()
+    expect(page.get_by_test_id("preview-modal").get_by_test_id("violation").first.get_by_test_id("problem-raw")).to_have_text(
+        'READ_ONLY_REMOTE "gd:" has no write_remote configured.')
     me.finish()

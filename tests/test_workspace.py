@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import posixpath
 import random
+import time
+import unicodedata
 from collections import Counter
 
 import pytest
 
-from drivemerge import db, plans, simulate
+from drivemerge import db, dirstats, plans, simulate
 from drivemerge import workspace as ws
 from drivemerge.workspace import WorkspaceError
 
@@ -33,7 +35,8 @@ def refresh_stats(conn) -> None:
     """Brute-force dir_stats, so the additive after-view formula has an exact 'before'."""
     conn.execute("DELETE FROM dir_stats")
     ents = [dict(r) for r in conn.execute("SELECT * FROM entries WHERE present = 1")]
-    copies = Counter(e["content_group"] for e in ents if not e["is_dir"] and e["content_group"] is not None)
+    copies = Counter(e["content_group"] for e in ents
+                     if not e["is_dir"] and e["content_group"] is not None and (e["size"] or 0) > 0)
     dirs = {(e["remote_id"], e["path"]) for e in ents if e["is_dir"]}
     dirs |= {(r[0], "") for r in conn.execute("SELECT id FROM remotes")}
     for rid, d in dirs:
@@ -42,7 +45,8 @@ def refresh_stats(conn) -> None:
         conn.execute(
             "INSERT INTO dir_stats(remote_id, path, files, dirs, bytes, dup_files) VALUES (?, ?, ?, ?, ?, ?)",
             (rid, d, len(files), sum(1 for e in under if e["is_dir"]), sum(e["size"] or 0 for e in files),
-             sum(1 for e in files if e["content_group"] is not None and copies[e["content_group"]] >= 2)))
+             sum(1 for e in files if e["content_group"] is not None and (e["size"] or 0) > 0
+                 and copies[e["content_group"]] >= 2)))
 
 
 def L(spec: str) -> dict:
@@ -267,7 +271,8 @@ def test_dragging_away_and_back_is_a_net_noop(world):
     mv(conn, d, "gdrive:A/zz.txt", "gdrive:B", new_name="z.txt")
     ops, info = ws.build_ops(conn, d)
     assert ops == [] and info["changes"] == [] and info["empty_dirs_left"] == 0
-    assert ws.preview(conn, d) == {"plan_id": None, "message": "nothing to do", "stale_actions": []}
+    assert ws.preview(conn, d) == {"plan_id": None, "message": "nothing to do", "stale_actions": [],
+                                   "empty_dirs_skipped": []}
     assert ws.get_draft(conn, d)["summary"]["moved_files"] == 0
     for p, items in before.items():
         after = ls(conn, p, d)
@@ -289,6 +294,49 @@ def test_swapping_a_name_back_with_a_rename_is_a_noop_too(world):
     mv(conn, d, "gdrive:Q/f.txt", "gdrive:Q", new_name="g.txt")
     mv(conn, d, "gdrive:Q/g.txt", "gdrive:P", new_name="f.txt")
     assert ws.build_ops(conn, d)[0] == []
+
+
+def test_moving_folders_that_hold_no_files_is_reported_not_silently_dropped(world):
+    """Ops are per file, so a folder without files never travels. The page shows it in its new home, so the
+    preview has to say that nothing will happen to it."""
+    conn, cat, g, _ = world
+    for path in ("Projects", "Projects/2019", "Archive"):
+        cat.dir(g, path)
+    d = new_draft(conn)
+    mv(conn, d, "gdrive:Projects/2019", "gdrive:Archive")
+    assert list(ls(conn, "gdrive:Archive", d)) == ["2019"]                    # on screen it moved
+    out = ws.preview(conn, d)
+    assert out["plan_id"] is None and out["stale_actions"] == []
+    assert out["empty_dirs_skipped"] == [{"from": {"remote": "gdrive", "path": "Projects/2019"},
+                                          "to": {"remote": "gdrive", "path": "Archive/2019"}}]
+    assert ws.build_ops(conn, d)[0] == []
+
+
+def test_empty_subfolders_of_a_moved_folder_are_listed_once_at_their_top(world):
+    conn, cat, g, x = world
+    put(cat, g, "School/notes.txt", size=3, md5="aa", group=1)
+    put(cat, g, "School/deep/er/f.txt", size=3, md5="bb", group=2)             # folders that hold a file travel
+    for path in ("School/empty", "School/empty/inner", "School/also"):
+        cat.dir(g, path)
+    cat.dir(x, "Archive")
+    d = new_draft(conn)
+    mv(conn, d, "gdrive:School", "dropbox:Archive")
+    out = ws.preview(conn, d)
+    assert out["plan_id"] is not None and out["summary"]["ops"] == {"move": 0, "copy": 2, "delete": 2}
+    assert [(e["from"]["path"], e["to"]["remote"], e["to"]["path"]) for e in out["empty_dirs_skipped"]] == [
+        ("School/also", "dropbox", "Archive/School/also"), ("School/empty", "dropbox", "Archive/School/empty")]
+    assert out["summary"]["empty_dirs_skipped"] == 2
+    assert out["ok"] is True                                                    # harmless, but nobody is left guessing
+
+
+def test_a_draft_that_moves_files_only_reports_no_skipped_folders(world):
+    conn, cat, g, _ = world
+    put(cat, g, "A/x/f.txt", size=3, md5="aa", group=1)
+    cat.dir(g, "B")
+    d = new_draft(conn)
+    mv(conn, d, "gdrive:A", "gdrive:B")
+    out = ws.preview(conn, d)
+    assert out["empty_dirs_skipped"] == [] and out["summary"]["empty_dirs_skipped"] == 0
 
 
 def test_paths_match_by_whole_segments_only(world):
@@ -365,6 +413,39 @@ def test_folder_merge_with_identical_files_dedupes_with_a_witness(world):
     assert out["simulation"]["ok"] and out["summary"]["dedupes"] == 1
     assert out["summary"]["ops"] == {"move": 1, "copy": 0, "delete": 1}
     assert plans.get_plan(conn, out["plan_id"]).status == "simulated"
+
+
+def test_empty_files_are_not_duplicates_in_the_tree_or_in_the_folder_counts(world):
+    """Every empty file shares one hash. Search, the duplicate list and dir_stats leave them out, so a folder
+    badge must not count them either (a file row would say "duplicate" while its folder says none)."""
+    conn, cat, g, x = world
+    put(cat, g, "proj1/__init__.py", size=0, md5="e", group=1)
+    put(cat, x, "proj2/__init__.py", size=0, md5="e", group=1)
+    put(cat, g, "proj1/real.bin", size=5, md5="r", group=2)
+    put(cat, x, "proj2/real.bin", size=5, md5="r", group=2)
+    dirstats.refresh(conn)
+    first = ls(conn, "gdrive:proj1")
+    assert (first["__init__.py"]["dup_files"], first["real.bin"]["dup_files"]) == (0, 1)
+    assert ls(conn, "gdrive:")["proj1"]["dup_files"] == 1 == dirstats.get(conn, g, "proj1")["dup_files"]
+    d = new_draft(conn)
+    mv(conn, d, "gdrive:proj1", "dropbox:")
+    assert ls(conn, "dropbox:", d)["proj1"]["dup_files"] == 1                  # same answer after the move
+
+
+def test_a_merge_that_deletes_an_empty_file_does_not_take_a_duplicate_off_its_folder(world):
+    """The survivor of a deleted twin stops being a duplicate -- unless the twin is an empty file, which never was."""
+    conn, cat, g, x = world
+    put(cat, x, "a/empty.txt", size=0, md5="e", group=1)
+    put(cat, x, "a/r1.bin", size=5, md5="r", group=2)
+    put(cat, x, "a/r2.bin", size=5, md5="r", group=2)
+    put(cat, g, "a/empty.txt", size=0, md5="e", group=1)
+    dirstats.refresh(conn)
+    assert dirstats.get(conn, x, "a")["dup_files"] == 2
+    d = new_draft(conn)
+    mv(conn, d, "gdrive:a", "dropbox:")                      # merges into dropbox:a; its empty.txt twin is deleted
+    assert ws.preview(conn, d)["summary"]["dedupes"] == 1
+    merged = ls(conn, "dropbox:", d)["a"]
+    assert (merged["files"], merged["dup_files"]) == (3, 2)
 
 
 def test_the_after_view_agrees_with_the_simulator_when_a_merge_drops_an_identical_file(world):
@@ -480,27 +561,78 @@ def test_case_only_rename_warns_but_is_allowed_when_alone(world):
     put(cat, x, "d/other.md", group=2)
     d = new_draft(conn)
     r = mv(conn, d, "dropbox:d/readme.md", "dropbox:d", new_name="README.md")
-    assert codes(r) == []                                    # the only "clash" is the file itself
+    assert codes(r) == ["CASE_ONLY_RENAME"]                  # the only "clash" is the file itself: no CASE_COLLISION
     r = mv(conn, d, "dropbox:d/other.md", "dropbox:d", new_name="README.MD")
     assert codes(r) == ["CASE_COLLISION"]
     mk = mkdir(conn, d, "dropbox:d", "Readme.md")
     assert codes(mk) == ["CASE_COLLISION"]
 
 
-def test_case_only_renames_pass_the_simulator_on_a_case_insensitive_remote(world):
+def test_case_only_renames_on_a_case_insensitive_remote_are_conflicts_not_clean_drafts(world):
+    """The simulator allows a rename by move, but the executor refuses a move onto the file itself (the cloud
+    finds the source under the new spelling), and moving file by file cannot change a folder's case either. So
+    the preview must say so before anyone approves, instead of calling the draft clean and failing at run time."""
     conn, cat, g, x = world
     put(cat, x, "d/readme.md", size=3, dropbox="aa", group=1)
     put(cat, x, "Thesis/a.txt", size=3, dropbox="bb", group=2)
     put(cat, x, "Thesis/sub/b.txt", size=3, dropbox="cc", group=3)
     d = new_draft(conn)
-    assert codes(mv(conn, d, "dropbox:d/readme.md", "dropbox:d", new_name="README.md")) == []
-    assert codes(mv(conn, d, "dropbox:Thesis", "dropbox:", new_name="thesis")) == []
+    # staging allows it but says so at once (the toast), long before anyone opens the preview
+    assert codes(mv(conn, d, "dropbox:d/readme.md", "dropbox:d", new_name="README.md")) == ["CASE_ONLY_RENAME"]
+    assert codes(mv(conn, d, "dropbox:Thesis", "dropbox:", new_name="thesis")) == ["CASE_ONLY_RENAME"]
     ops, info = ws.build_ops(conn, d)
     assert describe(conn, ops) == [("move", "dropbox:Thesis/a.txt", "dropbox:thesis/a.txt"),
                                    ("move", "dropbox:Thesis/sub/b.txt", "dropbox:thesis/sub/b.txt"),
                                    ("move", "dropbox:d/readme.md", "dropbox:d/README.md")]
-    assert info["conflicts"] == [] and sim(conn, ops).ok
-    assert ws.preview(conn, d)["ok"]
+    # one conflict for the folder that was renamed (not one per file in it), one for the lone file
+    assert [(c["code"], c["from"]["path"], c["to"]["path"]) for c in info["conflicts"]] == [
+        ("CASE_ONLY_RENAME", "Thesis", "thesis"), ("CASE_ONLY_RENAME", "d/readme.md", "d/README.md")]
+    assert sim(conn, ops).ok                                 # the simulator alone cannot see it
+    out = ws.preview(conn, d)
+    assert out["ok"] is False and out["summary"]["conflicts"] == 2
+    assert [c["code"] for c in out["conflicts"]] == ["CASE_ONLY_RENAME"] * 2
+    assert "CYCLE" not in [c["code"] for c in out["conflicts"]]     # landing on its own spot is not a wait
+
+
+def test_a_respelled_name_is_the_same_name_on_a_remote_that_ignores_case_and_unicode_form(world):
+    conn, cat, g, x = world
+    nfd, nfc = unicodedata.normalize("NFD", "café.txt"), unicodedata.normalize("NFC", "café.txt")
+    assert nfd != nfc
+    put(cat, x, f"d/{nfd}", size=3, dropbox="aa", group=1)
+    put(cat, x, "d/Notes.txt", size=3, dropbox="bb", group=2)
+    put(cat, x, "d/Plain.txt", size=3, dropbox="cc", group=3)
+    cat.dir(x, "other")
+    d = new_draft(conn)
+    assert codes(mv(conn, d, f"dropbox:d/{nfd}", "dropbox:d", new_name=nfc)) == ["CASE_ONLY_RENAME"]
+    assert [(c["code"], c["to"]["path"]) for c in ws.build_ops(conn, d)[1]["conflicts"]] == [
+        ("CASE_ONLY_RENAME", f"d/{nfc}")]
+    ws.undo(conn, d)
+    # what is not a respelling in place is fine: a new name, the same name in another folder, another case elsewhere
+    assert codes(mv(conn, d, "dropbox:d/Notes.txt", "dropbox:d", new_name="Notes2.txt")) == []
+    assert codes(mv(conn, d, "dropbox:d/Plain.txt", "dropbox:other", new_name="PLAIN.txt")) == []
+    out = ws.preview(conn, d)
+    assert out["conflicts"] == [] and out["ok"] is True
+
+
+def test_the_same_case_only_rename_is_fine_on_a_case_sensitive_remote(world):
+    conn, cat, g, x = world
+    put(cat, g, "Thesis/a.txt", size=3, md5="aa", group=1)
+    d = new_draft(conn)
+    assert codes(mv(conn, d, "gdrive:Thesis", "gdrive:", new_name="thesis")) == []       # no warning either
+    out = ws.preview(conn, d)
+    assert out["conflicts"] == [] and out["ok"] is True
+    assert describe(conn, plans.get_plan(conn, out["plan_id"]).ops) == [
+        ("move", "gdrive:Thesis/a.txt", "gdrive:thesis/a.txt")]
+
+
+def test_a_local_disk_declared_case_insensitive_is_treated_like_dropbox(conn, catalog):
+    """`case_insensitive = true` on a local remote reaches staging, the preview and the plan, not just the executor."""
+    disk = catalog.remote("disk", "local", case_insensitive=True)
+    put(catalog, disk, "Photos/a.jpg", size=3, md5="aa", group=1)
+    d = new_draft(conn)
+    assert codes(mv(conn, d, "disk:Photos", "disk:", new_name="photos")) == ["CASE_ONLY_RENAME"]
+    out = ws.preview(conn, d)
+    assert out["ok"] is False and [c["code"] for c in out["conflicts"]] == ["CASE_ONLY_RENAME"]
 
 
 def test_files_landing_in_one_action_dedupe_against_each_other(world):
@@ -650,6 +782,59 @@ def test_warnings(world):
     assert not ws.preview(conn, d)["simulation"]["ok"]
 
 
+def test_a_multi_item_drag_lists_the_destination_once_not_once_per_item(world, monkeypatch):
+    """Listing a folder walks every sub-move, so doing it per dragged item made staging cubic on Dropbox/OneDrive
+    (400 files into a folder of 400: ~16 s under the server lock, minutes for 1000) while Drive took milliseconds."""
+    conn, cat, g, x = world
+    n = 120
+    for i in range(n):
+        put(cat, x, f"src/new{i}.txt", size=1)
+        put(cat, x, f"dst/old{i}.txt", size=1)
+    listed = []
+    original = ws._Space.children
+    monkeypatch.setattr(ws._Space, "children", lambda self, r, d: listed.append((r, d)) or original(self, r, d))
+    d = new_draft(conn)
+    r = mv(conn, d, [f"dropbox:src/new{i}.txt" for i in range(n)], "dropbox:dst")
+    assert codes(r) == [] and len(listed) == 1
+    assert len(ls(conn, "dropbox:dst", d)) == 2 * n
+
+
+def test_staging_hundreds_of_items_into_a_case_insensitive_folder_stays_fast(world):
+    conn, cat, g, x = world
+    n = 300
+    for i in range(n):
+        put(cat, x, f"src/new{i}.txt", size=1)
+        put(cat, x, f"dst/old{i}.txt", size=1)
+    d = new_draft(conn)
+    started = time.perf_counter()
+    mv(conn, d, [f"dropbox:src/new{i}.txt" for i in range(n)], "dropbox:dst")
+    assert time.perf_counter() - started < 3.0               # ~0.05 s now; it took 7 s while it was cubic
+
+
+def test_case_clashes_inside_one_multi_item_drag_are_still_found(world):
+    conn, cat, g, x = world
+    put(cat, x, "a/Report.pdf", group=1)
+    put(cat, x, "b/report.PDF", group=2)
+    put(cat, x, "c/Other.txt", group=3)
+    put(cat, x, "dst/REPORT.pdf", group=4)
+    put(cat, x, "e/readme.md", group=5)
+    cat.dir(x, "empty")
+    d = new_draft(conn)
+    # against what is already there ...
+    assert codes(mv(conn, d, "dropbox:a/Report.pdf", "dropbox:dst")) == ["CASE_COLLISION"]
+    ws.undo(conn, d)
+    # ... and against an item of the same drag that lands first
+    r = mv(conn, d, ["dropbox:b/report.PDF", "dropbox:c/Other.txt", "dropbox:e/readme.md"], "dropbox:empty")
+    assert codes(r) == []
+    ws.undo(conn, d)
+    put(cat, x, "f/README.MD", group=6)
+    r = mv(conn, d, ["dropbox:e/readme.md", "dropbox:f/README.MD"], "dropbox:empty")
+    assert codes(r) == ["CASE_COLLISION"]                    # the second one differs from the first only by case
+    # a rename inside the folder is not a clash with its own old spelling
+    ws.undo(conn, d)
+    assert codes(mv(conn, d, "dropbox:dst/REPORT.pdf", "dropbox:dst", new_name="Report.pdf")) == ["CASE_ONLY_RENAME"]
+
+
 # ------------------------------------------------------------------ quarantine
 
 Q = ".drive-merge-quarantine"
@@ -664,7 +849,8 @@ def test_nothing_is_staged_out_of_into_or_around_the_quarantine_folder(world):
     cat.dir(g, "B")
     d = new_draft(conn)
 
-    refuse(conn, d, "QUARANTINE", f"gdrive:{Q}/7/A/old.txt", "gdrive:B")          # out of it: a file
+    assert refuse(conn, d, "QUARANTINE", f"gdrive:{Q}/7/A/old.txt", "gdrive:B").params == {
+        "item": L(f"gdrive:{Q}/7/A/old.txt")}                                           # out of it: a file
     refuse(conn, d, "QUARANTINE", f"gdrive:{Q}/7", "gdrive:B")                    # a folder inside
     refuse(conn, d, "QUARANTINE", f"gdrive:{Q}", "gdrive:B")                      # the folder itself
     refuse(conn, d, "QUARANTINE", f"gdrive:{Q}/7/A/old.txt", f"gdrive:{Q}/7/A", new_name="renamed.txt")
@@ -871,6 +1057,34 @@ def test_cross_remote_merge_with_identical_content_just_removes_the_source(world
     assert sim(conn, ops).ok
 
 
+def test_a_merge_that_deletes_instead_of_copying_is_not_a_cross_cloud_transfer(world):
+    """The approval card says how much goes through this machine: files the merge deletes (identical content is
+    already there) are not copied, so they must not count, in the preview and in the staged list alike."""
+    conn, cat, g, x = world
+    big = 5 * 1024 ** 3
+    put(cat, x, "Thesis/dup.bin", size=big, dropbox="d1", group=1)         # identical copy already on Drive
+    put(cat, x, "Thesis/new.bin", size=10, dropbox="d2", group=2)
+    put(cat, g, "Thesis/dup.bin", size=big, md5="m1", group=1)
+    refresh_stats(conn)
+    d = new_draft(conn)
+    mv(conn, d, "dropbox:Thesis", "gdrive:")
+    out = ws.preview(conn, d)
+    assert out["summary"]["dedupes"] == 1 and out["simulation"]["op_counts"] == {"copy": 1, "move": 0, "delete": 2}
+    assert out["simulation"]["bytes_cross_remote"] == 10
+    assert out["summary"]["cross_remote_bytes"] == out["simulation"]["bytes_cross_remote"]
+    assert ws.get_draft(conn, d)["summary"]["cross_remote_bytes"] == 10
+    # both files still leave Dropbox, so the other totals are unchanged
+    assert out["summary"]["moved_files"] == 2 and out["summary"]["moved_bytes"] == big + 10
+
+    # only identical files: nothing is transferred at all
+    ws.remove_action(conn, d, ws.get_draft(conn, d)["actions"][0]["id"])
+    conn.execute("UPDATE entries SET present = 0 WHERE path = 'Thesis/new.bin'")
+    mv(conn, d, "dropbox:Thesis", "gdrive:")
+    out = ws.preview(conn, d)
+    assert out["simulation"]["bytes_cross_remote"] == 0 and out["summary"]["cross_remote_bytes"] == 0
+    assert ws.get_draft(conn, d)["summary"]["cross_remote_bytes"] == 0
+
+
 def test_swapping_across_remotes_is_reported_not_attempted_blindly(world):
     conn, cat, g, x = world
     put(cat, g, "a/f.txt", size=10, md5="aa", group=1)
@@ -966,6 +1180,24 @@ def test_a_swap_has_no_valid_order_and_is_flagged(world):
     ops, info = ws.build_ops(conn, d)
     assert len(ops) == 2 and sorted(c["code"] for c in info["conflicts"]) == ["CYCLE", "CYCLE"]
     assert not ws.preview(conn, d)["simulation"]["ok"]
+
+
+def test_a_file_that_would_have_to_move_into_itself_is_a_cycle_with_an_explanation(world):
+    """c (holding x.txt) is dragged into dropbox's c under the name x.txt and that c back to the root: the file
+    c/x.txt has to end up at c/x.txt/x.txt, which can only happen after it has left, i.e. it waits on itself."""
+    conn, cat, g, x = world
+    put(cat, g, "c/x.txt", size=3, md5="aa", group=1)
+    cat.dir(x, "c")
+    d = new_draft(conn)
+    mv(conn, d, "gdrive:c", "dropbox:c", new_name="x.txt")
+    mv(conn, d, "dropbox:c", "gdrive:")
+    ops, info = ws.build_ops(conn, d)
+    assert describe(conn, ops) == [("move", "gdrive:c/x.txt", "gdrive:c/x.txt/x.txt")]
+    assert [(c["code"], c["from"]["path"], c["to"]["path"]) for c in info["conflicts"]] == [
+        ("CYCLE", "c/x.txt", "c/x.txt/x.txt")]
+    assert not sim(conn, ops).ok                             # the simulator stops it as well; now the draft says why
+    out = ws.preview(conn, d)
+    assert out["ok"] is False and [c["code"] for c in out["conflicts"]] == ["CYCLE"]
 
 
 # --------------------------------------------------------------- undo and redo
@@ -1396,7 +1628,7 @@ def test_preview_binds_the_plan_to_the_draft_version(world):
     dr = ws.get_draft(conn, d)
     assert (dr["preview_plan_id"], dr["preview_version"]) == (plan.id, 1)
     assert set(out) == {"plan_id", "draft_version", "ok", "simulation", "summary", "changes", "conflicts",
-                        "empty_dirs_left", "stale_actions"}
+                        "empty_dirs_left", "empty_dirs_skipped", "stale_actions"}
     assert out["ok"] is True
     assert out["changes"] == [{"from": {"remote": "gdrive", "path": "A"}, "to": {"remote": "gdrive", "path": "B/A"},
                                "files": 1, "bytes": 3, "kind": "move", "is_dir": True}]
@@ -1422,6 +1654,95 @@ def test_preview_binds_the_plan_to_the_draft_version(world):
     assert ws.is_stale_preview(conn, again["plan_id"])
     other = plans.create_plan(conn, "x", "manual", [], created_by="t")
     assert not ws.is_stale_preview(conn, other)
+
+
+def test_a_plan_that_only_claims_to_be_a_preview_is_not_judged_by_a_draft(world):
+    """Only workspace.preview makes a plan of kind 'workspace', created by 'workspace'; a proposer's params
+    cannot tie its plan to someone's open draft (the same rule as Service.execute)."""
+    conn, cat, g, _ = world
+    d = new_draft(conn)
+    params = {"draft_id": d, "draft_version": 99}
+    forged = plans.create_plan(conn, "x", "workspace", [], created_by="api", params=params)
+    genuine = plans.create_plan(conn, "x", "workspace", [], created_by="workspace", params=params)
+    assert not ws.is_stale_preview(conn, forged)
+    assert ws.is_stale_preview(conn, genuine)                 # version 99 is not the draft's version 0
+
+
+def test_previewing_a_draft_that_became_empty_retires_the_plan_of_the_moves_taken_back(world):
+    """The CLI approves any simulated plan, so a plan for moves the draft no longer holds must not stay one."""
+    conn, cat, g, _ = world
+    put(cat, g, "A/f.txt", size=3, md5="aa", group=1)
+    cat.dir(g, "B")
+    d = new_draft(conn)
+    mv(conn, d, "gdrive:A/f.txt", "gdrive:B")
+    first = ws.preview(conn, d)
+    ws.undo(conn, d)
+    out = ws.preview(conn, d)
+    assert out["plan_id"] is None and out["message"] == "nothing to do"
+    assert plans.get_plan(conn, first["plan_id"], with_ops=False).status == "cancelled"
+    with pytest.raises(plans.PlanError):
+        plans.approve_plan(conn, first["plan_id"], plans.short_code(first["simulation"]["digest"]), approved_by="cli")
+    dr = ws.get_draft(conn, d)
+    assert (dr["preview_plan_id"], dr["preview_version"]) == (None, None)       # nothing is "the current preview"
+    assert ws.preview(conn, d)["plan_id"] is None                               # and asking again is harmless
+
+    # an approved one is retired as well
+    mv(conn, d, "gdrive:A/f.txt", "gdrive:B")
+    second = ws.preview(conn, d)
+    plans.approve_plan(conn, second["plan_id"], plans.short_code(second["simulation"]["digest"]), approved_by="cli")
+    ws.undo(conn, d)
+    ws.preview(conn, d)
+    assert plans.get_plan(conn, second["plan_id"], with_ops=False).status == "cancelled"
+
+
+def test_a_preview_whose_steps_all_went_stale_is_retired_too(world):
+    conn, cat, g, _ = world
+    put(cat, g, "A/f.txt", size=3, md5="aa", group=1)
+    cat.dir(g, "B")
+    d = new_draft(conn)
+    mv(conn, d, "gdrive:A/f.txt", "gdrive:B")
+    first = ws.preview(conn, d)
+    conn.execute("UPDATE entries SET present = 0 WHERE path = 'A/f.txt'")        # a rescan: the file is gone
+    out = ws.preview(conn, d)
+    assert out["plan_id"] is None and len(out["stale_actions"]) == 1
+    assert plans.get_plan(conn, first["plan_id"], with_ops=False).status == "cancelled"
+    # the draft version did not move, so the pointer must not claim that a (dead) preview is current
+    assert ws.get_draft(conn, d)["preview_plan_id"] is None
+
+
+def test_a_plan_that_already_ran_is_history_and_stays(world):
+    conn, cat, g, _ = world
+    put(cat, g, "A/f.txt", size=3, md5="aa", group=1)
+    cat.dir(g, "B")
+    d = new_draft(conn)
+    mv(conn, d, "gdrive:A/f.txt", "gdrive:B")
+    first = ws.preview(conn, d)
+    plans.set_status(conn, first["plan_id"], "done")
+    ws.undo(conn, d)
+    assert ws.preview(conn, d)["plan_id"] is None
+    assert plans.get_plan(conn, first["plan_id"], with_ops=False).status == "done"
+    assert ws.get_draft(conn, d)["preview_plan_id"] == first["plan_id"]
+
+
+def test_discarding_a_draft_cancels_its_unrun_preview_plan(world):
+    conn, cat, g, _ = world
+    put(cat, g, "A/f.txt", size=3, md5="aa", group=1)
+    cat.dir(g, "B")
+    d = new_draft(conn)
+    mv(conn, d, "gdrive:A/f.txt", "gdrive:B")
+    pid = ws.preview(conn, d)["plan_id"]
+    ws.discard_draft(conn, d)
+    assert plans.get_plan(conn, pid, with_ops=False).status == "cancelled"
+    ws.discard_draft(conn, d)                                                   # idempotent
+    # one that ran is kept
+    d2 = new_draft(conn)
+    mv(conn, d2, "gdrive:A/f.txt", "gdrive:B", new_name="g.txt")
+    ran = ws.preview(conn, d2)["plan_id"]
+    plans.set_status(conn, ran, "done")
+    ws.discard_draft(conn, d2)
+    assert plans.get_plan(conn, ran, with_ops=False).status == "done"
+    # a draft that was never previewed has nothing to cancel
+    ws.discard_draft(conn, new_draft(conn))
 
 
 def test_a_failed_preview_still_records_the_plan_but_never_becomes_approvable(world):
@@ -1790,7 +2111,9 @@ def propose(rng, m: Model, names: dict[int, str]) -> dict:
     return body
 
 
-@pytest.mark.parametrize("seed, tame", [(20240601, False), (7, False), (424242, True), (11, True)])
+# 5004, 6016 and 6036 once produced a file that had to move into a folder of its own name: unflagged and unexecutable.
+@pytest.mark.parametrize("seed, tame", [(20240601, False), (7, False), (424242, True), (11, True),
+                                        (5004, False), (6016, True), (6036, True)])
 def test_random_drafts_match_a_naive_model(conn, catalog, seed, tame):
     rng = random.Random(seed)
     rid = random_catalog(catalog, rng, tame)
@@ -1888,3 +2211,60 @@ def redo_expected(conn, d, base):
         return code
     m.apply(target)
     return [a["id"] for a in head] + [target["id"]] + [a["id"] for a in replay_ok(m, tail)]
+
+
+# ------------------------------------------------- messages a page can word itself
+
+
+def test_warnings_carry_params_so_a_page_can_word_them(world):
+    """Each warning is a code plus the facts of its English message (a place is {"remote", "path"})."""
+    conn, cat, g, x = world
+    ro = cat.remote("archive", "other", writable=False)
+    put(cat, g, "a/f.txt", group=1)
+    put(cat, g, "Research/Thesis/c.txt", group=3)
+    put(cat, g, "School/Thesis/d.txt", group=4)
+    put(cat, x, "d/readme.md", group=5)
+    put(cat, x, "d/other.md", group=6)
+    cat.dir(x, "box")
+    d = new_draft(conn)
+    by_code = {}
+    for result in (mv(conn, d, "gdrive:Research/Thesis", "gdrive:School"),
+                   mv(conn, d, "gdrive:a/f.txt", "dropbox:box"),
+                   mv(conn, d, "dropbox:box/f.txt", "archive:"),
+                   mv(conn, d, "dropbox:d/readme.md", "dropbox:d", new_name="README.md"),
+                   mv(conn, d, "dropbox:d/other.md", "dropbox:d", new_name="README.MD")):
+        by_code.update({w["code"]: w for w in result["warnings"]})
+    assert set(by_code) == {"MERGE", "CROSS_REMOTE", "READ_ONLY", "CASE_ONLY_RENAME", "CASE_COLLISION"}
+    for w in by_code.values():
+        assert isinstance(w["message"], str) and w["message"]       # the English sentence stays for CLI/API/MCP
+    assert by_code["MERGE"]["params"] == {"src": L("gdrive:Research/Thesis"), "into": L("gdrive:School/Thesis")}
+    assert by_code["CROSS_REMOTE"]["params"] == {"n": 1}
+    assert by_code["READ_ONLY"]["params"] == {"remote": "archive"}
+    assert by_code["CASE_ONLY_RENAME"]["params"] == {"remote": "dropbox", "from": "readme.md", "to": "README.md"}
+    assert by_code["CASE_COLLISION"]["params"] == {"remote": "dropbox", "name": "README.MD", "dst": L("dropbox:d")}
+    assert mkdir(conn, d, "archive:", "new")["warnings"][0]["params"] == {"remote": "archive"}
+
+
+def test_refusals_carry_params(world):
+    conn, cat, g, x = world
+    put(cat, g, "a/f.txt", group=1)
+    put(cat, g, "b/f.txt", group=2)
+    cat.dir(g, "c")
+    d = new_draft(conn)
+    assert refuse(conn, d, "SRC_NOT_FOUND", "gdrive:a/missing.txt", "gdrive:c").params == {"item": L("gdrive:a/missing.txt")}
+    assert refuse(conn, d, "DST_NOT_DIR", "gdrive:a/f.txt", "gdrive:b/f.txt").params == {"dst": L("gdrive:b/f.txt")}
+    assert refuse(conn, d, "INTO_ITSELF", "gdrive:a", "gdrive:a").params == {"item": L("gdrive:a")}
+    assert refuse(conn, d, "NAME_EXISTS", "gdrive:a/f.txt", "gdrive:b").params == {"item": L("gdrive:b/f.txt")}
+    assert refuse(conn, d, "BAD_NAME", "gdrive:a/f.txt", "gdrive:c", new_name="x/y").params == {"name": "x/y"}
+    assert refuse(conn, d, "NOOP", "gdrive:a/f.txt", "gdrive:a").params == {"dst": L("gdrive:a")}
+    with pytest.raises(WorkspaceError) as e:
+        ws.get_draft(conn, 999)
+    assert e.value.code == "NOT_FOUND" and e.value.params == {"draft": 999}
+    ws.discard_draft(conn, d)
+    with pytest.raises(WorkspaceError) as e:
+        mv(conn, d, "gdrive:a/f.txt", "gdrive:c")
+    assert e.value.code == "NOT_OPEN" and e.value.params == {"draft": d, "status": "discarded"}
+    with pytest.raises(WorkspaceError) as e:
+        ws.remove_action(conn, new_draft(conn), 7)
+    assert e.value.code == "NOT_FOUND" and set(e.value.params) == {"draft", "action"}
+    assert WorkspaceError("X", "message").params == {}

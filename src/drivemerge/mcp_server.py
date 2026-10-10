@@ -92,9 +92,9 @@ was applied.
 - Read before you move: browse_tree (view "after" is what the draft would produce, "before" is the catalog), \
 folder_profiles and suggest_reorganization (ready-made moves). A destination must be an existing folder; make a new \
 one with a "mkdir" step first.
-- Each move reports its own result. Pass every error and warning (MERGE, CROSS_REMOTE, READ_ONLY, CASE_COLLISION) \
-on to the human. undo_last and remove_staged retract staged moves, whoever made them. A step flagged stale no \
-longer fits the catalog after a rescan: it does nothing, so tell the human or remove it.
+- Each move reports its own result. Pass every error and warning (MERGE, CROSS_REMOTE, READ_ONLY, CASE_COLLISION, \
+CASE_ONLY_RENAME) on to the human. undo_last and remove_staged retract staged moves, whoever made them. A step \
+flagged stale no longer fits the catalog after a rescan: it does nothing, so tell the human or remove it.
 - The quarantine folder holds files deleted by executed plans; it cannot be staged (QUARANTINE). Only the human \
 restores or purges it with the command line.
 - preview_draft turns the draft into a simulated plan for the human to review. Give them its ok, conflicts, \
@@ -183,11 +183,21 @@ def _dup_group(group: dict) -> dict:
     return out
 
 
+def _plain(messages: Any) -> Any:
+    """Violations or warnings without `params`: they only let a web page word the English `message` in another language."""
+    if not isinstance(messages, list):
+        return messages
+    return [{k: v for k, v in m.items() if k != "params"} if isinstance(m, dict) else m for m in messages]
+
+
 def _report(report: dict | None) -> dict | None:
     """A simulation report without approval secrets and with long lists capped."""
     if report is None:
         return None
     out = {k: v for k, v in report.items() if k not in _HIDDEN_KEYS}
+    for key in ("violations", "warnings"):
+        if key in out:
+            out[key] = _plain(out[key])
     violations = out.get("violations") or []
     if violations:
         out["violations_by_code"] = dict(Counter(v.get("code") for v in violations))
@@ -672,7 +682,8 @@ def build_server(service: Service) -> MCPServer:
                 The moves of suggest_reorganization can be passed as they are.
             stop_on_error: leave the moves after the first failure unstaged (default: try each one).
         Returns staged, failed and one result per move: index, ok, and either action_id, seq and warnings (MERGE,
-        CROSS_REMOTE = copied through this machine, READ_ONLY, CASE_COLLISION), or code and error (SRC_NOT_FOUND,
+        CROSS_REMOTE = copied through this machine, READ_ONLY, CASE_COLLISION, CASE_ONLY_RENAME = a rename that only
+        changes the case on a cloud that ignores case, which the preview will refuse), or code and error (SRC_NOT_FOUND,
         DST_NOT_DIR, INTO_ITSELF, NAME_EXISTS, NOOP, BAD_NAME, QUARANTINE, BAD_REQUEST). Tell the human about every
         failure and warning. Also draft_version and summary (what the whole draft would move).
         """
@@ -708,7 +719,7 @@ def build_server(service: Service) -> MCPServer:
             else:
                 staged_n, version = staged_n + 1, staged["draft_version"]
                 results.append({"index": index, "ok": True, "action_id": staged["action"]["id"],
-                                "seq": staged["action"]["seq"], "warnings": staged["warnings"]})
+                                "seq": staged["action"]["seq"], "warnings": _plain(staged["warnings"])})
         data: dict[str, Any] = {"draft_id": draft_id, "staged": staged_n, "failed": len(moves) - staged_n,
                                 "results": results}
         if not staged_n:
@@ -770,17 +781,20 @@ def build_server(service: Service) -> MCPServer:
         Returns plan_id (null when the draft moves nothing), ok (the simulation passes AND there are no conflicts;
         only then can the human approve), summary (moved files and bytes, cross_remote_bytes, dedupes, conflicts,
         ops), changes (one row per moved folder or file: from, to, files, bytes, kind move | copy+delete | merge |
-        dedupe), conflicts (what blocks approval, each with a code), stale_actions (staged steps that no longer fit
-        the catalog and are left out), empty_dirs_left and the simulation report (violations, warnings, per-cloud
-        before/after, contents_lost, bytes_cross_remote). Give the human the plan id and every violation, conflict
-        and stale step; do not retry blindly.
+        dedupe), conflicts (what blocks approval, each with a code; CASE_ONLY_RENAME means a rename that only changes
+        the case on a cloud that ignores case, which cannot be carried out), stale_actions (staged steps that no
+        longer fit the catalog and are left out), empty_dirs_skipped (moved folders that hold no files: a cloud
+        changes through files only, so these are not created at the new place), empty_dirs_left and the simulation
+        report (violations, warnings, per-cloud before/after, contents_lost, bytes_cross_remote). Give the human the
+        plan id and every violation, conflict, stale step and skipped folder; do not retry blindly.
         """
         data = dict(service.preview_draft(draft_id))
         if data.get("simulation") is not None:
             data["simulation"] = _report(data["simulation"])
         if data.get("stale_actions"):
             data["stale_actions"] = [_draft_action(a) for a in data["stale_actions"]]
-        for key, cap in (("changes", MAX_CHANGES), ("conflicts", MAX_CONFLICTS), ("stale_actions", MAX_CONFLICTS)):
+        for key, cap in (("changes", MAX_CHANGES), ("conflicts", MAX_CONFLICTS), ("stale_actions", MAX_CONFLICTS),
+                         ("empty_dirs_skipped", MAX_CONFLICTS)):
             items = data.get(key)
             if isinstance(items, list) and len(items) > cap:
                 data[key], data[f"{key}_total"] = items[:cap], len(items)

@@ -7,6 +7,7 @@ detection needs hash *bridging* (see identity.py / hash_bridges table).
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 
 HASH_TYPES: tuple[str, ...] = ("md5", "sha1", "sha256", "dropbox", "quickxor")
@@ -23,6 +24,10 @@ class Provider:
     has_native_docs: bool           # objects with no bytes/hash (Google Docs, ...)
     notes: str = ""
 
+
+# A local disk is case-insensitive by default on macOS (APFS) and Windows (NTFS), and not on Linux; a mount that
+# differs (exFAT, a case-folded ext4) says so with `case_insensitive` in its [[remotes]] entry.
+LOCAL_CASE_INSENSITIVE = sys.platform in ("darwin", "win32")
 
 PROVIDERS: dict[str, Provider] = {
     "drive": Provider(
@@ -50,7 +55,7 @@ PROVIDERS: dict[str, Provider] = {
     # Local disks and rclone's in-memory backend: used for tests and for a
     # Mac's synced iCloud folder. rclone computes any hash by reading the file.
     "local": Provider(
-        "local", ("md5", "sha1", "sha256", "dropbox", "quickxor"), case_insensitive=False,
+        "local", ("md5", "sha1", "sha256", "dropbox", "quickxor"), case_insensitive=LOCAL_CASE_INSENSITIVE,
         allows_duplicate_paths=False, server_side_move=True, server_side_copy=True, has_native_docs=False,
         notes="Hashes are computed by reading every byte: scanning with hashes is slow on big disks.",
     ),

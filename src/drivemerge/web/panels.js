@@ -1,10 +1,12 @@
 // Side drawers: the staged-changes list and the folder suggestions.
-import { html, useContext, useEffect, useState } from './vendor/htm-preact-standalone.mjs';
+import { html, useContext, useEffect, useRef, useState } from './vendor/htm-preact-standalone.mjs';
 import { t } from './i18n.js';
 import * as api from './api.js';
 import { Icon } from './icons.js';
 import { AppCtx } from './ctx.js';
-import { describeAction, errorText, fmtBytes, fmtLoc, fmtNum, staleText } from './util.js';
+import {
+  describeAction, errorText, fmtBytes, fmtLoc, fmtNum, rescanText, sleep, staleText, suggestionText,
+} from './util.js';
 
 const SUGGESTION_NOTE = /^(related|duplicates):[0-9a-f]+$/i;
 
@@ -72,11 +74,18 @@ export function StagedDrawer({ draft, onClose }) {
   <//>`;
 }
 
+/** A suggestion is staged while the draft holds all its steps (each carries the suggestion id as its note). */
+const isStaged = (draft, s) => {
+  const steps = draft.actions.filter((a) => a.state === 'active' && a.note === s.id).length;
+  return steps > 0 && steps >= (s.actions || []).length;
+};
+
 function SuggestionCard({ s, added, onAdd, onReveal }) {
   const folders = s.folders || [];
+  const text = suggestionText(s);
   return html`<article class=${'sug-card' + (added ? ' added' : '')} data-testid="suggestion-card" data-sid=${s.id}>
-    <h3 class="sug-title">${s.title}</h3>
-    <p class="sug-reason">${s.reason}</p>
+    <h3 class="sug-title">${text.title}</h3>
+    <p class="sug-reason">${text.reason}</p>
     <ul class="sug-folders">
       ${folders.map((f, i) => html`<li key=${fmtLoc(f)}>
         <span class="sug-folder-name" title=${fmtLoc(f)}><${Icon} name="folder" size=${14} class="cat-folder" />
@@ -101,7 +110,6 @@ export function SuggestionsDrawer({ draft, onClose }) {
   const ctx = useContext(AppCtx);
   const [kind, setKind] = useState('related');
   const [state, setState] = useState({ loading: true, items: [], error: '' });
-  const [added, setAdded] = useState({});
 
   async function load(k) {
     setState({ loading: true, items: [], error: '' });
@@ -113,10 +121,7 @@ export function SuggestionsDrawer({ draft, onClose }) {
   }
   useEffect(() => { load(kind); }, [kind]);
 
-  async function add(s) {
-    const n = await ctx.stageMany(s.actions);
-    if (n === s.actions.length) setAdded((x) => ({ ...x, [`${draft.id}:${s.id}`]: true }));
-  }
+  const add = (s) => ctx.stageMany(s.actions);
 
   // Anchor on the chosen side and the first other folder on the opposite side, so the pair can be compared at once.
   function show(side, folders) {
@@ -140,8 +145,56 @@ export function SuggestionsDrawer({ draft, onClose }) {
     ${state.error && html`<p class="empty-hint error">${state.error}</p>`}
     ${!state.loading && !state.error && state.items.length === 0 && html`<p class="empty-hint">${t('sug.none')}</p>`}
     <div class="sug-list" data-testid="suggestion-list">
-      ${state.items.map((s) => html`<${SuggestionCard} key=${s.id} s=${s} added=${!!added[`${draft.id}:${s.id}`]}
+      ${state.items.map((s) => html`<${SuggestionCard} key=${s.id} s=${s} added=${isStaged(draft, s)}
         onAdd=${() => add(s)} onReveal=${show} />`)}
     </div>
   <//>`;
+}
+
+/**
+ * After a run the catalog lags behind the clouds until a scan finishes. Said once the run ends and kept on screen
+ * (closing the dialog must not hide it), with the one click that fixes it; a terminal-only page shows the command.
+ */
+export function CatalogBanner({ remotes, onFresh, onDismiss }) {
+  const ctx = useContext(AppCtx);
+  const [job, setJob] = useState(null);
+  const [error, setError] = useState('');
+  const alive = useRef(true);
+  useEffect(() => () => { alive.current = false; }, []);
+  const canRescan = ctx.config.approvals_enabled !== false;
+
+  async function rescan() {
+    setError('');
+    setJob({ progress: {} });
+    try {
+      const { job_id: id } = await api.rescan(remotes);
+      for (let misses = 0; alive.current;) {
+        await sleep(700);
+        let j;
+        try { j = await api.job(id); } catch (e) { misses += 1; if (misses > 10) throw e; continue; }
+        misses = 0;
+        if (!alive.current) return;
+        setJob(j);
+        if (j.status === 'failed') throw new Error(j.error || t('prog.rescanFailed'));
+        if (j.status === 'done') { onFresh(); return; }
+      }
+    } catch (e) {
+      if (!alive.current) return;
+      setError(errorText(e));
+      setJob(null);
+    }
+  }
+
+  return html`<div class="banner banner-outdated" role="status" data-testid="catalog-banner">
+    <${Icon} name="alert" size=${17} />
+    <span class="banner-text"><strong>${t('catalog.title')}</strong> ${t('catalog.text', { remotes: remotes.join(', ') })}
+      ${!canRescan && html` ${t('catalog.cli')} ${remotes.map((r) => html`<code key=${r}>drivemerge scan ${r}</code>${' '}`)}`}
+      ${error && html` <span class="banner-error" data-testid="catalog-error">${error}</span>`}</span>
+    ${job ? html`<span class="spinner" aria-hidden="true"></span>
+        <span class="banner-progress" data-testid="catalog-progress">${rescanText(job)}</span>`
+    : canRescan && html`<button class="btn btn-small" data-testid="catalog-rescan" onClick=${rescan}>
+        <${Icon} name="refresh" size=${14} /> ${t('catalog.rescan')}</button>`}
+    <button class="icon-btn" data-testid="catalog-dismiss" aria-label=${t('catalog.dismiss')} title=${t('catalog.dismiss')}
+      disabled=${!!job} onClick=${onDismiss}><${Icon} name="x" size=${15} /></button>
+  </div>`;
 }

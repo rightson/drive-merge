@@ -12,6 +12,7 @@ was: full listings (files, bytes, directories) are compared before and after.
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
@@ -168,7 +169,7 @@ class Env:
 
     def approve(self, pid: int) -> None:
         snap = db.snapshot(self.conn)
-        digest = plans.compute_digest(pid, plans.load_ops(self.conn, pid), snap)
+        digest = plans.compute_digest(self.conn, pid, plans.load_ops(self.conn, pid), snap)
         plans.record_simulation(self.conn, pid, SimulationReport(plan_id=pid, digest=digest, ok=True), snap)
         plans.approve_plan(self.conn, pid, plans.short_code(digest), approved_by="test")
 
@@ -336,7 +337,7 @@ def test_a_simulated_but_unapproved_plan_does_not_run(env):
     env.scan("gd")
     pid = env.plan([env.copy("gd", "a.bin", "gd", "b.bin")], approve=False)
     snap = db.snapshot(env.conn)
-    digest = plans.compute_digest(pid, plans.load_ops(env.conn, pid), snap)
+    digest = plans.compute_digest(env.conn, pid, plans.load_ops(env.conn, pid), snap)
     plans.record_simulation(env.conn, pid, SimulationReport(plan_id=pid, digest=digest, ok=True), snap)
     with pytest.raises(ExecutionError):
         env.run(pid)
@@ -1720,6 +1721,279 @@ def test_purge_after_a_mixed_plan_removes_nothing_but_quarantined_files(env):
     assert removed == {("dbx", env.qpath(pid, "Photos/p.jpg")), ("ic", env.qpath(pid, "Notes/n.txt")),
                        ("gd", env.qpath(pid, "a/dup.txt"))}
     assert all(after[k] == live_and_quarantine[k] for k in after)
+
+
+# --------------------------------------------------------------------------- #
+# md5 and QuickXorHash only prove a difference
+# --------------------------------------------------------------------------- #
+
+def collision_pair(seed: int = 1) -> tuple[bytes, bytes]:
+    """Two different files of equal size with the same QuickXorHash: A = X+Y and B = Y+X (160-byte rows swapped).
+
+    A byte's bit offset in QuickXorHash depends only on its position mod 160, so any permutation of whole rows
+    collides. Record-structured data does this by accident; anyone can do it on purpose."""
+    r = random.Random(seed)
+    x, y = r.randbytes(160), r.randbytes(160)
+    return x + y, y + x
+
+
+def test_the_collision_pair_really_collides_on_quickxor_only():
+    a, b = collision_pair()
+    ha, hb = hashing.hash_stream(io.BytesIO(a)), hashing.hash_stream(io.BytesIO(b))
+    assert a != b and len(a) == len(b) and ha["quickxor"] == hb["quickxor"]
+    assert all(ha[t] != hb[t] for t in ("md5", "sha1", "sha256", "dropbox"))
+
+
+def test_equal_quickxor_alone_does_not_prove_a_delete_witness(env):
+    a, b = collision_pair(1)
+    env.put("od", "docs/a.bin", a)
+    env.put("od", "keep/a.bin", b)
+    env.scan("od")
+    pid = env.plan([env.delete("od", "docs/a.bin", witness=("od", "keep/a.bin"))])
+    res = assert_refused(env, pid, env.tree())
+    assert "not provably identical" in res.error
+    assert env.spy.count("download") == 2, "QuickXor-only files are read on both sides and compared on sha256"
+    assert env.read("od", "docs/a.bin") == a and env.read("od", "keep/a.bin") == b
+
+
+def test_identical_files_in_a_quickxor_only_cloud_are_proven_by_reading_both(env):
+    data = blob(500, 3)
+    env.put("od", "docs/a.bin", data)
+    env.put("od", "keep/a.bin", data)
+    env.scan("od")
+    pid = env.plan([env.delete("od", "docs/a.bin", witness=("od", "keep/a.bin"))])
+    assert env.run(pid) == ExecResult(pid, "done", done=1)
+    assert env.spy.count("download") == 2
+    assert env.read("od", env.qpath(pid, "docs/a.bin")) == data and env.read("od", "keep/a.bin") == data
+    [verify] = [j for j in env.journal(pid, "verify") if j["detail"]["what"] == "witness check"]
+    assert verify["detail"]["verdict"] == "same" and verify["detail"]["how"] == "download"
+
+
+def test_the_bridge_of_a_drive_file_does_not_vouch_for_a_onedrive_file_with_its_quickxor(env):
+    """The documented flow: bridge once (the Drive copy), then delete the OneDrive source with the Drive witness."""
+    a, b = collision_pair(2)
+    env.put("gd", "Archive/thesis.pdf", a)
+    env.put("od", "Docs/thesis.pdf", b)
+    env.scan("gd", "od")
+    identity.bridge_entry(env.conn, Rclone(), env.entry("gd", "Archive/thesis.pdf")["id"], env.tmp / "bridge-tmp")
+    pid = env.plan([env.delete("od", "Docs/thesis.pdf", witness=("gd", "Archive/thesis.pdf"))])
+    res = assert_refused(env, pid, env.tree())
+    assert "not provably identical" in res.error
+    assert env.spy.paths("download") == [("Docs/thesis.pdf",)], "the OneDrive file itself is what gets read"
+
+
+def test_a_onedrive_file_bridged_from_its_own_bytes_is_proven_without_a_download(env):
+    data = blob(400, 6)
+    env.put("gd", "Archive/t.pdf", data)
+    env.put("od", "Docs/t.pdf", data)
+    env.scan("gd", "od")
+    identity.bridge_entry(env.conn, Rclone(), env.entry("od", "Docs/t.pdf")["id"], env.tmp / "bridge-tmp")
+    pid = env.plan([env.delete("od", "Docs/t.pdf", witness=("gd", "Archive/t.pdf"))])
+    assert env.run(pid) == ExecResult(pid, "done", done=1)
+    assert env.spy.count("download") == 0
+    assert env.read("od", env.qpath(pid, "Docs/t.pdf")) == data
+
+
+def test_a_onedrive_file_edited_after_its_own_bridge_is_read_again(env):
+    old, new = collision_pair(7)
+    env.put("gd", "Archive/t.pdf", old)
+    env.put("od", "Docs/t.pdf", old)
+    env.scan("gd", "od")
+    identity.bridge_entry(env.conn, Rclone(), env.entry("od", "Docs/t.pdf")["id"], env.tmp / "bridge-tmp")
+    op = env.delete("od", "Docs/t.pdf", witness=("gd", "Archive/t.pdf"))
+    env.put("od", "Docs/t.pdf", new)                  # same size, same QuickXor, new mtime: the bridge is stale
+    res = assert_refused(env, env.plan([op]), env.tree())
+    assert "not provably identical" in res.error and env.spy.count("download") == 1
+
+
+def test_purge_keeps_a_file_whose_witness_was_replaced_by_a_quickxor_twin(env):
+    a, b = collision_pair(3)
+    env.put("od", "docs/a.bin", a)
+    env.put("od", "keep/a.bin", a)
+    env.scan("od")
+    pid = env.plan([env.delete("od", "docs/a.bin", witness=("od", "keep/a.bin"))])
+    assert env.run(pid).status == "done"
+    env.put("od", "keep/a.bin", b)                    # same size, same QuickXor, other bytes
+    env.spy.calls.clear()
+    res = _kept(env, pid, source="od", data=a)
+    assert "not provably identical" in res.error
+
+
+def test_move_inside_a_quickxor_only_cloud_reads_nothing(env):
+    """Renaming an object the cloud keeps is told from itself by its size and QuickXor: no download."""
+    env.put("od", "a/x.bin", blob(120, 5))
+    env.scan("od")
+    pid = env.plan([env.move("od", "a/x.bin", "od", "b/z.bin")])
+    assert env.run(pid) == ExecResult(pid, "done", done=1)
+    assert env.read("od", "b/z.bin") == blob(120, 5) and not env.exists("od", "a/x.bin")
+    assert env.spy.count("download") == 0
+    [verify] = env.journal(pid, "verify")
+    assert verify["detail"]["verdict"] == "same" and "same object" in verify["detail"]["how"]
+
+
+def test_move_onto_a_quickxor_twin_with_other_bytes_is_refused_after_reading_both(env):
+    a, b = collision_pair(4)
+    env.put("od", "a.bin", a)
+    env.put("od", "b.bin", b)
+    env.scan("od")
+    pid = env.plan([env.move("od", "a.bin", "od", "b.bin")])
+    res = assert_refused(env, pid, env.tree())
+    assert "not provably identical" in res.error and env.spy.count("download") == 2
+
+
+def test_move_onto_identical_bytes_in_a_quickxor_only_cloud_is_proven_by_reading_both(env):
+    data = blob(90, 8)
+    env.put("od", "a.bin", data)
+    env.put("od", "b.bin", data)
+    env.scan("od")
+    pid = env.plan([env.move("od", "a.bin", "od", "b.bin")])
+    assert env.run(pid) == ExecResult(pid, "done", done=1)
+    assert env.spy.count("download") == 2 and env.read("od", env.qpath(pid, "a.bin")) == data
+
+
+def test_copy_into_a_quickxor_only_cloud_is_verified_by_reading_the_copy_back(env):
+    data = blob(700, 9)
+    env.put("gd", "a.bin", data)
+    env.scan("gd")
+    pid = env.plan([env.copy("gd", "a.bin", "od", "a.bin")])
+    assert env.run(pid) == ExecResult(pid, "done", done=1)
+    assert env.spy.paths("download") == [("a.bin",)] and env.read("od", "a.bin") == data
+    [bridge] = env.bridges()
+    assert bridge["sha256"] == hashlib.sha256(data).hexdigest()
+
+
+def test_copy_onto_a_quickxor_twin_with_other_bytes_is_refused(env):
+    a, b = collision_pair(5)
+    env.put("od", "a.bin", a)
+    env.put("od", "b.bin", b)
+    env.scan("od")
+    pid = env.plan([env.copy("od", "a.bin", "od", "b.bin")])
+    res = assert_refused(env, pid, env.tree())
+    assert "already exists" in res.error and env.read("od", "b.bin") == b
+
+
+# --------------------------------------------------------------------------- #
+# A local disk that is case-insensitive without the config saying so
+# --------------------------------------------------------------------------- #
+
+class CaseFoldSpy(Spy):
+    """stat() answers like APFS or NTFS: any spelling of an existing name finds the object. The config still
+    says provider 'local', i.e. case-sensitive. Listings show the spelling the object was created with."""
+
+    def stat(self, remote, path, *, hash_types=()):
+        cur, parts = Path(remote), []
+        for part in path.split("/"):
+            try:
+                names = os.listdir(cur)
+            except (FileNotFoundError, NotADirectoryError):
+                names = []
+            hit = part if part in names else next((n for n in names if n.casefold() == part.casefold()), part)
+            parts.append(hit)
+            cur = cur / hit
+        return super().stat(remote, "/".join(parts), hash_types=hash_types)
+
+
+def test_a_case_only_rename_on_a_case_insensitive_disk_never_quarantines_the_only_copy(env):
+    env.spy = CaseFoldSpy()
+    data = blob(300, 5)
+    env.put("gd", "Notes/Report.txt", data)
+    env.scan("gd")
+    pid = env.plan([env.move("gd", "Notes/Report.txt", "gd", "Notes/report.txt")])
+    res = assert_refused(env, pid, env.tree())
+    assert "only in case" in res.error
+    assert env.read("gd", "Notes/Report.txt") == data and env.files(quarantine=True) == {}
+
+
+def test_moving_into_a_folder_that_differs_only_in_case_never_quarantines_the_file(env):
+    """What the default photo rule does to a 'photos/2019/...' folder: the destination is the source itself."""
+    env.spy = CaseFoldSpy()
+    data = blob(300, 6)
+    env.put("gd", "photos/2019/p.jpg", data)
+    env.scan("gd")
+    pid = env.plan([env.move("gd", "photos/2019/p.jpg", "gd", "Photos/2019/p.jpg")])
+    res = assert_refused(env, pid, env.tree())
+    assert "only in case" in res.error and env.files(quarantine=True) == {}
+
+
+def test_a_witness_that_is_the_file_itself_in_another_case_is_refused_on_a_case_insensitive_disk(env):
+    env.spy = CaseFoldSpy()
+    data = blob(120, 7)
+    env.put("gd", "Docs/a.txt", data)
+    env.scan("gd")
+    pid = env.plan([env.delete("gd", "Docs/a.txt", witness=("gd", "docs/A.TXT"))])
+    res = assert_refused(env, pid, env.tree())
+    assert "witness is the file being deleted" in res.error
+    assert env.read("gd", "Docs/a.txt") == data and env.files(quarantine=True) == {}
+
+
+def test_a_rename_to_another_name_still_works_on_a_case_insensitive_disk(env):
+    env.spy = CaseFoldSpy()
+    data = blob(80, 8)
+    env.put("gd", "Notes/Report.txt", data)
+    env.scan("gd")
+    pid = env.plan([env.move("gd", "Notes/Report.txt", "gd", "Notes/Summary.txt")])
+    assert env.run(pid) == ExecResult(pid, "done", done=1)
+    assert env.read("gd", "Notes/Summary.txt") == data
+
+
+def test_files_that_differ_only_in_case_are_two_files_on_a_case_sensitive_disk(env):
+    """The listing shows both names, so the config's word stands: either is a fine witness for the other."""
+    data = blob(60, 9)
+    env.put("gd", "Docs/a.txt", data)
+    env.put("gd", "Docs/A.TXT", data)
+    env.put("gd", "docs/a.txt", data)
+    env.scan("gd")
+    pid = env.plan([env.delete("gd", "Docs/a.txt", witness=("gd", "Docs/A.TXT")),
+                    env.delete("gd", "docs/a.txt", witness=("gd", "Docs/A.TXT"))])
+    assert env.run(pid) == ExecResult(pid, "done", done=2)
+    assert env.read("gd", "Docs/A.TXT") == data and not env.exists("gd", "Docs/a.txt")
+
+
+def test_a_move_onto_a_case_variant_twin_is_a_dedupe_on_a_case_sensitive_disk(env):
+    data = blob(60, 10)
+    env.put("gd", "Docs/a.txt", data)
+    env.put("gd", "Docs/A.TXT", data)
+    env.scan("gd")
+    pid = env.plan([env.move("gd", "Docs/a.txt", "gd", "Docs/A.TXT")])
+    assert env.run(pid) == ExecResult(pid, "done", done=1)
+    assert env.read("gd", env.qpath(pid, "Docs/a.txt")) == data and env.read("gd", "Docs/A.TXT") == data
+
+
+def test_a_case_only_rename_to_a_free_name_works_on_a_case_sensitive_disk(env):
+    data = blob(60, 11)
+    env.put("gd", "Notes/Report.txt", data)
+    env.scan("gd")
+    pid = env.plan([env.move("gd", "Notes/Report.txt", "gd", "Notes/report.txt")])
+    assert env.run(pid) == ExecResult(pid, "done", done=1)
+    assert [p.name for p in (env.roots["gd"] / "Notes").iterdir()] == ["report.txt"]
+
+
+def test_a_listing_that_fails_stops_the_op_when_two_spellings_cannot_be_told_apart(env):
+    data = blob(60, 12)
+    env.put("gd", "Docs/a.txt", data)
+    env.put("gd", "Docs/A.TXT", data)
+    env.scan("gd")
+
+    def broken(*args, **kwargs):
+        raise RcloneError("network down")
+        yield  # pragma: no cover  (makes this a generator, like Rclone.lsjson)
+
+    env.spy.lsjson = broken
+    pid = env.plan([env.delete("gd", "Docs/a.txt", witness=("gd", "Docs/A.TXT"))])
+    res = assert_refused(env, pid, env.tree())
+    assert "cannot list" in res.error
+
+
+def test_a_case_insensitive_cloud_needs_no_listing_to_know_it(env):
+    """Dropbox/OneDrive are flagged: the answer is yes without asking the disk."""
+    data = blob(40, 13)
+    env.put("ci", "a.txt", data)
+    env.put("ci", "A.TXT", data)
+    env.scan("ci")
+    env.spy.lsjson = None      # any listing would blow up
+    pid = env.plan([env.move("ci", "a.txt", "ci", "A.TXT")])
+    res = assert_refused(env, pid, env.tree())
+    assert "only in case" in res.error
 
 
 # --------------------------------------------------------------------------- #

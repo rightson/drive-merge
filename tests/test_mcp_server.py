@@ -402,6 +402,18 @@ def test_propose_plan_without_title_and_with_stringified_params(fx, server, monk
     assert out["data"]["message"] == "nothing to do" and "reminder" not in out
 
 
+def test_propose_plan_cannot_claim_a_workspace_draft(fx, server):
+    """`draft_id` would make the plan stand in for the human's draft (and close it when it runs): only the
+    workspace preview may set it, so the model's params are refused and nothing is stored."""
+    ops = [{"op": "copy", "src": "gdrive:Docs/report.pdf", "dst": "dropbox:Docs/report.pdf"}]
+    for claim in ({"draft_id": 1}, {"draft_version": 1}, {"draft_id": 1, "draft_version": 2}):
+        message = err(server, "propose_plan", kind="manual", params={"ops": ops, **claim})
+        assert "reserved for workspace previews" in message, message
+    assert fx.conn.execute("SELECT COUNT(*) FROM plans").fetchone()[0] == 0
+    plan_id = ok(server, "propose_plan", kind="manual", params={"ops": ops})["data"]["plan_id"]
+    assert plans.get_plan(fx.conn, plan_id, with_ops=False).params == {"ops": ops}
+
+
 def test_propose_plan_never_relays_the_approval_code_and_caps_long_lists(fx, server, monkeypatch):
     violations = [{"code": "DST_EXISTS", "message": f"{INJECTION} {i}", "seq": i} for i in range(80)]
     violations.append({"code": "CONTENT_LOST", "message": "x", "seq": 99})
@@ -422,6 +434,18 @@ def test_propose_plan_never_relays_the_approval_code_and_caps_long_lists(fx, ser
     data = json.loads(raw)["data"]
     assert len(data["skipped"]) == 20 and data["skipped_total"] == 60
     assert sim["remotes"][0]["remote"] == "gdrive"
+
+
+def test_the_model_reads_english_messages_not_the_params_that_a_web_page_words_them_with(fx, server, monkeypatch):
+    """`params` let the web page write a message in the person's language; for a model they would only add tokens."""
+    at = {"remote": "gdrive", "path": "a"}
+    report = fake_report(ok=False, violations=[{"code": "SRC_MISSING", "message": "no live file", "seq": 1,
+                                                "params": {"variant": "missing", "at": at, "why": "absent"}}],
+                         warnings=[{"code": "NOOP", "message": "m", "seq": 1, "params": {"at": at}}])
+    patch(monkeypatch, fx.service, "propose_plan", {"plan_id": 7, "ops": 1, "skipped": [], "stats": {}, "simulation": report})
+    sim = json.loads(call(server, "propose_plan", kind="dedupe", params={}).content[0].text)["data"]["simulation"]
+    assert sim["violations"] == [{"code": "SRC_MISSING", "message": "no live file", "seq": 1}]
+    assert sim["warnings"] == [{"code": "NOOP", "message": "m", "seq": 1}]
 
 
 def test_propose_plan_manual_params_are_validated_before_the_service_is_called(fx, server, monkeypatch):
@@ -599,9 +623,9 @@ def world(tmp_path):
     g, d = cat.remote("gdrive", "drive"), cat.remote("dropbox", "dropbox")
     a = cat.remote("archive", "drive", writable=False)
     for i in range(4):
-        cat.file(d, f"School/Thesis/thesis_chapter{i}.docx", size=100 + i, md5=f"m{i}")
-    cat.file(g, "Research/thesis-drafts/thesis_chapter0.docx", size=100, md5="m0")
-    cat.file(g, "Research/thesis-drafts/thesis_chapter1.docx", size=101, md5="m1")
+        cat.file(d, f"School/Thesis/thesis_chapter{i}.docx", size=100 + i, sha256=f"m{i}")
+    cat.file(g, "Research/thesis-drafts/thesis_chapter0.docx", size=100, sha256="m0")
+    cat.file(g, "Research/thesis-drafts/thesis_chapter1.docx", size=101, sha256="m1")
     cat.file(g, "Research/thesis-drafts/draft_v1.docx", size=9)
     cat.file(g, "Research/thesis-drafts/draft_v2.docx", size=9)
     cat.file(g, "Misc/a.txt", size=3)
@@ -610,8 +634,8 @@ def world(tmp_path):
     cat.file(d, "Notes/plan.txt", size=7)          # same name on both clouds, no hash to prove them equal
     cat.file(g, "Notes/plan.txt", size=8)
     for i in range(3):                              # two copies of one folder, proven by hash
-        cat.file(d, f"Camera/2019/IMG_{i}.jpg", size=50, md5=f"p{i}")
-        cat.file(g, f"Photos/2019/IMG_{i}.jpg", size=50, md5=f"p{i}")
+        cat.file(d, f"Camera/2019/IMG_{i}.jpg", size=50, sha256=f"p{i}")
+        cat.file(g, f"Photos/2019/IMG_{i}.jpg", size=50, sha256=f"p{i}")
     cat.file(a, "Old/x.txt", size=2)
     identity.rebuild_groups(conn)
     dirstats.refresh(conn)
@@ -897,7 +921,7 @@ def test_stage_moves_passes_warnings_through(world, wserver, draft):
                     move("archive:Old", "gdrive:Research"))["data"]["results"]
     assert sorted(w["code"] for w in results[0]["warnings"]) == ["CROSS_REMOTE", "MERGE"]
     assert sorted(w["code"] for w in results[1]["warnings"]) == ["CROSS_REMOTE", "READ_ONLY"]
-    assert all(w["message"] for r in results for w in r["warnings"])
+    assert all(w["message"] and "params" not in w for r in results for w in r["warnings"])        # English, no params
 
 
 def test_stage_moves_can_make_a_folder_and_rename_into_it(world, wserver, draft):
@@ -1179,11 +1203,14 @@ def test_preview_draft_caps_long_lists(world, wserver, draft, monkeypatch):
     stage(wserver, draft, move("gdrive:Misc", "gdrive:Research"), move("gdrive:Inbox", "gdrive:Research"))
     data = ok(wserver, "preview_draft", draft_id=draft)["data"]
     assert len(data["changes"]) == 1 and data["changes_total"] == 2
+    skipped = [{"from": loc(f"gdrive:empty{i}"), "to": loc(f"dropbox:empty{i}")} for i in range(70)]
     fake = {"plan_id": 5, "ok": False, "simulation": fake_report(violations=[{"code": "X", "seq": i} for i in range(80)]),
-            "changes": [], "conflicts": [{"code": "OCCUPIED", "path": str(i)} for i in range(70)]}
+            "changes": [], "conflicts": [{"code": "OCCUPIED", "path": str(i)} for i in range(70)],
+            "empty_dirs_skipped": skipped}
     monkeypatch.setattr(world.service, "preview_draft", lambda draft_id: fake)
     capped = ok(wserver, "preview_draft", draft_id=draft)["data"]
     assert len(capped["conflicts"]) == mcp_server.MAX_CONFLICTS and capped["conflicts_total"] == 70
+    assert len(capped["empty_dirs_skipped"]) == mcp_server.MAX_CONFLICTS and capped["empty_dirs_skipped_total"] == 70
     assert len(capped["simulation"]["violations"]) == 50 and capped["simulation"]["violations_total"] == 80
 
 

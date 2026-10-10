@@ -53,6 +53,9 @@
 - 執行以檔案為單位（同雲搬移資料夾時會逐檔 move；Drive 上大量檔案較慢）。未來可加「整個資料夾一次伺服器端搬移」的 op。
 - 搬走後留下的空資料夾不會自動刪除（預覽會列出數量）。新增但沒有放東西的資料夾不會被建立。
 - 多個瀏覽器分頁同時編輯同一份草稿時，以伺服器版本為準（頁面會偵測版本變化並重新整理）。
+- 底下沒有任何檔案的資料夾無法被搬動：執行以檔案為單位，沒有東西會在新位置建立它。預覽會把這種資料夾列出來（`empty_dirs_skipped`），而不是默默丟掉，也不把它們算成變更；一份草稿若只做了這種事，就沒有任何東西可執行。
+- 在不分大小寫的雲端上，只改變名稱大小寫的更名（`Docs` 改成 `docs`）無法逐檔執行：雲端會保留已存在資料夾的拼法，而且 executor 拒絕把檔案當成它自己的重複檔。暫存時允許，但會附上 `CASE_ONLY_RENAME` 警告，預覽則把它回報為衝突，所以永遠不會被提供核准。請改用不同的名稱（先執行那一步，再改名一次）。
+- executor 絕不會動 catalog，所以執行之後，樹狀檢視描述的仍是雲端原本的樣子，直到掃描完成。頁面會用一條橫幅說明這件事：關掉對話框或重新載入頁面都不會讓它消失（伺服器會回報自某個雲端上次完成掃描後，執行動過它的雲端），而且在重掃之前，不提供新預覽的核准；無法重掃的頁面會改為顯示 `drivemerge scan` 指令。從頁面重掃從不使用強制模式：如果掃描防護因為某個雲端真的被清空而擋下它，請在終端機執行 `drivemerge scan --force`。
 
 ---
 
@@ -88,13 +91,13 @@
 - `NOOP`：每個項目都會落在它原本所在的位置（拒絕；沒有東西可暫存）。
 - `BAD_NAME`：new_name 為空、含有 '/'、為 '.' 或 '..'，或含有 NUL。
 - `QUARANTINE`：某個項目位於隔離資料夾（`db.quarantine_dir(conn)`，預設 `.drive-merge-quarantine`，每個 remote 上都有；在不分大小寫的 remote 上以 NFC+casefold 比較）本身或其底下；某個項目是包含該隔離資料夾的資料夾（只有 `quarantine_dir` 為巢狀路徑時才可能發生）；或某個項目的目標路徑（目的地加上其名稱或 `new_name`）、某個 `mkdir` 的目標路徑，位於隔離資料夾本身或其底下。已刪除的檔案只能由命令列還原或清除（`drivemerge plan restore` / `purge`），絕不能透過草稿。此項最先檢查，早於 `SRC_NOT_FOUND`：它只取決於路徑。
-- 警告（非致命）：`MERGE`、`READ_ONLY`（來源或目的地 remote 沒有 write_remote）、`CROSS_REMOTE`（位元組會經由這台機器複製）、`CASE_COLLISION`（不分大小寫的目的地 remote 上已有大小寫不同的同名項目）。
+- 警告（非致命）：`MERGE`、`READ_ONLY`（來源或目的地 remote 沒有 write_remote）、`CROSS_REMOTE`（位元組會經由這台機器複製）、`CASE_COLLISION`（不分大小寫的目的地 remote 上已有大小寫不同的同名項目）、`CASE_ONLY_RENAME`（在兩者都不分的 remote 上，只改變名稱的大小寫或 Unicode 形式的更名：暫存時允許，預覽則把它當成衝突拒絕，見 §G）。
 
 暫存時各項檢查的順序：`BAD_NAME`（new_name）、`BAD_REQUEST`（沒有項目）、`QUARANTINE`、`SRC_NOT_FOUND`、`DST_NOT_DIR`、`INTO_ITSELF`、`NAME_EXISTS`、`NOOP`。
 
 新增動作時，會刪除該草稿所有 `undone` 的動作（截斷重做堆疊），並讓 `drafts.version` 加一。
 
-**復原／重做／移除**：`undo` 把 seq 最大的 active 動作標為 `undone`；`redo` 重新啟用 seq 最小的 undone 動作；`remove_action(id)` 先把該動作標為 undone，再依序重新驗證之後每個 active 動作，把不再通過驗證的也標為 undone（回傳它們的 id）。每一項都會讓 `version` 加一。
+**復原／重做／移除**：`undo` 把 seq 最大的 active 動作標為 `undone`；`redo` 重新啟用 seq 最小的 undone 動作；`remove_action(id)` 先把該動作標為 undone，再依序重新驗證之後每個 active 動作，把不再通過驗證的也標為 undone（回傳它們的 id）。每一項都會讓 `version` 加一。被移除的步驟保留它原本的 `seq`，所以移除某個中間的步驟、再復原較後面的一步之後，`redo` 會先把被移除的步驟帶回來：Ctrl+Z 一律取走最後一個 active 的步驟，Ctrl+Shift+Z 則取回編號最小的 undone 步驟。
 
 ## B. 草稿 → 計畫（`workspace.build_ops`、`workspace.preview`）
 
@@ -105,9 +108,9 @@
 
 順序：先排所有 move 與 copy（依來源 remote、path 排序），再排 delete。Reason 字串會註明草稿與動作的 seq。
 
-`preview(conn, draft_id, *, policy=None) -> dict`：建立 ops；若沒有任何 op，回傳 `{"plan_id": None, "message": "nothing to do"}`；否則呼叫 `plans.create_plan(conn, f"Workspace: {title}", "workspace", ops, created_by="workspace", params={"draft_id", "draft_version"})` 與 `simulate.simulate_plan`，把結果存入 `drafts.preview_plan_id/preview_version`，並回傳 `{"plan_id", "draft_version", "ok", "simulation": asdict(report), "summary": {...}, "changes": [...], "conflicts": [...], "empty_dirs_left": n}`（`ok` = 模擬 ok **且**沒有衝突；唯有如此，UI 才可提供核准）。再次預覽會取消該草稿先前的預覽計畫（已經執行過的除外）；`changes` 每個被搬動的根項目列一列 `{"from": {"remote", "path"}, "to": {...}, "files", "bytes", "kind": "move" | "copy+delete" | "merge" | "dedupe"}`。
+`preview(conn, draft_id, *, policy=None) -> dict`：建立 ops；若沒有任何 op，在取消該草稿先前的預覽計畫（已經執行過的除外）並清除 `drafts.preview_plan_id` / `preview_version` 之後，回傳 `{"plan_id": None, "message": "nothing to do", "stale_actions": [...], "empty_dirs_skipped": [...]}`，如此草稿已不再持有的那些搬移所對應的計畫，就不會留在可核准的狀態；否則呼叫 `plans.create_plan(conn, f"Workspace: {title}", "workspace", ops, created_by="workspace", params={"draft_id", "draft_version"})` 與 `simulate.simulate_plan`，把結果存入 `drafts.preview_plan_id/preview_version`，並回傳 `{"plan_id", "draft_version", "ok", "simulation": asdict(report), "summary": {...}, "changes": [...], "conflicts": [...], "empty_dirs_left": n, "empty_dirs_skipped": [...], "stale_actions": [...]}`（`ok` = 模擬 ok **且**沒有衝突；唯有如此，UI 才可提供核准）。再次預覽會取消該草稿先前的預覽計畫（已經執行過的除外）；`changes` 每個被搬動的根項目列一列 `{"from": {"remote", "path"}, "to": {...}, "files", "bytes", "kind": "move" | "copy+delete" | "merge" | "dedupe"}`。`empty_dirs_skipped` 對每個底下沒有任何檔案的被搬動資料夾（巢狀者只列最上層）列出 `{"from": {"remote", "path"}, "to": {...}}`：計畫以檔案為單位，所以沒有東西會建立它們；`summary.empty_dirs_skipped` 是它們的數量。
 
-`changes` 與 `conflicts` 的說明見 §G。`stale_actions` 列出不再符合 catalog 的 active 草稿動作（見 §G「失效的步驟」）；它一律存在，沒有時為 `[]`，在 `{"plan_id": None, "message": "nothing to do"}` 的回應中也一樣。
+`changes` 與 `conflicts` 的說明見 §G。`stale_actions` 列出不再符合 catalog 的 active 草稿動作（見 §G「失效的步驟」）；它一律存在，沒有時為 `[]`，在 `{"plan_id": None, "message": "nothing to do"}` 的回應中也一樣（`empty_dirs_skipped` 亦然）。
 
 若計畫的 `params.draft_version` 與草稿目前的版本不同，該計畫即已失效（stale）：透過 UI 核准時必須拒絕它。
 
@@ -119,7 +122,7 @@ def create_draft(conn, title: str) -> dict
 def list_drafts(conn, *, status: str | None = "open") -> list[dict]
 def get_draft(conn, draft_id: int) -> dict           # {"id","title","status","version","preview_plan_id","preview_version","actions":[...],"undo_available","redo_available","summary":{"moved_files","moved_bytes","cross_remote_bytes","remotes_touched":[names],"stale_actions":n}}
 def discard_draft(conn, draft_id: int) -> None
-def add_action(conn, draft_id: int, action: dict, *, created_by: str) -> dict   # action as in HTTP body below (remote *names*); returns {"action", "draft_version", "warnings":[{"code","message"}]}
+def add_action(conn, draft_id: int, action: dict, *, created_by: str) -> dict   # action as in HTTP body below (remote *names*); returns {"action", "draft_version", "warnings":[{"code","message","params"}]}
 def undo(conn, draft_id: int) -> dict
 def redo(conn, draft_id: int) -> dict
 def remove_action(conn, draft_id: int, action_id: int) -> dict                  # {"draft_version", "removed": [ids]}
@@ -131,6 +134,8 @@ def mark_applied(conn, draft_id: int) -> None
 ```
 清單項目（list item）的結構：`{"name", "path", "remote", "is_dir", "size", "mtime", "category", "files", "dirs", "bytes", "dup_files", "entry_id"（僅檔案有，virtual 者為 None）, "origins": [{"remote","path"}], "moved_here": bool, "merged": bool, "conflict": bool, "dedupe": bool, "virtual": bool, "quarantine": bool（位於隔離資料夾本身或其底下：鎖定，見 `QUARANTINE`）, "quarantine_root": bool（隔離資料夾本身）}`；排序為先目錄，再依自然排序、不分大小寫的名稱順序。Ghost（原位置的影子）的結構：`{"name", "path", "is_dir", "moved_to": {"remote","path"}}`。
 
+`summary.cross_remote_bytes`（`get_draft` 與 `preview` 中皆然）不包含合併時被刪除而不是被複製的檔案，所以它等於模擬器的 `bytes_cross_remote`。`discard_draft` 也會取消該草稿尚未執行的預覽計畫。
+
 ## D. HTTP 合約（`src/drivemerge/ui_api.py`，全為 JSON）
 
 驗證：每個路由都接受 API Bearer token **或** UI session cookie，唯獨人類通道（`/v1/ui/plans/...`、`/v1/ui/rescan`）例外：它要求 UI session cookie，**且**標頭 `X-CSRF-Token` 與該 session 相符，**且**（若有帶）`Origin` 等於伺服器自己的 origin，**且**此伺服器行程已啟用核准。Bearer token 永遠到不了人類通道。
@@ -138,12 +143,12 @@ def mark_applied(conn, draft_id: int) -> None
 | 方法與路徑 | 內容／查詢參數 | 回應 |
 |---|---|---|
 | `POST /v1/ui/session` | `{"token"}`（`drivemerge ui` 印出的那一個） | 設定 cookie `dm_session`（HttpOnly、SameSite=Strict、Path=/）；`{"csrf", "approvals_enabled"}` |
-| `GET /v1/ui/config` | | `{"approvals_enabled", "execution_enabled", "remotes": [{"id","name","provider","writable","case_insensitive"}], "version", "csrf"}`（`csrf`：對 cookie 呼叫者是該 session 的 token，讓重新載入的頁面能取回；對 Bearer 則為 `null`） |
+| `GET /v1/ui/config` | | `{"approvals_enabled", "execution_enabled", "remotes": [{"id","name","provider","writable","case_insensitive"}], "version", "csrf", "outdated": [names]}`（`csrf`：對 cookie 呼叫者是該 session 的 token，讓重新載入的頁面能取回；對 Bearer 則為 `null`。`outdated`：在其上次完成掃描之後，有計畫操作執行過（或執行到一半失敗）的雲端，讓重新載入的頁面仍能說明 catalog 落後了） |
 | `GET /v1/tree/roots` | `draft` | `{"roots": [...]}` |
 | `GET /v1/tree` | `remote, path, draft, view=after\|before, ghosts=0\|1, limit, offset` | `{"remote","path","view","draft_version","items":[...],"ghosts":[...],"total"}` |
 | `GET /v1/drafts` / `POST /v1/drafts` | `?status=open\|applied\|discarded\|all`（預設 open） / `{"title"}` | `{"drafts": [...]}` / 草稿（201） |
 | `GET /v1/drafts/{id}` / `DELETE /v1/drafts/{id}` | | 草稿 / `{"ok"}` |
-| `POST /v1/drafts/{id}/actions` | `{"kind":"move","items":[{"remote","path"}],"dst":{"remote","path"},"new_name"?, "note"?}` 或 `{"kind":"mkdir","dst":{"remote","path"},"new_name"}` | 201 `{"action","draft_version","warnings"}`；409 `{"error","code"}` |
+| `POST /v1/drafts/{id}/actions` | `{"kind":"move","items":[{"remote","path"}],"dst":{"remote","path"},"new_name"?, "note"?}` 或 `{"kind":"mkdir","dst":{"remote","path"},"new_name"}` | 201 `{"action","draft_version","warnings"}`；409 `{"error","code","params"?}` |
 | `POST /v1/drafts/{id}/undo` / `redo` | | 草稿 |
 | `DELETE /v1/drafts/{id}/actions/{action_id}` | | `{"draft_version","removed"}` |
 | `POST /v1/drafts/{id}/preview` | | preview 字典，但不含 `simulation.digest`（其前 8 個字元*就是*核准碼），另外只在「UI session 且已啟用核准、同時 `ok` 為真」時附上 `"approval_code"` |
@@ -152,10 +157,12 @@ def mark_applied(conn, draft_id: int) -> None
 | `POST /v1/ui/plans/{id}/execute` | | 202 `{"job_id"}`；任一工作執行中時回 409 `JOB_BUSY`（執行與重掃都會寫入 catalog），409 `NOT_APPROVED` / `STALE_PREVIEW`，403 `EXECUTION_DISABLED`。workspace 計畫執行完畢時也會一併結束它的草稿（`result.draft_applied`） |
 | `POST /v1/ui/rescan` | `{"remotes":[names]}` | 202 `{"job_id"}`（先掃描每個 remote，再重建身分；兩者都會更新 `dir_stats`） |
 | `GET /v1/jobs/{job_id}` | | `{"id","kind","status":"running\|done\|failed","progress":{...},"result","error"}` |
-| `GET /v1/plans/{id}/progress` | | `{"status","ops_total","done","failed","skipped","current","recent_journal":[...]}` |
+| `GET /v1/plans/{id}/progress` | | `{"status","ops_total","done","failed","skipped","current","recent_journal":[...]}`（journal 的詳細內容不含 digest、確認碼或快照） |
 | `GET /ui/` 與 `/ui/static/*` | | 來自 `src/drivemerge/web/` 的單頁應用程式 |
 
-工作（job）在背景執行緒中執行，各自使用**自己的** SQLite 連線（`db.connect(config.db_path)`，因此 catalog 必須是檔案）；處理請求的連線是共用的，並以鎖保護。此應用程式的錯誤格式為 `{"error", "code"}`：`WorkspaceError` 回 409 並帶其 code，但 `NOT_FOUND`（404）與 `BAD_REQUEST`（400）除外；無效的請求內容回 422。
+此伺服器也一併掛載的 REST API 計畫路由（`GET /v1/plans`、`GET /v1/plans/{id}`、`POST /v1/plans`、`POST /v1/plans/{id}/simulate`），無論對 Bearer token 或瀏覽器 session，回應中任何層級都不含 `digest`、`approval_code` 與 `snapshot`：確認碼只會經由「可核准之 session 的工作區預覽」或 CLI 到達真人手中。`POST /v1/plans`（與 MCP 工具 `propose_plan`、CLI 一樣）對每一種計畫類型都拒絕參數 `draft_id` 與 `draft_version`：只有 `workspace.preview` 能把計畫綁到草稿。
+
+工作（job）在背景執行緒中執行，各自使用**自己的** SQLite 連線（`db.connect(config.db_path)`，因此 catalog 必須是檔案）；處理請求的連線是共用的，並以鎖保護。此應用程式的錯誤格式為 `{"error", "code"}`，當拒絕帶有頁面可據以措辭的事實時另有 `"params"`（`error` 是英文句子）：`WorkspaceError` 回 409 並帶其 code，但 `NOT_FOUND`（404）與 `BAD_REQUEST`（400）除外；無效的請求內容回 422 並帶 `BAD_REQUEST`。此應用程式的每個錯誤都帶有 `code`，連 REST API 共用處理器產生的錯誤也一樣（`BAD_REQUEST`、`NOT_FOUND`、`UNAUTHENTICATED`），因此頁面永遠不必顯示英文句子。
 
 ## E. 建議（`src/drivemerge/suggest.py`）
 
@@ -163,17 +170,25 @@ def mark_applied(conn, draft_id: int) -> None
 def related_folders(conn, *, remote: str | None = None, min_files: int = 3, limit: int = 20) -> list[dict]
 def duplicate_folders(conn, *, remote: str | None = None, min_files: int = 3, threshold: float = 0.9, limit: int = 20) -> list[dict]
 ```
-建議（suggestion）的結構：`{"id": "<kind>:<stable hash>", "kind", "score", "title", "reason", "folders": [{"remote","path","files","bytes"}], "terms": [...], "actions": [<HTTP action bodies>]}` — `actions` 可直接 POST 到 `/v1/drafts/{id}/actions`。
+建議（suggestion）的結構：`{"id": "<kind>:<stable hash>", "kind", "score", "title", "reason", "code", "params", "folders": [{"remote","path","files","bytes"}], "terms": [...], "actions": [<HTTP action bodies>]}` — `actions` 可直接 POST 到 `/v1/drafts/{id}/actions`。`title` 與 `reason` 是英文句子，CLI 與 MCP 原樣顯示。`code`（`RELATED` 或 `DUPLICATES`）與 `params` 是同樣的句子，只是以資料表示，讓用戶端能以自己的語言重新表達：`RELATED` 為 `{"count", "names", "anchor", "name_terms", "content_terms", "same"}`（資料夾數量、不重複的名稱、建議整理到哪裡、共同的資料夾名稱詞、共同的檔名詞、內容完全相同的數量），`DUPLICATES` 為 `{"count", "names", "kept", "similarity", "shared", "saved_bytes"}`。頁面一律由 `code` 與 `params` 自行組出卡片文字（`sug.<CODE>.title` 與 `sug.<CODE>.reason`），只有遇到不認得的 `code` 時，才顯示英文的 `title` 與 `reason`。
 
 ## F. 前端（`src/drivemerge/web/`）
 
-無建置步驟：`index.html`、`app.js`（ES module，使用 `./vendor/htm-preact-standalone.mjs`）、`styles.css`、`i18n.js`（zh-TW 為預設，en 為備援）。必須能離線運作（不使用 CDN）。版面與行為如 §1；HTML5 拖放；鍵盤復原／重做；每 3 秒輪詢目前草稿的版本，讓 Claude 暫存的變更能顯示出來；預覽對話框把違規（violation）以白話翻譯；核准並執行的流程附進度顯示；核准停用時顯示唯讀橫幅。e2e 測試需要的每個元素都帶有 `data-testid`。
+無建置步驟：`index.html`、`app.js`（ES module，使用 `./vendor/htm-preact-standalone.mjs`）、`styles.css`、`i18n.js`（預設為英文；瀏覽器列出中文時使用 zh-TW；缺少任何鍵時以英文為備援）。必須能離線運作（不使用 CDN）。版面與行為如 §1；HTML5 拖放；鍵盤復原／重做；每 3 秒輪詢目前草稿的版本，讓 Claude 暫存的變更能顯示出來；預覽對話框把違規（violation）以白話翻譯；核准並執行的流程附進度顯示；核准停用時顯示唯讀橫幅。e2e 測試需要的每個元素都帶有 `data-testid`。
 
 值得保留的行為（每項都有瀏覽器測試）：
-- **語言。** 違規代碼與衝突代碼（`DIFFERENT_CONTENT`、`DIR_IN_WAY`、`FILE_IN_WAY`、`OCCUPIED`、`CYCLE`）會有翻譯後的標題與說明（`viol.<CODE>.*`、`conflict.<CODE>.*`）；原始代碼與引擎產生的英文句子，仍以小字的等寬字型顯示在下方。新增衝突代碼時，每種語言都要補上它的兩個字串：i18n 完整性測試會從 `workspace.py` 讀取這些代碼。
+- **語言。** 頁面只在載入時決定一次語言：有 `?lang=` 查詢參數（`en` 或 `zh-TW`）就用它，否則用使用者先前的選擇（`EN` / `中文` 按鈕，保存在 `localStorage` 的 `dm-lang`；儲存空間會丟出例外時就忽略，此時的選擇只在這次瀏覽中有效），否則依瀏覽器自己的偏好順序：從 `navigator.languages` 的最前面往下走，第一個頁面有對應語言的項目就決定結果（`en`、`en-US`、`en_GB` 用英文；`zh`、`zh-TW`、`zh-CN`、`zh-Hant-HK`、`zh_TW` 用 `zh-TW`；其他項目一律略過），都沒有就用英文，所以 `en-US, zh-TW` 是英文，而 `ja, zh-TW, en` 是 `zh-TW`。按鈕會立即切換，不需要重新載入。某個語言缺少的鍵一律以英文補上，而 i18n 完整性測試要求每個鍵在兩種語言中都存在。
+- **伺服器的訊息。** 伺服器不替頁面寫任何句子。使用者可能讀到的內容，都是供 CLI、API 與 MCP 使用的英文 `message`（衝突為 `reason`，建議為 `title` 與 `reason`），外加由頁面以自己的語言措辭的 `code` 與 `params`：建議（`sug.<CODE>.*`，§E）、暫存警告（`warn.<CODE>`）、拒絕（`err.<CODE>`，以錯誤內容中的 `params` 措辭）、失效原因（`stale.<CODE>`，由 `items` 措辭）、衝突（`conflict.<CODE>.title`、`.text` 與 `.detail`），以及模擬器的違規與警告。違規的 `params` 含有 `variant`（代碼有好幾個句子時，指出是哪一個）、以 `{"remote","path"}` 表示的位置（`at` 是「顯示位置」連結要前往的那一個）、數量與大小，以及自帶句子的簡短種類 `why`、`problem`、`what` 與 `role`。頁面由 `viol.<CODE>.detail`（或 `viol.<CODE>.detail.<variant>`）組出細節那一行，並把代碼以小字的等寬字型放在旁邊；頁面沒有對應句子的訊息（較新的伺服器，或 `params` 出現之前存下來的報告），就顯示伺服器的英文 `message`。違規與衝突代碼另有翻譯後的標題與說明（`viol.<CODE>.title` 與 `.text`、`conflict.<CODE>.*`）。新增代碼、變體或警告時，每種語言都要補上它們的字串：測試會從 `simulate.py`、`workspace.py`、`suggest.py` 與 `ui_api.py` 讀取這些項目，檢查每個句子在兩種語言中都存在，且只使用伺服器真的會送出的參數。唯一仍原樣顯示的文字，是執行失敗的細節（rclone 的輸出與執行器的錯誤），並附有一行說明。MCP 用戶端取得的是不含 `params` 的英文訊息。
 - **失效的步驟。** 輪詢也會偵測到草稿版本不變、但 `summary.stale_actions` 改變的情況（重掃造成），並重新整理樹狀檢視、發出警告。暫存清單把失效的步驟加上刪除線並附上原因（`stale.<CODE>`），頂端列顯示警告數量，預覽對話框會列出 `stale_actions`（當每個步驟都已失效時，會明說這一點，而不是顯示「沒有任何變更」）。
 - **隔離區。** 帶有 `quarantine: true` 的項目呈現為鎖定狀態（不可拖曳、不是放置目標、不能重新命名、不能剪下、不能在其中新增資料夾或貼上，麵包屑也一樣）；`quarantine_root` 那一列標示為「隔離區」/「Quarantine」，並附工具提示說明如何用 CLI 還原與清除。
 - **提示訊息（toast）。** 位於右下角（抽屜開啟時顯示在抽屜旁，不蓋住抽屜的按鈕）。錯誤訊息會一直留到被關閉；資訊、警告、成功與「由 Claude 提出」的訊息約 6 秒後消失（帶按鈕者 12 秒），且在滑鼠指標或鍵盤焦點停在其上時會暫停倒數。同一則訊息再次出現時，會取代先前的那一則。訊息堆疊把自己的高度發布為 `--toast-reserve`，對話框的背景遮罩會在對話框下方留出這段空間，所以提示訊息絕不會蓋住對話框的頁尾。
+- **合併中的同名衝突。** 標有 `conflict` 的那一列代表好幾個檔案，重新命名它會連同原本就在那裡的檔案一起改名。所以 F2 與雙擊它都不會開啟編輯框：對話框會說明原因，並提供「取回把進來的那個檔案帶到那裡的步驟」，之後提示訊息會帶你到該檔案原本的位置。預覽的 `DIFFERENT_CONTENT` 卡片也有相同的一鍵解法。一個衝突就是一個問題：頁面會去掉模擬器附帶的回音（衝突已經說明了的位置上的 `DST_EXISTS`、同一朵雲上 `READ_ONLY_REMOTE` 底下的 `NO_WITNESS`，以及重複的句子）。
+- **執行後 catalog 落後。** 執行結束（完成或失敗）、或草稿在終端機被套用時，橫幅會點名這些雲端並提供重掃（沒有核准能力的頁面則顯示 `drivemerge scan <remote>`）。關掉對話框後橫幅仍在；重新載入頁面時，只要 `/v1/ui/config` 回報 `outdated`，橫幅就會回來；也可以手動關閉。期間做出的預覽會顯示一則附重掃按鈕的提示，且在 catalog 更新之前不提供核准。
+- **窄窗格。** 窗格是一個 CSS 容器：寬度 480px 以下時隱藏檔案數欄位（輔助科技仍會讀出），380px 以下時標章縮成圖示或圓點，並保留工具提示。麵包屑固定為單行高度（麵包屑片段縮短並加上刪節號；雲端名稱與焦點項目維持完整），所以聚焦某一列絕不會讓指標底下的樹狀檢視位移。
+- **很長的資料夾。** 每次暫存動作後的重新整理，都會重新載入與先前展開數量相同的子項目（以分頁方式，上限為伺服器的上限），所以用「載入更多」開啟的分頁不會遺失。
+- **重新命名。** 輸入 IME 組字期間（`isComposing`、按鍵碼 229），輸入框會忽略 Enter 與 Escape；離開輸入框會提交已輸入的名稱（整個視窗失去焦點時除外）；按下 Enter 或 Escape 之後，鍵盤仍留在樹狀檢視中，改名後的那一列會被選取並取得焦點。
+- **建議。** 建議卡片由草稿推導（note 為該建議 id 的 active 動作），所以暫存後又被復原的建議可以再次暫存；有 `detail` 時，卡片文字用它來組成。
+- **沒有檔案的資料夾。** 預覽會在失效步驟旁列出 `empty_dirs_skipped`，不論是在審閱畫面還是「沒有可執行的內容」的回應中。
 
 ## G. 實作比 A–F 更精確之處
 
@@ -182,10 +197,11 @@ def duplicate_folders(conn, *, remote: str | None = None, min_files: int = 3, th
 **命名空間與計畫（`workspace.py`）**
 - 以 `mkdir` 建立的目錄，只會被*在它之後*暫存的子搬移映射（它的原點是它的建立位置）；較早的子搬移不適用於它。
 - 變更後視圖的目錄計數以不重複的位置為單位（合併後的資料夾算一個資料夾，新建的 `mkdir` 資料夾也算），而且每個計數都以 0 為下限。缺少 `dir_stats` 列時視為全為零，因此在掃描與身分重建之後必須執行 `dirstats.refresh`（`Service.scan`、`Service.rebuild_identity` 與 `Service.bridge` 會執行它）。
+- 空檔案絕不算重複檔：它們共用同一個 hash，只是佔位用的檔案（`__init__.py`、`.gitkeep`），所以 `dup_files`（檔案列與資料夾計數皆然）會忽略大小為零的檔案，就像搜尋、`dir_stats` 與重複清單一樣。
 - 在不分大小寫的 remote 上，`build_ops` 以完整路徑的 NFC+casefold 找出最終路徑的佔用者；暫存時則維持以精確名稱比對，另加 `CASE_COLLISION` 警告。
-- `info["conflicts"]`（以及 `preview()["conflicts"]`）中的衝突帶有 `code`：`DIFFERENT_CONTENT`、`DIR_IN_WAY`（catalog 中的某個資料夾實際上仍在那裡：逐檔執行永遠不會移除資料夾）、`FILE_IN_WAY`、`OCCUPIED`（該位置屬於一個要到刪除階段才會離開的檔案）與 `CYCLE`（彼此等待的搬移，例如互換）。當內容相同時，`OCCUPIED` 與 `CYCLE` 可能通過模擬器，這就是 `preview()["ok"]` 也要求沒有衝突的原因。
+- `info["conflicts"]`（以及 `preview()["conflicts"]`）中的衝突帶有 `code`、相關的位置（`from`、`to`、`with`）與英文的 `reason`：`DIFFERENT_CONTENT`、`DIR_IN_WAY`（catalog 中的某個資料夾實際上仍在那裡：逐檔執行永遠不會移除資料夾）、`FILE_IN_WAY`、`OCCUPIED`（該位置屬於一個要到刪除階段才會離開的檔案）、`CYCLE`（彼此等待的搬移，例如互換，或必須搬進與自己同名資料夾的檔案）與 `CASE_ONLY_RENAME`（檔案或資料夾的最終位置，就是它自己換了大小寫或 Unicode 形式的另一種拼法，且發生在兩者都不分的 remote 上：每個被更名的根項目回報一個衝突，而不是裡面每個檔案各一個）。當內容相同時，`OCCUPIED`、`CYCLE` 與 `CASE_ONLY_RENAME` 可能通過模擬器，這就是 `preview()["ok"]` 也要求沒有衝突的原因。
 - move 與 copy 以拓撲排序，確保檔案只有在其目標位置上的東西都離開之後才會落地；同序者依來源 remote id 與 path 決定先後。對於有衝突的跨 remote copy，不會產生與之成對的 delete。
-- **失效的步驟。** 重掃可能在草稿仍開啟時，改變其底下的 catalog。當一個 active 動作在它之前各動作的變更後視圖上重播時，已沒有任何東西可作用，它就是*失效的（stale）*：某個 move 項目已不存在（`SRC_NOT_FOUND`；每個消失的項目都會列出），或某個目的地（move 或 `mkdir`）已不再是資料夾（`DST_NOT_DIR`）。建立在失效動作之上的動作也同樣失效。名稱衝突不算失效：預覽會把它們回報為衝突。`get_draft` 的每個動作都帶有 `"stale": bool` 與 `"stale_reason": {"code", "message", "items": [{"remote","path"}]} | None`（`items` 是消失的來源，或不存在的目的地）；`summary.stale_actions` 負責計數。`preview()` 會回傳 `"stale_actions": [<action dicts as in get_draft, stale_reason set>]` 與 `summary.stale_actions`。失效的步驟不產生 op，也不改變 `ok`（它們不會造成傷害），所以頁面在列出暫存步驟的每個地方以及預覽中，都必須顯示它們。已復原（undone）的動作絕不會失效。沒有被動過的 catalog，絕不會讓一份乾淨暫存的草稿產生失效的步驟。
+- **失效的步驟。** 重掃可能在草稿仍開啟時，改變其底下的 catalog。當一個 active 動作在它之前各動作的變更後視圖上重播時，已沒有任何東西可作用，它就是*失效的（stale）*：某個 move 項目已不存在（`SRC_NOT_FOUND`；每個消失的項目都會列出），或某個目的地（move 或 `mkdir`）已不再是資料夾（`DST_NOT_DIR`）。建立在失效動作之上的動作也同樣失效。名稱衝突不算失效：預覽會把它們回報為衝突。`get_draft` 的每個動作都帶有 `"stale": bool` 與 `"stale_reason": {"code", "message", "items": [{"remote","path"}]} | None`（`items` 是消失的來源，或不存在的目的地，也是頁面用來措辭該 code 的資料）；`summary.stale_actions` 負責計數。`preview()` 會回傳 `"stale_actions": [<action dicts as in get_draft, stale_reason set>]` 與 `summary.stale_actions`。失效的步驟不產生 op，也不改變 `ok`（它們不會造成傷害），所以頁面在列出暫存步驟的每個地方以及預覽中，都必須顯示它們。已復原（undone）的動作絕不會失效。沒有被動過的 catalog，絕不會讓一份乾淨暫存的草稿產生失效的步驟。
 - **工作區中的隔離區。** `list_dir` 會把位於隔離資料夾本身或其底下的每個項目標上 `quarantine: true`，並把該資料夾本身標上 `quarantine_root: true`（變更前視圖中也一樣）；頁面會以不同的樣式繪製根項目（標籤、指向 CLI 的工具提示），並讓整個子樹既不能拖曳、也不是放置目標。針對它的暫存會以 `QUARANTINE` 被拒絕（§A），`redo` 與 `remove_action` 在重新驗證較舊的步驟時也會套用這項檢查。
 - 對已經是 undone 的動作執行 `remove_action`，只會讓版本加一。`WorkspaceError` 另外還使用 `NOT_FOUND`、`NOT_OPEN`、`BAD_REQUEST`、`NOTHING_TO_UNDO`、`NOTHING_TO_REDO`。
 - `list_drafts` 的列是精簡的：`id, title, status, version, preview_plan_id, preview_version, created_at, updated_at, action_count`。
@@ -204,7 +220,7 @@ def duplicate_folders(conn, *, remote: str | None = None, min_files: int = 3, th
 
 **Service 門面（`service.py`）**
 - CLI、REST 與 MCP 都透過 `Service` 存取工作區：讀取用 `tree_roots`、`list_dir`、`get_draft`、`list_drafts`、`suggestions`；維護用 `refresh_dir_stats`（`scan`、`rebuild_identity` 與 `bridge` 也會執行它）；提案用 `create_draft`、`discard_draft`、`stage_action(..., created_by)`、`undo_action`、`redo_action`、`remove_action`、`preview_draft`。`preview_draft` 會回傳模擬 digest，所以呼叫者若不是在瀏覽器前的真人，就必須把它丟掉。核准與執行仍留在僅限人類的區段。`policy()` 是唯一依設定建立模擬器 `SafetyPolicy` 的地方。
-- MCP 目前還沒有草稿工具。等它有了之後，這些工具必須以 `created_by="mcp"` 暫存（頁面只有在此情況才會顯示「由 Claude 提出」的標章與提示訊息），而且絕不能暴露 `approval_code` 或 digest。
+- MCP 的草稿工具（`list_drafts`、`get_draft`、`create_draft`、`browse_tree`、`suggest_reorganization`、`stage_moves`、`undo_last`、`remove_staged`、`preview_draft`）以 `created_by="mcp"` 暫存（頁面只有在此情況才會顯示「由 Claude 提出」的標章與提示訊息），而且絕不暴露 `approval_code` 或 digest。
 
 **執行**
-- `Service.execute` 是唯一會結束草稿的地方：對帶有 `params.draft_id` 的計畫完成一次 `done` 的執行後，若草稿的版本仍等於 `params.draft_version`，就把草稿標為已套用；否則草稿維持開啟，並在結果中說明原因（`draft_applied: false`、`draft_error`）。因此 CLI、瀏覽器與重掃三者的結論一致。
+- `Service.execute` 是唯一會結束草稿的地方：對「就是某份草稿自己的預覽」的計畫（類型為 `workspace`、建立者為 `workspace`；`Service.propose_plan` 拒絕 `draft_id` / `draft_version` 參數，而只是帶著它們的計畫不屬於任何草稿，這裡與預覽失效的檢查都一樣）完成一次 `done` 的執行後，若草稿的版本仍等於 `params.draft_version`，就把草稿標為已套用；否則草稿維持開啟，並在結果中說明原因（`draft_applied: false`、`draft_error`）。因此 CLI、瀏覽器與重掃三者的結論一致。

@@ -10,7 +10,7 @@ Design documents: [docs/DESIGN.md](docs/DESIGN.md) — architecture, safety mode
 
 ## Why it is built this way
 
-- **No hash is shared by all four clouds** (Drive: md5/sha1/sha256, Dropbox: content hash, OneDrive: QuickXorHash, iCloud: none). drive-merge downloads *one* copy of an ambiguous file, computes all five hash types locally, and uses that "bridge" to prove copies on the other clouds identical without downloading them.
+- **No hash is shared by all four clouds** (Drive: md5/sha1/sha256, Dropbox: content hash, OneDrive: QuickXorHash, iCloud: none), and only a collision-resistant hash proves two files identical: sha256 and the Dropbox hash. md5, sha1 (practical collision attacks exist, and every cloud that reports it reports sha256 too) and QuickXorHash can show that two files differ, never that they match. drive-merge downloads *one* copy of an ambiguous file, computes all five hash types locally, and uses that "bridge" to prove copies that carry a strong hash on the other clouds identical without downloading them. A OneDrive or iCloud file with no strong hash becomes exact only through a bridge made from its own download.
 - **The catalog is built per remote, not through rclone `union`.** Union merges by path and shows one copy, which hides exactly the provenance a dedup tool needs. Use `combine` if you want a browsable single view (`drivemerge rclone-combine`).
 - **Nothing is written to a cloud except by an approved plan.** Plans are simulated against the catalog (no content may lose its last copy, every delete needs a provably identical surviving witness, no overwrites, case collisions, ...). Approval is bound to the simulation digest and needs an interactive terminal. Deletes go to a quarantine folder and can be restored.
 - **LLMs propose, humans approve.** Claude Code (via MCP) can search, read folder profiles, write layout rules, create and simulate plans. It cannot approve or execute them.
@@ -67,7 +67,7 @@ drivemerge plan restore 1                  # undo deletes (moves them back from 
 drivemerge ui                              # opens http://127.0.0.1:8765/ui/ (one-time token in the URL)
 ```
 
-Two tree panes show any two places side by side, across clouds. Drag files and folders to better levels, rename, undo and redo, flip between the "after" and "before" views, and take suggestions for related or duplicate folders. Nothing touches a cloud while you drag: the staged moves are previewed through the same simulator as every other plan (before/after per cloud, conflicts, dedupes), and only a typed 8-character approval code starts the execution — and only when `drivemerge ui` runs in your own interactive terminal, outside an AI agent. See [docs/WORKSPACE.md](docs/WORKSPACE.md).
+Two tree panes show any two places side by side, across clouds. Drag files and folders to better levels, rename, undo and redo, flip between the "after" and "before" views, and take suggestions for related or duplicate folders. Nothing touches a cloud while you drag: the staged moves are previewed through the same simulator as every other plan (before/after per cloud, conflicts, dedupes), and only a typed 8-character approval code starts the execution — and only when `drivemerge ui` runs in your own interactive terminal, outside an AI agent. The page is in English, or in Traditional Chinese when your browser lists a Chinese language; the `EN` / `中文` button switches and is remembered. See [docs/WORKSPACE.md](docs/WORKSPACE.md).
 
 API and MCP:
 

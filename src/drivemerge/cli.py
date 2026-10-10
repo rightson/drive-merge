@@ -38,9 +38,9 @@ from .rclone import RcloneError
 
 EXIT_OK, EXIT_ERROR, EXIT_REFUSED, EXIT_VIOLATIONS, EXIT_INTERRUPTED = 0, 1, 2, 3, 130
 MAX_VIOLATIONS_SHOWN = 20
-# Fields that let someone approve a plan; shown to a human by `plan approve`
-# only, never in other output (human or --json).
-_SECRET_KEYS = frozenset({"digest", "approval_code"})
+# Fields that let someone approve a plan (the snapshot is what the digest binds to); shown to a human by
+# `plan approve` only, never in other output (human or --json). The MCP server and the REST API drop the same keys.
+_SECRET_KEYS = frozenset({"digest", "approval_code", "snapshot"})
 _AGENT_ENV_VARS = ("CLAUDECODE", "AI_AGENT")
 
 
@@ -506,7 +506,9 @@ def cmd_scan(ctx: Ctx) -> int:
             if res.get("status") == "complete":
                 where = f"{name}:{res['root']}" if res.get("root") else name
                 print(f"{where}: {_n(res['files'])} files, {_n(res['dirs'])} dirs, {format_size(res['bytes'])}"
-                      f", {_n(res['tombstoned'])} no longer present")
+                      f", {_n(res['tombstoned'])} no longer present"
+                      + (f", {_n(res['ambiguous'])} share a name with another file (flagged AMBIGUOUS_PATH)"
+                         if res.get("ambiguous") else ""))
             else:
                 print(f"{name}: scan failed: {res.get('error')}", file=sys.stderr)
     if ctx.json:

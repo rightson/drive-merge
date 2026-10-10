@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import socket
@@ -12,7 +13,7 @@ from drivemerge.models import Op, SimulationReport, Violation
 
 def _sim(conn, plan_id, ok=True):
     snap = db.snapshot(conn)
-    digest = plans.compute_digest(plan_id, plans.load_ops(conn, plan_id), snap)
+    digest = plans.compute_digest(conn, plan_id, plans.load_ops(conn, plan_id), snap)
     plans.record_simulation(conn, plan_id, SimulationReport(plan_id=plan_id, digest=digest, ok=ok), snap)
     return digest
 
@@ -61,6 +62,60 @@ def test_resimulation_drops_approval(conn, catalog):
     plans.approve_plan(conn, pid, digest, approved_by="human")
     _sim(conn, pid)
     assert plans.get_plan(conn, pid).status == "simulated"
+
+
+# ------------------------------------------------------------------ the digest is keyed
+
+def _public_digest(conn, plan_id):
+    """What anyone could compute from the plan's ops and the scan ids, if the digest were an unkeyed hash."""
+    payload = json.dumps(
+        {"plan": plan_id, "ops": [o.canonical() for o in plans.load_ops(conn, plan_id)], "snapshot": db.snapshot(conn)},
+        sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def test_the_approval_code_cannot_be_computed_from_what_an_api_client_can_read(conn, catalog):
+    """The plan's ops and the latest scan ids are public; the 8 typed characters must not follow from them."""
+    g = catalog.remote("g", "drive")
+    pid = plans.create_plan(conn, "t", "manual", [Op("copy", g, "x", dst_remote_id=g, dst_path="y")], created_by="t")
+    digest = _sim(conn, pid)
+    assert digest != _public_digest(conn, pid)
+    assert plans.short_code(digest) != plans.short_code(_public_digest(conn, pid))
+    with pytest.raises(plans.PlanError):
+        plans.approve_plan(conn, pid, plans.short_code(_public_digest(conn, pid)), approved_by="human")
+    plans.approve_plan(conn, pid, plans.short_code(digest), approved_by="human")
+
+
+def test_two_catalogs_give_the_same_plan_different_digests():
+    digests = []
+    for _ in range(2):
+        c = db.connect(":memory:")
+        gid = c.execute("INSERT INTO remotes(name, provider, read_remote, write_remote, case_insensitive, created_at) "
+                        "VALUES ('g', 'drive', 'g:', 'g:', 0, 't') RETURNING id").fetchone()[0]
+        pid = plans.create_plan(c, "t", "manual", [Op("copy", gid, "x", dst_remote_id=gid, dst_path="y")], created_by="t")
+        digests.append(plans.compute_digest(c, pid, plans.load_ops(c, pid), db.snapshot(c)))
+    assert digests[0] != digests[1]
+
+
+def test_the_secret_is_made_once_and_survives_reopening(tmp_path):
+    path = tmp_path / "c.db"
+    first = db.digest_secret(db.connect(path))
+    assert len(first) == 32 and first != bytes(32)
+    conn = db.connect(path)
+    assert db.digest_secret(conn) == first
+    assert conn.execute("SELECT COUNT(*) FROM meta WHERE key = 'digest_secret'").fetchone()[0] == 1
+
+
+def test_a_simulation_made_before_reopening_the_catalog_is_still_approvable(tmp_path):
+    path = tmp_path / "c.db"
+    conn = db.connect(path)
+    g = conn.execute("INSERT INTO remotes(name, provider, read_remote, write_remote, case_insensitive, created_at) "
+                     "VALUES ('g', 'drive', 'g:', 'g:', 0, 't') RETURNING id").fetchone()[0]
+    pid = plans.create_plan(conn, "t", "manual", [Op("copy", g, "x", dst_remote_id=g, dst_path="y")], created_by="t")
+    digest = _sim(conn, pid)
+    conn.close()
+    conn = db.connect(path)
+    plans.approve_plan(conn, pid, plans.short_code(digest), approved_by="human")
 
 
 # ------------------------------------------------------------------ the execution lock
@@ -297,7 +352,7 @@ def test_stored_simulations_come_back_with_their_totals(conn, catalog):
     g = catalog.remote("g", "drive")
     pid = plans.create_plan(conn, "t", "manual", [Op("copy", g, "x", dst_remote_id=g, dst_path="y")], created_by="t")
     snap = db.snapshot(conn)
-    digest = plans.compute_digest(pid, plans.load_ops(conn, pid), snap)
+    digest = plans.compute_digest(conn, pid, plans.load_ops(conn, pid), snap)
     rep = SimulationReport(plan_id=pid, digest=digest, ok=False, violations=_violations(2), violations_total=9,
                            violations_by_code={"SRC_MISSING": 9})
     plans.record_simulation(conn, pid, rep, snap)

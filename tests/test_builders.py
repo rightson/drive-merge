@@ -20,7 +20,7 @@ from drivemerge.builders import (
 )
 from drivemerge.simulate import SafetyPolicy, simulate_ops
 
-HASH_OF = {"drive": "md5", "dropbox": "dropbox", "onedrive": "quickxor"}
+HASH_OF = {"drive": "sha256", "dropbox": "dropbox", "onedrive": "quickxor"}
 NATIVE_MIME = "application/vnd.google-apps.document"
 
 
@@ -43,7 +43,7 @@ class World:
         kw.setdefault("size", size if size is not None else 10 + len(content or path))
         hash_type = HASH_OF.get(self.provider[remote])
         if content is not None and hash_type:
-            kw[hash_type] = f"{hash_type}-{content}"
+            kw.setdefault(hash_type, f"{hash_type}-{content}")
         eid = self.cat.file(self.rid[remote], path, **kw)
         if content is not None:
             group = self.groups.setdefault(content, len(self.groups) + 1)
@@ -286,6 +286,50 @@ def test_keeper_accepts_copies_rows_and_dicts(w):
 # dedupe
 # =============================================================================
 
+def _onedrive_pair(catalog):
+    od = catalog.remote("od", "onedrive")
+    qx = "ab" * 20
+    a = catalog.file(od, "keep/report.bin", size=320, quickxor=qx)
+    b = catalog.file(od, "other/report.bin", size=320, quickxor=qx)
+    return a, b
+
+
+def _hashes(tag: str, quickxor: str) -> dict:
+    import hashlib
+    raw = tag.encode()
+    return {"md5": hashlib.md5(raw).hexdigest(), "sha1": hashlib.sha1(raw).hexdigest(),
+            "sha256": hashlib.sha256(raw).hexdigest(), "dropbox": hashlib.sha256(b"d" + raw).hexdigest(),
+            "quickxor": quickxor, "size": 320}
+
+
+def test_dedupe_never_deletes_onedrive_files_on_a_shared_quickxor_alone(catalog):
+    """Two files of one size and one QuickXorHash may still be different files (rows swapped, say): until
+    each was read and hashed there is no proof, so there is nothing to delete."""
+    a, b = _onedrive_pair(catalog)
+    identity.rebuild_groups(catalog.conn)
+    assert build_dedupe(catalog.conn).ops == []
+    assert [g.confidence for g in identity.duplicate_groups(catalog.conn, confidence="probable")] == ["probable"]
+
+    # Both were downloaded and they are different files with the same QuickXor: still nothing.
+    identity.record_bridge(catalog.conn, _hashes("one", "ab" * 20), source_entry_id=a, source_mtime="2024-01-01T00:00:00Z")
+    identity.record_bridge(catalog.conn, _hashes("two", "ab" * 20), source_entry_id=b, source_mtime="2024-01-01T00:00:00Z")
+    identity.rebuild_groups(catalog.conn)
+    assert build_dedupe(catalog.conn).ops == []
+
+
+def test_dedupe_deletes_a_onedrive_duplicate_once_both_copies_were_hashed(catalog):
+    a, b = _onedrive_pair(catalog)
+    for eid in (a, b):
+        identity.record_bridge(catalog.conn, _hashes("same", "ab" * 20), source_entry_id=eid,
+                               source_mtime="2024-01-01T00:00:00Z")
+    identity.rebuild_groups(catalog.conn)
+    r = build_dedupe(catalog.conn)
+    (op,) = r.ops
+    assert (op.op, op.src_path, op.witness_path) == ("delete", "other/report.bin", "keep/report.bin")
+    rep = simulate_ops(catalog.conn, r.ops)
+    assert rep.ok, [(v.code, v.message) for v in rep.violations]
+
+
 def test_dedupe_within_one_remote_keeps_one_and_leaves_other_remotes(w):
     w.put("gdrive", "Docs/report.pdf", "R")
     w.put("gdrive", "Docs/Copy of report.pdf", "R")
@@ -298,7 +342,7 @@ def test_dedupe_within_one_remote_keeps_one_and_leaves_other_remotes(w):
         assert o.op == "delete"
         assert (o.witness_remote_id, o.witness_path) == (w.rid["gdrive"], "Docs/report.pdf")
         assert o.reason == "duplicate of gdrive:Docs/report.pdf"
-        assert o.src_entry_id and o.expect_size and o.expect_hash.startswith("md5:")
+        assert o.src_entry_id and o.expect_size and o.expect_hash.startswith("sha256:")
     rep = run(w, r)
     assert (rep.contents_before, rep.contents_after) == (2, 2)
     after = w.after(r.ops)
@@ -506,6 +550,19 @@ def test_copy_source_prefers_hashed_copies_in_provider_order(w):
     assert src_of["Documents/2024/doc.pdf"] == "dropbox"                        # drive > dropbox > onedrive
     assert src_of["Photos/2024/2024-01/photo.jpg"] == "gdrive"
     assert "Documents/2024/doc (2).pdf" in src_of and src_of["Documents/2024/doc (2).pdf"] == "icloud"
+    run(w, r)
+
+
+def test_copy_source_prefers_a_copy_with_a_strong_hash_over_a_quickxor_only_one(w):
+    """A OneDrive copy is no better than an unhashed one for the executor (it must read it); a local copy with
+    sha256 is verified for free, though OneDrive ranks ahead of local by provider."""
+    w.remote("local", "local")
+    w.remote("target", "drive")
+    w.put("onedrive", "b/doc.pdf", "D")
+    w.put("local", "c/doc.pdf", "D", sha256="sha256-D")
+    r = build_consolidate(w.conn, target="target")
+    (op,) = r.ops
+    assert w.names()[op.src_remote_id] == "local"
     run(w, r)
 
 
@@ -939,6 +996,18 @@ def test_reorganize_rejects_bad_arguments(w):
 # =============================================================================
 # helpers that already existed
 # =============================================================================
+
+def test_best_hash_puts_the_weak_types_last(w):
+    local = w.remote("local", "local")
+    row = lambda **hashes: {t: hashes.get(t) for t in identity.HASH_TYPES}  # noqa: E731
+    assert builders.best_hash(row(md5="m", sha1="s", quickxor="q")) == "sha1:s"
+    assert builders.best_hash(row(md5="m", dropbox="d")) == "dropbox:d"
+    assert builders.best_hash(row(sha1="s", dropbox="d")) == "dropbox:d"          # sha1 is weak too: strong ones first
+    assert builders.best_hash(row(md5="m", quickxor="q")) == "md5:m"
+    assert builders.best_hash(row(quickxor="q")) == "quickxor:q"
+    assert builders.best_hash(row(md5="m", sha1="s", sha256="h", dropbox="d", quickxor="q")) == "sha256:h"
+    assert builders.best_hash(row()) is None and local
+
 
 def test_best_hash_parse_location_and_op_from_entry(w):
     eid = w.put("gdrive", "a/b.txt", "B", sha256="ss")

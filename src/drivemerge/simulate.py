@@ -6,9 +6,10 @@ read lazily, per lookup, and the plan's effects live in an in-memory overlay
 (added virtual files, removed catalog entries, implied directories).
 
 Content identity: a live entry's key is 'g:<content_group>' when hash-proven
-and 'e:<entry id>' otherwise. The 'e:' key is unique on purpose, so an
-unhashed file is never taken to equal another file; only a file created by
-copy/move inherits its source's key.
+(a strong hash or a bridge made from its own bytes, see identity.py: md5, sha1
+and QuickXor alone prove nothing) and 'e:<entry id>' otherwise. The 'e:' key is
+unique on purpose, so an unproven file is never taken to equal another file;
+only a file created by copy/move inherits its source's key.
 
 Files under the quarantine directory are never "live content": a purge would
 destroy them, so they must not serve as witnesses or count as surviving copies.
@@ -55,24 +56,41 @@ def _chunks(items: Sequence, n: int = _CHUNK) -> Iterator[Sequence]:
         yield items[i:i + n]
 
 
-def _path_problem(path: object) -> str | None:
-    """Why a path cannot be handed to rclone safely, or None.
+_PATH_PROBLEMS = {
+    "empty": "is empty",
+    "nul": "contains a NUL byte",
+    "absolute": "is absolute",
+    "empty_segment": "has an empty segment",
+    "dot_segment": "has a {segment!r} segment",
+}
+
+
+def _path_problem(path: object) -> tuple[str, dict] | None:
+    """Why a path cannot be handed to rclone safely, as (kind, params), or None.
 
     '..' or an absolute path would let an op act outside the remote root; an
     empty segment means the path is not in the catalog's canonical form.
     """
     if not isinstance(path, str) or not path:
-        return "is empty"
+        return "empty", {}
     if "\x00" in path:
-        return "contains a NUL byte"
+        return "nul", {}
     if path.startswith("/"):
-        return "is absolute"
+        return "absolute", {}
     for seg in path.split("/"):
         if seg == "":
-            return "has an empty segment"
+            return "empty_segment", {}
         if seg in (".", ".."):
-            return f"has a {seg!r} segment"
+            return "dot_segment", {"segment": seg}
     return None
+
+
+_MISSING_WHY = {
+    "moved": "it was already moved or deleted by op {by}",
+    "directory": "that path is a directory",
+    "tombstone": "the catalog marks it missing (tombstone)",
+    "absent": "the catalog has no such file",
+}
 
 
 class _Node:
@@ -160,7 +178,7 @@ class _Engine:
         self.gone: dict[tuple[int, str], int] = {}           # (remote, path) -> seq of the op that emptied it
         # Accounting.
         self.kdelta: dict[str, int] = {}                     # content key -> net live copies added/removed
-        self.touched: dict[str, tuple[int, str]] = {}        # keys of applied deletes/moves -> (seq, source)
+        self.touched: dict[str, tuple[int, tuple[int, str]]] = {}  # keys of applied deletes/moves -> (seq, source)
         self.witnesses: list[_Witness] = []
         self.probable_for: dict[tuple[int, str, str], str] = {}  # (remote, path, witness key) -> content it vouched for
         self.rstat: dict[int, list[int]] = {}                # remote -> [files, bytes, bytes_in, q_files, q_bytes]
@@ -233,6 +251,11 @@ class _Engine:
         """Remote:path for messages. repr() because file names are untrusted text."""
         return repr(self.label(rid, path))
 
+    def _loc(self, rid: int | None, path: object) -> dict:
+        """The same place as a message parameter: a page words it in its own language and can link to it."""
+        r = self.remotes.get(rid) if rid is not None else None
+        return {"remote": r.name if r else f"#{rid}", "path": path}
+
     def _add(self, rid: int, path: str, tpl: _Node, entry_id: int | None, seq: int) -> None:
         """Create a virtual file (made by op `seq`) that inherits tpl's identity (key, size, hashes) and its parents."""
         node = _Node(entry_id, path, False, tpl.size, _fold(path.rsplit("/", 1)[-1]),
@@ -281,45 +304,50 @@ class _Engine:
         st[4] += size
 
     def _touch(self, node: _Node, rid: int, path: str, seq: int) -> None:
-        self.touched.setdefault(node.key, (seq, self._w(rid, path)))
+        self.touched.setdefault(node.key, (seq, (rid, path)))
 
     # --------------------------------------------------------------------- ops
 
     def _addr(self, rid: object, path: object, role: str, bad) -> bool:
         ok = True
         if rid not in self.remotes:
-            bad("BAD_PATH", f"{role} remote id {rid!r} does not exist")
+            bad("BAD_PATH", f"{role} remote id {rid!r} does not exist", variant="remote", role=role, rid=str(rid))
             ok = False
         problem = _path_problem(path)
         if problem:
-            bad("BAD_PATH", f"{role} path {path!r} {problem}")
+            kind, extra = problem
+            bad("BAD_PATH", f"{role} path {path!r} {_PATH_PROBLEMS[kind].format(**extra)}",
+                variant="path", role=role, path=str(path), problem=kind, **extra)
             ok = False
         elif self._fq and (_fold(path) == self._fq or _fold(path).startswith(self._fq + "/")):  # type: ignore[arg-type]
-            bad("BAD_PATH", f"{role} path {path!r} is inside the quarantine area")
+            bad("BAD_PATH", f"{role} path {path!r} is inside the quarantine area", variant="quarantine",
+                role=role, path=path)
             ok = False
         return ok
 
-    def _why_missing(self, rid: int, path: str) -> str:
+    def _why_missing(self, rid: int, path: str) -> tuple[str, dict]:
+        """Why nothing lives at `path`: (kind, params), worded by `_MISSING_WHY` (or by a page, from the kind)."""
         seq = self.gone.get((rid, path))
         if seq is not None:
-            return f"it was already moved or deleted by op {seq}"
+            return "moved", {"by": seq}
         if self.has_dir(rid, path):
-            return "that path is a directory"
+            return "directory", {}
         if self.conn.execute("SELECT 1 FROM entries WHERE remote_id = ? AND path = ? AND present = 0 LIMIT 1",
                              (rid, path)).fetchone():
-            return "the catalog marks it missing (tombstone)"
-        return "the catalog has no such file"
+            return "tombstone", {}
+        return "absent", {}
 
     def run_op(self, op: Op, seq: int) -> None:
         viol: list[Violation] = []
         warn: list[Violation] = []
 
-        def bad(code: str, msg: str) -> None:
-            viol.append(Violation(code, msg, seq))
+        def bad(code: str, msg: str, variant: str | None = None, **params: object) -> None:
+            """`variant` names which sentence of the code this is; `params` are its facts (see Violation.params)."""
+            viol.append(Violation(code, msg, seq, {"variant": variant, **params} if variant else params))
 
         kind = op.op
         if kind not in ("copy", "move", "delete"):
-            bad("BAD_PATH", f"unknown op kind {kind!r}")
+            bad("BAD_PATH", f"unknown op kind {kind!r}", variant="op_kind", kind=str(kind))
             self.violations.extend(viol)
             return
         two = kind != "delete"
@@ -330,7 +358,7 @@ class _Engine:
         dst_ok = False
         if two:
             if drid is None or dpath is None:
-                bad("BAD_PATH", f"{kind} needs a destination remote and path")
+                bad("BAD_PATH", f"{kind} needs a destination remote and path", variant="no_destination", kind=kind)
             else:
                 dst_ok = self._addr(drid, dpath, "destination", bad)
         wit_given = not two and wrid is not None and wpath is not None
@@ -338,12 +366,12 @@ class _Engine:
 
         dep = op.depends_on
         if dep is not None and not (isinstance(dep, int) and 1 <= dep < seq and dep in self.seqs):
-            bad("DEPENDENCY", f"depends_on {dep!r} is not an earlier op of this plan")
+            bad("DEPENDENCY", f"depends_on {dep!r} is not an earlier op of this plan", variant="not_earlier", dep=str(dep))
 
         written = ([drid] if two else []) + ([srid] if kind != "copy" else [])
         for rid in dict.fromkeys(written):  # once per remote, even for a move inside one
             if rid in self.remotes and not self.remotes[rid].writable:
-                bad("READ_ONLY_REMOTE", f"{self._w(rid, '')} has no write_remote configured")
+                bad("READ_ONLY_REMOTE", f"{self._w(rid, '')} has no write_remote configured", at=self._loc(rid, ""))
         if kind == "move" and drid is not None and drid != srid:
             bad("CROSS_REMOTE_MOVE", "a move cannot cross remotes; use copy + delete")
 
@@ -355,18 +383,25 @@ class _Engine:
         sw = self._w(srid, spath)
         src, n = self._lookup(srid, spath)
         if n > 1:
-            bad("AMBIGUOUS_PATH", f"{n} live entries share {sw}; rclone cannot address one of them")
+            bad("AMBIGUOUS_PATH", f"{n} live entries share {sw}; rclone cannot address one of them",
+                variant="source", n=n, at=self._loc(srid, spath))
         elif src is None:
-            bad("SRC_MISSING", f"no live file at {sw}: {self._why_missing(srid, spath)}")
+            why, extra = self._why_missing(srid, spath)
+            bad("SRC_MISSING", f"no live file at {sw}: {_MISSING_WHY[why].format(**extra)}", variant="missing",
+                at=self._loc(srid, spath), why=why, **extra)
         elif op.src_entry_id is not None and src.id != op.src_entry_id:
             what = "a file created earlier in this plan" if src.id is None else f"entry {src.id}"
-            bad("SRC_MISSING", f"{sw} holds {what}, not the planned entry {op.src_entry_id}")
+            bad("SRC_MISSING", f"{sw} holds {what}, not the planned entry {op.src_entry_id}", variant="other_entry",
+                at=self._loc(srid, spath), what="created" if src.id is None else "entry", entry=src.id,
+                planned=op.src_entry_id)
             src = None
         if src is not None:
             if op.expect_size is not None and src.size != op.expect_size:
-                bad("EXPECT_MISMATCH", f"{sw} is {src.size} bytes at this step, the plan expected {op.expect_size}")
+                bad("EXPECT_MISMATCH", f"{sw} is {src.size} bytes at this step, the plan expected {op.expect_size}",
+                    at=self._loc(srid, spath), size=src.size, expected=op.expect_size)
             if src.native and (kind == "delete" or (kind == "copy" and drid != srid)):
-                bad("NATIVE_DOC", f"{sw} is a Google-native doc: no bytes to copy or to verify a delete against")
+                bad("NATIVE_DOC", f"{sw} is a Google-native doc: no bytes to copy or to verify a delete against",
+                    at=self._loc(srid, spath))
 
         action = "add"
         witness: _Witness | None = None
@@ -392,20 +427,23 @@ class _Engine:
         ancestors = ["/".join(parts[:i]) for i in range(1, len(parts))]
         for anc in ancestors:
             if self.files_at(drid, anc):
-                bad("DST_EXISTS", f"{self._w(drid, anc)} is a file, so {dw} cannot be created under it")
+                bad("DST_EXISTS", f"{self._w(drid, anc)} is a file, so {dw} cannot be created under it",
+                    variant="file_above", at=self._loc(drid, anc), dst=self._loc(drid, dpath))
                 break
         action = "add"
         if self.has_dir(drid, dpath):
-            bad("DST_EXISTS", f"{dw} is a directory")
+            bad("DST_EXISTS", f"{dw} is a directory", variant="directory", at=self._loc(drid, dpath))
         else:
             existing = self.files_at(drid, dpath)
             if len(existing) > 1:
-                bad("AMBIGUOUS_PATH", f"{len(existing)} live entries share the destination {dw}")
+                bad("AMBIGUOUS_PATH", f"{len(existing)} live entries share the destination {dw}",
+                    variant="destination", n=len(existing), at=self._loc(drid, dpath))
             elif existing:
                 if _compare(src, existing[0]) == "same":
                     action = "same"
                 else:
-                    bad("DST_EXISTS", f"{dw} holds different or unproven content; never overwritten")
+                    bad("DST_EXISTS", f"{dw} holds different or unproven content; never overwritten",
+                        variant="different", at=self._loc(drid, dpath))
         if self.remotes[drid].ci:
             self._check_case(op, ancestors, bad)
         return action
@@ -417,14 +455,16 @@ class _Engine:
         for anc in ancestors:
             for p, is_dir in self._ci_nodes(drid, anc):
                 if p != anc and not is_dir:
-                    bad("CASE_COLLISION", f"{self._w(drid, anc)} collides with the file {self._w(drid, p)} (case-insensitive)")
+                    bad("CASE_COLLISION", f"{self._w(drid, anc)} collides with the file {self._w(drid, p)} (case-insensitive)",
+                        variant="file", at=self._loc(drid, anc), other=self._loc(drid, p))
                     return
         for p, _ in self._ci_nodes(drid, dpath):
             if p == dpath:
                 continue
             if op.op == "move" and drid == op.src_remote_id and p == op.src_path:
                 continue  # a case-only rename: the "collision" is the file itself
-            bad("CASE_COLLISION", f"{self._w(drid, dpath)} collides with {self._w(drid, p)} (case-insensitive)")
+            bad("CASE_COLLISION", f"{self._w(drid, dpath)} collides with {self._w(drid, p)} (case-insensitive)",
+                variant="name", at=self._loc(drid, dpath), other=self._loc(drid, p))
             return
 
     def _depends_on(self, seq: int, target: int | None) -> bool:
@@ -444,7 +484,7 @@ class _Engine:
     def _check_witness(self, op: Op, seq: int, src: _Node, given: bool, addr_ok: bool, bad, warn) -> _Witness | None:
         wrid, wpath = op.witness_remote_id, op.witness_path
         if not given:
-            bad("NO_WITNESS", "a delete must name a witness: the identical copy that survives")
+            bad("NO_WITNESS", "a delete must name a witness: the identical copy that survives", variant="none_given")
             return None
         if not addr_ok:
             return None  # BAD_PATH already recorded
@@ -452,18 +492,23 @@ class _Engine:
         ww = self._w(wrid, wpath)
         if wrid == op.src_remote_id and (
                 wpath == op.src_path or (self.remotes[wrid].ci and _fold(wpath) == _fold(op.src_path))):
-            bad("NO_WITNESS", f"the witness {ww} is the file being deleted")
+            bad("NO_WITNESS", f"the witness {ww} is the file being deleted", variant="is_source",
+                at=self._loc(wrid, wpath))
             return None
         w, n = self._lookup(wrid, wpath)
         if n > 1:
-            bad("AMBIGUOUS_PATH", f"{n} live entries share the witness path {ww}")
+            bad("AMBIGUOUS_PATH", f"{n} live entries share the witness path {ww}", variant="witness", n=n,
+                at=self._loc(wrid, wpath))
             return None
         if w is None:
-            bad("NO_WITNESS", f"no live file at the witness {ww}: {self._why_missing(wrid, wpath)}")
+            why, extra = self._why_missing(wrid, wpath)
+            bad("NO_WITNESS", f"no live file at the witness {ww}: {_MISSING_WHY[why].format(**extra)}",
+                variant="missing", at=self._loc(wrid, wpath), why=why, **extra)
             return None
         if w.virtual and not self._depends_on(seq, w.made_by):
             bad("DEPENDENCY", f"the witness {ww} is created by op {w.made_by}; this delete must declare "
-                              f"depends_on that op (directly or through other ops)")
+                              f"depends_on that op (directly or through other ops)", variant="witness_made_by",
+                at=self._loc(wrid, wpath), by=w.made_by)
         verdict = _compare(src, w)
         if verdict == "same":
             return _Witness(seq, wrid, wpath, w.key, src.key, False)
@@ -471,13 +516,16 @@ class _Engine:
                 and src.size is not None and w.size is not None and w.name_norm == src.name_norm):
             if self.probable_for.get((wrid, wpath, w.key), src.key) != src.key:
                 bad("WITNESS_MISMATCH", f"{ww} already vouches, by name and size only, for a different file; "
-                                        f"one probable match cannot cover two contents")
+                                        f"one probable match cannot cover two contents", variant="vouched",
+                    at=self._loc(wrid, wpath))
                 return None
             warn.append(Violation(
-                "PROBABLE_ONLY", f"{ww} matches by name and size only; content is not hash-proven", seq))
+                "PROBABLE_ONLY", f"{ww} matches by name and size only; content is not hash-proven", seq,
+                {"at": self._loc(wrid, wpath)}))
             return _Witness(seq, wrid, wpath, w.key, src.key, True)
         why = {"different": "its size or hash differs", "unproven": "its content is not provably identical"}[verdict]
-        bad("WITNESS_MISMATCH", f"witness {ww} does not match the deleted file: {why}")
+        bad("WITNESS_MISMATCH", f"witness {ww} does not match the deleted file: {why}", variant="differs",
+            at=self._loc(wrid, wpath), why=verdict)
         return None
 
     def _apply(self, op: Op, seq: int, src: _Node, action: str, witness: _Witness | None) -> None:
@@ -488,7 +536,8 @@ class _Engine:
         if kind == "copy":
             assert drid is not None and dpath is not None
             if action == "same":
-                self.warnings.append(Violation("NOOP", f"{self._w(drid, dpath)} already holds identical content", seq))
+                self.warnings.append(Violation("NOOP", f"{self._w(drid, dpath)} already holds identical content", seq,
+                                               {"variant": "identical", "at": self._loc(drid, dpath)}))
                 return
             self._add(drid, dpath, src, None, seq)
             st = self._stat(drid)
@@ -501,14 +550,16 @@ class _Engine:
         elif kind == "move":
             assert drid is not None and dpath is not None
             if drid == srid and dpath == spath:
-                self.warnings.append(Violation("NOOP", f"move of {self._w(srid, spath)} onto itself", seq))
+                self.warnings.append(Violation("NOOP", f"move of {self._w(srid, spath)} onto itself", seq,
+                                               {"variant": "onto_itself", "at": self._loc(srid, spath)}))
                 return
             self._touch(src, srid, spath, seq)
             self._remove(src, srid, spath, seq)
             if action == "same":
                 self.warnings.append(Violation(
                     "NOOP", f"{self._w(drid, dpath)} already holds identical content; "
-                            f"the move only removes {self._w(srid, spath)}", seq))
+                            f"the move only removes {self._w(srid, spath)}", seq,
+                    {"variant": "identical_move", "at": self._loc(drid, dpath), "removed": self._loc(srid, spath)}))
                 self._quarantine(srid, size)
                 self.witnesses.append(_Witness(seq, drid, dpath, src.key, src.key, False))
             else:
@@ -555,7 +606,8 @@ class _Engine:
             if len(cur) != 1 or cur[0].key != w.key:
                 self.violations.append(Violation(
                     "NO_WITNESS", f"witness {self._w(w.remote_id, w.path)} is no longer live with the same "
-                                  f"content at the end of the plan", w.seq))
+                                  f"content at the end of the plan", w.seq,
+                    {"variant": "gone", "at": self._loc(w.remote_id, w.path)}))
             elif w.probable:
                 cover.add((w.src_key, w.remote_id, w.path))
         cover_n: dict[str, int] = {}
@@ -566,7 +618,7 @@ class _Engine:
         #    for one copy of the content it vouched for.
         before_all = self._key_counts(list(self.touched), None)
         lost = 0
-        for key, (seq, src_desc) in self.touched.items():
+        for key, (seq, src_at) in self.touched.items():
             before = before_all.get(key, 0)
             after = before + self.kdelta.get(key, 0) + cover_n.get(key, 0)
             need = max(1, min(self.policy.min_copies, before))
@@ -574,15 +626,17 @@ class _Engine:
                 lost += 1
             if after < need:
                 self.violations.append(Violation(
-                    "CONTENT_LOST", f"{src_desc}: content would be left with {max(after, 0)} live "
-                                    f"cop{'y' if after == 1 else 'ies'} (policy needs {need})", seq))
+                    "CONTENT_LOST", f"{self._w(*src_at)}: content would be left with {max(after, 0)} live "
+                                    f"cop{'y' if after == 1 else 'ies'} (policy needs {need})", seq,
+                    {"at": self._loc(*src_at), "n": max(after, 0), "need": need}))
 
         # 3. Quota. Quarantine is a move inside the remote, so deletes never offset it.
         for rid, seq in self.quota_seq.items():
             st = self.rstat[rid]
             self.violations.append(Violation(
                 "QUOTA", f"{self._w(rid, '')} would receive {st[2]} bytes but only "
-                         f"{(self.policy.free_bytes or {})[rid]} are free", seq))
+                         f"{(self.policy.free_bytes or {})[rid]} are free", seq,
+                {"at": self._loc(rid, ""), "bytes": st[2], "free": (self.policy.free_bytes or {})[rid]}))
 
         # 4. Before/after numbers.
         deltas: list[RemoteDelta] = []
@@ -647,7 +701,8 @@ def simulate_ops(conn: sqlite3.Connection, ops: list[Op], *, plan_id: int | None
         if op.op in counts:
             counts[op.op] += 1
         if seq < 1 or seq == last:
-            eng.violations.append(Violation("DEPENDENCY", f"seq {seq} is not a unique positive position", seq))
+            eng.violations.append(Violation("DEPENDENCY", f"seq {seq} is not a unique positive position", seq,
+                                            {"variant": "position", "seq": seq}))
         else:
             eng.run_op(op, seq)
         last = seq
@@ -684,7 +739,7 @@ def simulate_plan(conn: sqlite3.Connection, plan_id: int, *, policy: SafetyPolic
     try:
         ops = plans.load_ops(conn, plan_id)
         snapshot = db.snapshot(conn)
-        digest = plans.compute_digest(plan_id, ops, snapshot)
+        digest = plans.compute_digest(conn, plan_id, ops, snapshot)
         report = simulate_ops(conn, ops, plan_id=plan_id, policy=policy, digest=digest)
     finally:
         if own_txn:

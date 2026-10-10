@@ -27,8 +27,9 @@ DEFAULT_QUARANTINE = ".drive-merge-quarantine"
 _PAGE = 200            # duplicate groups fetched per query
 _MAX_SUFFIX = 1000     # ' (2)' ... ' (1000)' before a destination is given up on
 
-# Strongest first: the executor re-checks this hash live before touching the file.
-_HASH_PREFERENCE = ("sha256", "md5", "sha1", "dropbox", "quickxor")
+# Strongest first: the executor re-checks this hash live before touching the file. sha1, md5 and QuickXor
+# come last because they are the weak ones (identity.WEAK_TYPES): fine to notice a change, no proof of identity.
+_HASH_PREFERENCE = ("sha256", "dropbox", "sha1", "md5", "quickxor")
 
 
 @dataclass
@@ -260,7 +261,9 @@ class _File(NamedTuple):
         return f"{self.remote}:{self.path}"
 
 
-_HASHED = " OR ".join(f"COALESCE(e.{t}, '') <> ''" for t in identity.HASH_TYPES)
+# "Hashed" = carries a hash that proves identity. A file with only md5/sha1/QuickXor (OneDrive) is no better off than
+# a hashless one: the executor must read it unless a bridge made from its own bytes vouches for it.
+_HASHED = " OR ".join(f"COALESCE(e.{t}, '') <> ''" for t in identity.STRONG_TYPES)
 
 
 def _fold(s: str) -> str:

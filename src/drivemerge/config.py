@@ -23,12 +23,20 @@ class RemoteConfig:
     write: str | None = None                # rclone path the executor may modify; None = read-only
     hash_types: tuple[str, ...] | None = None  # override provider.native_hashes when scanning
     extra_args: tuple[str, ...] = ()        # extra rclone flags for this remote
+    case_insensitive: bool | None = None    # override provider.case_insensitive (a local disk can be either)
 
     @property
     def scan_hash_types(self) -> tuple[str, ...]:
         if self.hash_types is not None:
             return self.hash_types
         return providers.get(self.provider).native_hashes
+
+    @property
+    def folds_case(self) -> bool:
+        """Does this remote treat `Docs` and `docs` as one name? The config wins over the provider's default."""
+        if self.case_insensitive is not None:
+            return self.case_insensitive
+        return providers.get(self.provider).case_insensitive
 
 
 @dataclass
@@ -64,6 +72,15 @@ class Config:
         raise KeyError(f"unknown remote {name!r}")
 
 
+def _optional_bool(remote: dict, key: str) -> bool | None:
+    """`key` of a [[remotes]] entry as a bool, None when absent; a string like "false" would be truthy, so refuse it."""
+    if key not in remote:
+        return None
+    if not isinstance(remote[key], bool):
+        raise ValueError(f"remote {remote.get('name')!r}: {key} must be true or false, not {remote[key]!r}")
+    return remote[key]
+
+
 def parse_config(data: dict) -> Config:
     db = data.get("database", {})
     rc = data.get("rclone", {})
@@ -80,6 +97,7 @@ def parse_config(data: dict) -> Config:
             write=expand(r.get("write")),
             hash_types=tuple(r["hash_types"]) if "hash_types" in r else None,
             extra_args=tuple(r.get("extra_args", ())),
+            case_insensitive=_optional_bool(r, "case_insensitive"),
         ))
     names = [r.name for r in remotes]
     if len(names) != len(set(names)):
@@ -107,12 +125,11 @@ def sync_remotes(conn: sqlite3.Connection, config: Config) -> None:
     entries reference them), and record the quarantine folder every module must treat as not live."""
     set_quarantine_dir(conn, config.safety.quarantine_dir)
     for r in config.remotes:
-        prov = providers.get(r.provider)
         conn.execute(
             """INSERT INTO remotes(name, provider, read_remote, write_remote, case_insensitive, created_at)
                VALUES (?, ?, ?, ?, ?, ?)
                ON CONFLICT(name) DO UPDATE SET provider = excluded.provider,
                  read_remote = excluded.read_remote, write_remote = excluded.write_remote,
                  case_insensitive = excluded.case_insensitive""",
-            (r.name, r.provider, r.read, r.write, int(prov.case_insensitive), utcnow()),
+            (r.name, r.provider, r.read, r.write, int(r.folds_case), utcnow()),
         )

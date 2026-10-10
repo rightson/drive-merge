@@ -21,10 +21,13 @@ from . import (
     builders, classify, db, dirstats, executor, identity, plans, search, simulate, suggest, workspace,
 )
 from .config import Config, sync_remotes
+from .models import Plan
 from .rclone import Rclone
 from .scanner import scan_remote
 
 PLAN_KINDS = ("dedupe", "consolidate", "reorganize", "manual")
+# Written only by workspace.preview; a proposer's params must never be able to claim a draft.
+RESERVED_PARAMS = ("draft_id", "draft_version")
 
 
 def _plain(obj):
@@ -37,6 +40,18 @@ def _plain(obj):
 
 class ServiceError(ValueError):
     pass
+
+
+def draft_of(plan: Plan) -> int | None:
+    """The draft this plan is the preview of, or None.
+
+    Only `workspace.preview` makes a plan of kind 'workspace', created by 'workspace'. A `draft_id` in the
+    params of any other plan is a claim made by whoever proposed it, so it links nothing: otherwise running
+    that plan would close someone else's draft.
+    """
+    if plan.kind != "workspace" or plan.created_by != "workspace":
+        return None
+    return plan.params.get("draft_id")
 
 
 class Service:
@@ -138,6 +153,10 @@ class Service:
         """Build a plan, persist it as a draft and simulate it. Never touches a cloud."""
         if kind not in PLAN_KINDS:
             raise ServiceError(f"unknown plan kind {kind!r}; expected one of {PLAN_KINDS}")
+        claimed = [k for k in RESERVED_PARAMS if k in params]
+        if claimed:
+            raise ServiceError(f"params {', '.join(claimed)} are reserved for workspace previews; "
+                               "stage moves into a draft and preview it instead")
         params = dict(params)
         rules_text = params.pop("rules", None)
         # Quarantined files are deleted content, not live copies; builders must know where they are.
@@ -250,9 +269,10 @@ class Service:
         """Run an approved plan. A finished workspace plan also closes its draft, so the browser,
         the CLI and a later rescan all agree that the staged moves have happened."""
         result = _plain(executor.execute_plan(self.conn, self.rclone, self.config, plan_id, progress=progress))
-        params = plans.get_plan(self.conn, plan_id, with_ops=False).params
-        if params.get("draft_id") is not None and result.get("status") == "done":
-            result.update(self._close_draft(params["draft_id"], params.get("draft_version")))
+        plan = plans.get_plan(self.conn, plan_id, with_ops=False)
+        draft_id = draft_of(plan)
+        if draft_id is not None and result.get("status") == "done":
+            result.update(self._close_draft(draft_id, plan.params.get("draft_version")))
         return result
 
     def _close_draft(self, draft_id: int, previewed_version: int | None) -> dict:
@@ -274,4 +294,4 @@ class Service:
                                                 older_than_days=older_than_days))
 
 
-__all__ = ["Service", "ServiceError", "PLAN_KINDS"]
+__all__ = ["Service", "ServiceError", "PLAN_KINDS", "RESERVED_PARAMS", "draft_of"]

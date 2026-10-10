@@ -46,9 +46,10 @@ def refresh(conn: sqlite3.Connection, *, remote_ids: list[int] | None = None) ->
 
     Only live entries (present = 1) count. dup_files is judged against the whole
     catalog: a copy on a remote that is not being refreshed still makes a file a
-    duplicate. Old rows are replaced in one transaction, so readers never see a
-    half-built remote. mtimes are canonical fixed-width UTC strings, so plain
-    string max() is the real maximum.
+    duplicate, but empty files never are (as in identity.duplicate_groups). Old
+    rows are replaced in one transaction, so readers never see a half-built
+    remote. mtimes are canonical fixed-width UTC strings, so plain string max()
+    is the real maximum.
     """
     started = time.perf_counter()
     if remote_ids is None:
@@ -61,7 +62,7 @@ def refresh(conn: sqlite3.Connection, *, remote_ids: list[int] | None = None) ->
 
     shared = {
         r[0] for r in conn.execute(
-            "SELECT content_group FROM entries WHERE present = 1 AND is_dir = 0 "
+            "SELECT content_group FROM entries WHERE present = 1 AND is_dir = 0 AND size > 0 "
             "AND content_group IS NOT NULL GROUP BY content_group HAVING COUNT(*) >= 2"
         )
     }

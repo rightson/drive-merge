@@ -23,6 +23,9 @@ from .service import Service, ServiceError
 
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 _NO_PLAN = re.compile(r"no plan \d+")
+# The first 8 characters of a digest ARE the approval code, and `snapshot` is what the digest binds to.
+# Only the human at the terminal or browser may see them; MCP and the CLI's --json drop them too.
+_SECRET_KEYS = frozenset({"digest", "approval_code", "snapshot"})
 
 
 class _Body(BaseModel):
@@ -57,12 +60,23 @@ def _given(**kwargs: Any) -> dict[str, Any]:
     return {k: v for k, v in kwargs.items() if v is not None}
 
 
+def scrub_secrets(obj: Any) -> Any:
+    """`obj` without approval secrets at any depth, so a caller holding only the API token never learns the
+    code a person is meant to read off their own screen."""
+    if isinstance(obj, dict):
+        return {k: scrub_secrets(v) for k, v in obj.items() if k not in _SECRET_KEYS}
+    if isinstance(obj, (list, tuple)):
+        return [scrub_secrets(v) for v in obj]
+    return obj
+
+
 def _message(exc: Exception) -> str:
     return str(exc.args[0]) if len(exc.args) == 1 else str(exc)
 
 
-def _error(status: int, message: str, headers: dict[str, str] | None = None) -> JSONResponse:
-    return JSONResponse({"error": message}, status_code=status, headers=headers)
+def _error(status: int, message: str, headers: dict[str, str] | None = None, code: str | None = None) -> JSONResponse:
+    body = {"error": message} if code is None else {"error": message, "code": code}
+    return JSONResponse(body, status_code=status, headers=headers)
 
 
 def bearer_ok(authorization: str | None, expected: bytes | None) -> bool:
@@ -72,19 +86,28 @@ def bearer_ok(authorization: str | None, expected: bytes | None) -> bool:
             and hmac.compare_digest(presented.encode(), expected))
 
 
-def install_error_handlers(app: FastAPI) -> None:
-    """Map service/plan errors to JSON `{"error": ...}` responses; shared with the UI app."""
+def install_error_handlers(app: FastAPI, *, coded: bool = False) -> None:
+    """Map service/plan errors to JSON `{"error": ...}` responses; shared with the UI app.
+
+    With `coded` (the UI app) every error also carries a `code`, so that the page can word it in the
+    person's language instead of showing the English `error`.
+    """
+    def code(name: str) -> str | None:
+        return name if coded else None
+
     def http_error(_: Request, exc: StarletteHTTPException) -> JSONResponse:
-        return _error(exc.status_code, str(exc.detail), exc.headers)
+        name = {401: "UNAUTHENTICATED", 404: "NOT_FOUND"}.get(exc.status_code, "BAD_REQUEST")
+        return _error(exc.status_code, str(exc.detail), exc.headers, code(name))
 
     def bad_request(_: Request, exc: Exception) -> JSONResponse:
-        return _error(400, _message(exc))
+        return _error(400, _message(exc), code=code("BAD_REQUEST"))
 
     def not_found(_: Request, exc: KeyError) -> JSONResponse:
-        return _error(404, _message(exc))
+        return _error(404, _message(exc), code=code("NOT_FOUND"))
 
     def plan_error(_: Request, exc: plans.PlanError) -> JSONResponse:
-        return _error(404 if _NO_PLAN.fullmatch(str(exc)) else 400, str(exc))
+        missing = _NO_PLAN.fullmatch(str(exc))
+        return _error(404 if missing else 400, str(exc), code=code("NOT_FOUND" if missing else "BAD_REQUEST"))
 
     app.add_exception_handler(StarletteHTTPException, http_error)
     for exc_type in (ValueError, ServiceError, builders.BuildError):  # the last two subclass ValueError
@@ -119,7 +142,9 @@ def create_app(service: Service, *, token: str) -> FastAPI:
 
 def build_router(service: Service, lock: threading.Lock, *, dependencies: list[Any]) -> APIRouter:
     """The /v1 catalog and plan routes. `dependencies` is the auth the including app requires;
-    `lock` serialises use of the service's single SQLite connection."""
+    `lock` serialises use of the service's single SQLite connection. Plan responses leave here scrubbed of
+    the digest, the approval code and the snapshot: every caller of these routes is a bearer client or a
+    page, and the code reaches a human only through the workspace preview or the CLI."""
     api = APIRouter(dependencies=dependencies)
 
     @api.get("/v1/stats")
@@ -194,22 +219,22 @@ def build_router(service: Service, lock: threading.Lock, *, dependencies: list[A
     @api.get("/v1/plans")
     def list_plans(status: str | None = None, limit: int = 50) -> dict:
         with lock:
-            return {"plans": service.plans(status=status, limit=limit)}
+            return {"plans": scrub_secrets(service.plans(status=status, limit=limit))}
 
     @api.post("/v1/plans", status_code=201)
     def create_plan(body: PlanBody) -> dict:
         with lock:
-            return service.propose_plan(body.kind, body.params, created_by="api", title=body.title)
+            return scrub_secrets(service.propose_plan(body.kind, body.params, created_by="api", title=body.title))
 
     @api.get("/v1/plans/{plan_id}")
     def get_plan(plan_id: int, ops_limit: int = 200) -> dict:
         with lock:
-            return service.plan(plan_id, ops_limit=ops_limit)
+            return scrub_secrets(service.plan(plan_id, ops_limit=ops_limit))
 
     @api.post("/v1/plans/{plan_id}/simulate")
     def simulate_plan(plan_id: int) -> dict:
         with lock:
-            return service.simulate(plan_id)
+            return scrub_secrets(service.simulate(plan_id))
 
     @api.post("/v1/plans/{plan_id}/cancel")
     def cancel_plan(plan_id: int) -> dict:
@@ -230,4 +255,5 @@ def serve(config: Config, *, allow_remote: bool = False) -> None:
     uvicorn.run(app, host=host, port=config.api.port)
 
 
-__all__ = ["create_app", "build_router", "install_error_handlers", "bearer_ok", "serve", "LOOPBACK_HOSTS"]
+__all__ = ["create_app", "build_router", "install_error_handlers", "bearer_ok", "scrub_secrets", "serve",
+           "LOOPBACK_HOSTS"]

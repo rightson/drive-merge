@@ -39,10 +39,10 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, ConfigDict
 
 from . import __version__, plans
-from .api import LOOPBACK_HOSTS, bearer_ok, build_router, install_error_handlers
+from .api import LOOPBACK_HOSTS, bearer_ok, build_router, install_error_handlers, scrub_secrets
 from .config import Config
 from .models import Op, Plan
-from .service import Service
+from .service import Service, draft_of
 
 SESSION_COOKIE = "dm_session"
 MAX_SESSIONS = 32          # token holders only, but a loop must not grow memory without bound
@@ -60,11 +60,14 @@ _CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'
 
 
 class UiError(Exception):
-    """A refusal with a machine-readable code; rendered as {"error", "code"}."""
+    """A refusal with a machine-readable code; rendered as {"error", "code"} (and "params" when it has any).
 
-    def __init__(self, status: int, code: str, message: str, headers: dict[str, str] | None = None):
+    `message` is English, for terminals and API clients; the page words the code itself, with `params`.
+    """
+
+    def __init__(self, status: int, code: str, message: str, headers: dict[str, str] | None = None, **params: Any):
         super().__init__(message)
-        self.status, self.code, self.headers = status, code, headers
+        self.status, self.code, self.headers, self.params = status, code, headers, params
 
 
 class _Body(BaseModel):
@@ -89,6 +92,14 @@ class RescanBody(_Body):
 
 def _refusal(status: int, payload: dict, headers: dict[str, str] | None = None) -> JSONResponse:
     return JSONResponse(payload, status_code=status, headers=headers)
+
+
+def _coded(message: str, code: str, params: dict | None = None) -> dict:
+    """An error body: the English `error` for people at a terminal, and `code` + `params` for the page to word."""
+    body: dict = {"error": message, "code": code}
+    if params:
+        body["params"] = params
+    return body
 
 
 def _current_user() -> str:
@@ -168,7 +179,7 @@ class _Jobs:
             running = next((j for j in self._jobs.values() if j.status == "running"), None)
             if running is not None:
                 raise UiError(409, "JOB_BUSY", f"a {running.kind} job ({running.id}) is still running; "
-                                               "wait for it to finish")
+                                               "wait for it to finish", job=running.id, kind=running.kind)
             job = _Job(secrets.token_hex(6), kind, progress=dict(progress))
             self._jobs[job.id] = job
             for old in [j.id for j in self._jobs.values() if j.status != "running"][:-KEEP_JOBS]:
@@ -233,9 +244,29 @@ def _reports(jobs: _Jobs, job: _Job) -> Callable[..., None]:
 # Helpers shared by routes
 # --------------------------------------------------------------------------- #
 
+def _outdated_remotes(conn) -> list[str]:
+    """Names of the clouds a plan operation changed after the catalog last finished scanning them.
+
+    The executor never touches the catalog, so after a run the tree describes the cloud as it was; the page
+    says so until a scan completes. Read from the journal of executed operations (done, or failed part way)
+    rather than from page memory, so a reload, another tab or a run from the terminal show it as well.
+    """
+    return [r[0] for r in conn.execute(
+        """SELECT r.name FROM remotes r WHERE EXISTS (
+               SELECT 1 FROM (SELECT src_remote_id AS rid, executed_at AS t FROM plan_ops
+                              WHERE status IN ('done', 'failed') AND executed_at IS NOT NULL
+                              UNION ALL
+                              SELECT dst_remote_id, executed_at FROM plan_ops
+                              WHERE status IN ('done', 'failed') AND dst_remote_id IS NOT NULL
+                                AND executed_at IS NOT NULL) x
+               WHERE x.rid = r.id AND x.t > COALESCE((SELECT MAX(s.finished_at) FROM scans s
+                                                      WHERE s.remote_id = r.id AND s.status = 'complete'), ''))
+           ORDER BY r.id""")]
+
+
 def _stale_reason(conn, plan: Plan) -> str | None:
     """Why a draft's plan no longer matches the draft; None for other plans and current previews."""
-    draft_id = plan.params.get("draft_id")
+    draft_id = draft_of(plan)
     if draft_id is None:
         return None
     row = conn.execute("SELECT status, version FROM drafts WHERE id = ?", (draft_id,)).fetchone()
@@ -338,19 +369,19 @@ def create_ui_app(service: Service, *, config: Config, api_token: str, ui_token:
 
     app = FastAPI(title="drive-merge workspace", version=__version__,
                   docs_url=None, redoc_url=None, openapi_url=None)
-    install_error_handlers(app)
+    install_error_handlers(app, coded=True)
 
     def ui_error(_: Request, exc: UiError) -> JSONResponse:
-        return _refusal(exc.status, {"error": str(exc), "code": exc.code}, exc.headers)
+        return _refusal(exc.status, _coded(str(exc), exc.code, exc.params), exc.headers)
 
     def workspace_error(_: Request, exc: Exception) -> JSONResponse:
         code = getattr(exc, "code", "CONFLICT")
         status = 404 if code == "NOT_FOUND" else 400 if code == "BAD_REQUEST" else 409
-        return _refusal(status, {"error": str(exc), "code": code})
+        return _refusal(status, _coded(str(exc), code, getattr(exc, "params", None)))
 
     def invalid_request(_: Request, exc: RequestValidationError) -> JSONResponse:
         problems = "; ".join(f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors())
-        return _refusal(422, {"error": problems})
+        return _refusal(422, _coded(problems, "BAD_REQUEST"))
 
     app.add_exception_handler(UiError, ui_error)
     app.add_exception_handler(workspace.WorkspaceError, workspace_error)
@@ -427,6 +458,7 @@ def create_ui_app(service: Service, *, config: Config, api_token: str, ui_token:
         with lock:
             rows = service.conn.execute(
                 "SELECT id, name, provider, write_remote, case_insensitive FROM remotes ORDER BY id").fetchall()
+            outdated = _outdated_remotes(service.conn)
         return {
             "approvals_enabled": approvals_enabled,
             "execution_enabled": config.safety.execution_enabled,
@@ -435,6 +467,8 @@ def create_ui_app(service: Service, *, config: Config, api_token: str, ui_token:
             "version": __version__,
             # Lets a reloaded page recover its CSRF token without the one-time URL token; only a session gets it.
             "csrf": auth.session.csrf if auth.session else None,
+            # Clouds a run changed since their last completed scan: the catalog (and so the tree) is behind them.
+            "outdated": outdated,
         }
 
     @router.get("/v1/tree/roots")
@@ -554,7 +588,7 @@ def create_ui_app(service: Service, *, config: Config, api_token: str, ui_token:
             "pending": counts.get("pending", 0),
             "current": current,
             "recent_journal": [{"id": r[0], "ts": r[1], "action": r[2], "op_id": r[3], "op_seq": r[4],
-                                "detail": _json_detail(r[5])} for r in reversed(rows)],
+                                "detail": scrub_secrets(_json_detail(r[5]))} for r in reversed(rows)],
         }
 
     @router.get("/v1/jobs/{job_id}")
@@ -569,7 +603,7 @@ def create_ui_app(service: Service, *, config: Config, api_token: str, ui_token:
             plan = plans.get_plan(service.conn, plan_id, with_ops=False)
             stale = _stale_reason(service.conn, plan)
             if stale:
-                raise UiError(409, "STALE_PREVIEW", f"{stale}; preview the draft again before approving")
+                raise UiError(409, "STALE_PREVIEW", f"{stale}; preview the draft again before approving", plan=plan_id)
             plans.approve_plan(service.conn, plan_id, body.code.strip().lower(),
                                approved_by=f"ui:{_current_user()}")
         return {"ok": True}
@@ -578,7 +612,8 @@ def create_ui_app(service: Service, *, config: Config, api_token: str, ui_token:
     def execute(plan_id: int) -> dict:
         busy = jobs.busy()
         if busy is not None:
-            raise UiError(409, "JOB_BUSY", f"a {busy.kind} job ({busy.id}) is still running; wait for it to finish")
+            raise UiError(409, "JOB_BUSY", f"a {busy.kind} job ({busy.id}) is still running; wait for it to finish",
+                          job=busy.id, kind=busy.kind)
         if not config.safety.execution_enabled:
             raise UiError(403, "EXECUTION_DISABLED", "execution is disabled: set `execution_enabled = true` under "
                                                      "[safety] in config.toml, then restart `drivemerge ui`")
@@ -586,10 +621,12 @@ def create_ui_app(service: Service, *, config: Config, api_token: str, ui_token:
             plan = plans.get_plan(service.conn, plan_id, with_ops=False)
             if plan.status != "approved":
                 raise UiError(409, "NOT_APPROVED", f"plan {plan_id} is {plan.status}; "
-                                                   "only an approved plan can be executed")
+                                                   "only an approved plan can be executed",
+                              plan=plan_id, plan_status=plan.status)
             stale = _stale_reason(service.conn, plan)
             if stale:
-                raise UiError(409, "STALE_PREVIEW", f"{stale}; preview and approve it again before executing")
+                raise UiError(409, "STALE_PREVIEW", f"{stale}; preview and approve it again before executing",
+                              plan=plan_id)
 
         def work(job: _Job) -> tuple[Any, str | None]:
             svc = Service(config)  # own connection and rclone: this thread never touches the request connection

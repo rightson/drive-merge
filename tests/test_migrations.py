@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from drivemerge import db, identity, search
+from drivemerge import db, dirstats, identity, search, workspace
 
 OLD_SCHEMA = Path(__file__).parent / "data" / "schema_cfb9079.sql"
 T0 = "2024-03-03T00:00:00Z"
@@ -208,6 +208,51 @@ def test_first_release_catalog_works_end_to_end(tmp_path):
     assert g[ids["icloud"]] == g[ids["drive"]] == ids["drive"]
 
 
+def test_first_release_catalog_gets_its_folder_counts(tmp_path):
+    """dir_stats did not exist in version 1 and only a scan fills it: without a refill every folder reads as empty."""
+    path = tmp_path / "old.db"
+    make_v1_catalog(path)
+    raw = sqlite3.connect(path, isolation_level=None)
+    raw.execute("INSERT INTO entries(remote_id, entry_key, path, parent, name, name_norm, ext, category, is_dir, "
+                "is_native_doc, present, first_seen_scan, last_seen_scan, row_version) "
+                "VALUES (1, 'p:Docs', 'Docs', '', 'Docs', 'docs', '', 'other', 1, 0, 1, 1, 1, 1)")
+    raw.close()
+    conn = db.connect(path)                                  # no scan, no identity rebuild afterwards
+    docs = next(i for i in workspace.list_dir(conn, "gd", "")["items"] if i["name"] == "Docs")
+    assert (docs["files"], docs["bytes"]) == (2, 13)         # Report.pdf (10) and Other.txt (3)
+    assert dirstats.get(conn, 2, "")["files"] == 1           # the iCloud remote too
+    assert conn.execute("SELECT COUNT(*) FROM dir_stats").fetchone()[0] == 4    # gd: '' + Docs, ic: '' + Docs
+
+
+def test_folder_counts_are_not_recomputed_on_every_connection(tmp_path, monkeypatch):
+    path = tmp_path / "old.db"
+    make_v1_catalog(path)
+    db.connect(path).close()
+    calls = []
+    monkeypatch.setattr(dirstats, "refresh", lambda *a, **k: calls.append(1))
+    db.connect(path).close()
+    assert calls == []
+
+
+def test_an_upgrade_that_dies_while_counting_folders_is_finished_by_the_next_connection(tmp_path, monkeypatch):
+    path = tmp_path / "old.db"
+    make_v1_catalog(path)
+
+    def crash(*a, **k):
+        raise RuntimeError("power cut")
+
+    with monkeypatch.context() as m:
+        m.setattr(dirstats, "refresh", crash)
+        with pytest.raises(RuntimeError, match="power cut"):
+            db.connect(path)
+    raw = sqlite3.connect(path)
+    assert raw.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()[0] == "1"
+    raw.close()
+    conn = db.connect(path)
+    assert meta(conn, "schema_version") == "2"
+    assert dirstats.get(conn, 1, "Docs")["files"] == 2
+
+
 # --------------------------------------------------------------------------- from the release before bridge_sources
 
 def test_previous_release_catalog_gains_bridge_sources_filled_from_its_slot(tmp_path, fresh_shape):
@@ -300,6 +345,100 @@ def test_a_failure_while_altering_rolls_the_whole_step_back(tmp_path, monkeypatc
     assert raw.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()[0] == "1"
     raw.close()
     assert meta(db.connect(path), "schema_version") == "2"       # and a later attempt simply works
+
+
+# --------------------------------------------------------------------------- groups made under older identity rules
+
+def _weakly_grouped_catalog(path: Path) -> tuple[int, int]:
+    """Two OneDrive files with the same size and QuickXor, grouped as the release that let QuickXor join files did."""
+    conn = db.connect(path)
+    rid = conn.execute(
+        "INSERT INTO remotes(name, provider, read_remote, write_remote, case_insensitive, created_at) "
+        "VALUES ('od', 'onedrive', 'od:', 'od:', 1, ?) RETURNING id", (T0,)).fetchone()[0]
+    scan = conn.execute("INSERT INTO scans(remote_id, status, started_at, finished_at) VALUES (?, 'complete', ?, ?) "
+                        "RETURNING id", (rid, T0, T0)).fetchone()[0]
+    a = _add_entry(conn, rid, scan, "a/report.bin", quickxor="ab" * 10)
+    b = _add_entry(conn, rid, scan, "b/report.bin", quickxor="ab" * 10)
+    conn.execute("UPDATE entries SET content_group = ? WHERE id IN (?, ?)", (a, a, b))
+    conn.execute("INSERT INTO dir_stats(remote_id, path, files, dirs, bytes, dup_files) VALUES (?, '', 2, 0, 20, 2)",
+                 (rid,))
+    conn.execute("DELETE FROM meta WHERE key = 'identity_rules'")                # as the older release left it
+    conn.close()
+    return a, b
+
+
+def test_new_catalogs_record_the_identity_rules_without_rebuilding_anything(monkeypatch):
+    monkeypatch.setattr(identity, "rebuild_groups", lambda *a, **k: pytest.fail("nothing to regroup"))
+    conn = db.connect(":memory:")
+    assert meta(conn, "identity_rules") == str(db.IDENTITY_RULES)
+
+
+def test_groups_built_when_a_weak_hash_could_join_files_are_dropped_on_the_first_connection(tmp_path):
+    path = tmp_path / "weak.db"
+    a, b = _weakly_grouped_catalog(path)
+    conn = db.connect(path)
+    assert meta(conn, "identity_rules") == str(db.IDENTITY_RULES)
+    groups = dict(conn.execute("SELECT id, content_group FROM entries WHERE is_dir = 0").fetchall())
+    assert groups == {a: None, b: None}                      # equal QuickXor alone proves nothing
+    assert identity.duplicate_groups(conn) == []
+    assert dirstats.get(conn, 1, "")["dup_files"] == 0       # the folder badges follow the groups
+    (probable,) = identity.duplicate_groups(conn, confidence="probable")
+    assert {c.entry_id for c in probable.copies} == {a, b}
+
+
+def test_groups_built_when_sha1_could_join_files_are_dropped_on_the_first_connection(tmp_path):
+    """Rules version 2 trusted sha1; the current rules do not, so a catalog recorded as 2 is regrouped once."""
+    assert db.IDENTITY_RULES > 2
+    path = tmp_path / "sha1.db"
+    conn = db.connect(path)
+    rid = conn.execute(
+        "INSERT INTO remotes(name, provider, read_remote, write_remote, case_insensitive, created_at) "
+        "VALUES ('gd', 'drive', 'gd:', 'gd:', 0, ?) RETURNING id", (T0,)).fetchone()[0]
+    scan = conn.execute("INSERT INTO scans(remote_id, status, started_at, finished_at) VALUES (?, 'complete', ?, ?) "
+                        "RETURNING id", (rid, T0, T0)).fetchone()[0]
+    sha1 = hashlib.sha1(b"A").hexdigest()
+    a = _add_entry(conn, rid, scan, "a/report.bin", sha1=sha1)                  # no sha256 to tell them apart
+    b = _add_entry(conn, rid, scan, "b/report.bin", sha1=sha1)
+    c = _add_entry(conn, rid, scan, "c/report.bin", sha1=sha1, sha256=_sha("A"))
+    d = _add_entry(conn, rid, scan, "d/report.bin", sha256=_sha("A"))
+    conn.execute("UPDATE entries SET content_group = ? WHERE id IN (?, ?, ?)", (a, a, b, c))
+    conn.execute("UPDATE entries SET content_group = ? WHERE id = ?", (d, d))
+    conn.execute("UPDATE meta SET value = '2' WHERE key = 'identity_rules'")      # as the older release left it
+    conn.close()
+
+    conn = db.connect(path)
+    assert meta(conn, "identity_rules") == str(db.IDENTITY_RULES)
+    groups = dict(conn.execute("SELECT id, content_group FROM entries WHERE is_dir = 0").fetchall())
+    assert groups == {a: None, b: None, c: c, d: c}                # only the shared sha256 still proves anything
+    (exact,) = identity.duplicate_groups(conn)
+    assert {copy.entry_id for copy in exact.copies} == {c, d}
+
+
+def test_the_regroup_runs_once(tmp_path, monkeypatch):
+    path = tmp_path / "weak.db"
+    _weakly_grouped_catalog(path)
+    db.connect(path).close()
+    monkeypatch.setattr(identity, "rebuild_groups", lambda *a, **k: pytest.fail("regrouped a second time"))
+    db.connect(path).close()
+
+
+def test_an_interrupted_regroup_is_repeated_by_the_next_connection(tmp_path, monkeypatch):
+    path = tmp_path / "weak.db"
+    a, b = _weakly_grouped_catalog(path)
+
+    def crash(*args, **kwargs):
+        raise RuntimeError("power cut")
+
+    with monkeypatch.context() as m:
+        m.setattr(identity, "rebuild_groups", crash)
+        with pytest.raises(RuntimeError, match="power cut"):
+            db.connect(path)
+    raw = sqlite3.connect(path)
+    assert raw.execute("SELECT value FROM meta WHERE key = 'identity_rules'").fetchone() is None
+    raw.close()
+    conn = db.connect(path)
+    assert meta(conn, "identity_rules") == str(db.IDENTITY_RULES)
+    assert conn.execute("SELECT COUNT(*) FROM entries WHERE content_group IS NOT NULL").fetchone()[0] == 0
 
 
 # --------------------------------------------------------------------------- savepoint

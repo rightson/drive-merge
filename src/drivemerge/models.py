@@ -94,11 +94,18 @@ class Violation:
       EXPECT_MISMATCH   the op's expect_size no longer matches the catalog (stale plan)
       NOOP              (warning) op changes nothing, e.g. copy onto identical content
       PROBABLE_ONLY     (warning) delete justified by name+size only; allowed only by policy
+
+    `message` is an English sentence for people reading a terminal or a log. `params` holds the facts the
+    sentence was made from, so that a client can word it in its own language: `variant` (which of the code's
+    sentences this is, when it has several), `at` and other places as {"remote", "path"}, counts, sizes,
+    `seq`s, and `why` / `problem` / `what` (a short kind, like "moved" or "directory", that has a sentence of its
+    own). A report stored before `params` existed has an empty dict, and a page then shows `message` as it is.
     """
 
     code: str
     message: str
     seq: int | None = None
+    params: dict = field(default_factory=dict)
 
 
 def count_codes(items: list[Violation]) -> dict[str, int]:

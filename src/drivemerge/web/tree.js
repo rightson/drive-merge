@@ -11,6 +11,7 @@ import {
 } from './util.js';
 
 const PAGE = 500;
+const MAX_FETCH = 5000;  // the most children the server returns in one request
 const SPRING_MS = 700;
 
 // The item being dragged, shared by both panes (dataTransfer is unreadable until drop).
@@ -30,6 +31,11 @@ function reducer(s, a) {
     case 'set': return { ...s, ...a.patch };
     case 'cache': return { ...s, cache: { ...s.cache, [a.key]: a.data } };
     case 'clearCache': return { ...s, cache: {} };
+    case 'prune': {  // rows that have just disappeared leave the selection; one chosen meanwhile (a reveal) stays
+      const sel = s.sel.filter((k) => !a.gone.has(k));
+      if (sel.length === s.sel.length && !a.gone.has(s.focus)) return s;
+      return { ...s, sel, focus: a.gone.has(s.focus) ? sel[0] || null : s.focus };
+    }
     case 'expand': return { ...s, expanded: { ...s.expanded, ...Object.fromEntries(a.keys.map((k) => [k, true])) } };
     case 'collapse': {
       const expanded = { ...s.expanded };
@@ -97,18 +103,38 @@ export function Pane({ side, draft, tick, handle }) {
     ghosts: st.current.ghosts && st.current.view === 'after' ? 1 : 0,
   });
 
+  /** Children from the top down to `want` of them (several requests when the server's own cap is lower). */
+  async function fetchListing(remote, path, want) {
+    let items = [];
+    let r;
+    do {
+      r = await api.tree({ remote, path, ...queryParams(), limit: Math.min(MAX_FETCH, want - items.length), offset: items.length });
+      items = items.concat(r.items);
+    } while (r.items.length > 0 && items.length < want && items.length < (r.total === undefined ? 0 : r.total));
+    return { items, ghosts: r.ghosts || [], total: r.total === undefined ? items.length : r.total };
+  }
+
+  /** A refresh must not shrink a folder back to its first page: the person has opened more with "load more". */
+  const loadedCount = (key) => {
+    const c = st.current.cache[key];
+    return Math.max(PAGE, c && !c.error ? c.items.length : 0);
+  };
+
   async function loadDir(remote, path, { append = false } = {}) {
     const key = keyOf(remote, path);
     const mine = (seqs.current[key] = (seqs.current[key] || 0) + 1);
     const ep = epoch.current;
     const prev = st.current.cache[key];
     try {
-      const r = await api.tree({
-        remote, path, ...queryParams(), limit: PAGE, offset: append && prev ? prev.items.length : 0,
-      });
+      let data;
+      if (append && prev) {
+        const r = await api.tree({ remote, path, ...queryParams(), limit: PAGE, offset: prev.items.length });
+        const items = prev.items.concat(r.items);
+        data = { items, ghosts: r.ghosts || [], total: r.total === undefined ? items.length : r.total };
+      } else {
+        data = await fetchListing(remote, path, loadedCount(key));
+      }
       if (ep !== epoch.current || seqs.current[key] !== mine) return null;
-      const items = append && prev ? prev.items.concat(r.items) : r.items;
-      const data = { items, ghosts: r.ghosts || [], total: r.total === undefined ? items.length : r.total };
       dispatch({ type: 'cache', key, data });
       return data;
     } catch (e) {
@@ -122,11 +148,11 @@ export function Pane({ side, draft, tick, handle }) {
   /** Fetch a listing now and put it in the cache, whatever else is in flight (used when a revealed path is missing). */
   async function reload(remote, path) {
     const ep = epoch.current;
+    const key = keyOf(remote, path);
     try {
-      const r = await api.tree({ remote, path, ...queryParams(), limit: PAGE, offset: 0 });
+      const data = await fetchListing(remote, path, loadedCount(key));
       if (ep !== epoch.current) return null;
-      const data = { items: r.items, ghosts: r.ghosts || [], total: r.total === undefined ? r.items.length : r.total };
-      dispatch({ type: 'cache', key: keyOf(remote, path), data });
+      dispatch({ type: 'cache', key, data });
       return data;
     } catch (e) {
       return null;
@@ -176,11 +202,14 @@ export function Pane({ side, draft, tick, handle }) {
     }
   }, [s.root]);
 
-  // Drop selection and focus that no longer exist after a refresh.
+  // Drop selection and focus that no longer exist after a refresh. The effect runs after the refresh has rendered
+  // and a reveal may have chosen its row in between, so only rows that were in the previous render and are not now
+  // are dropped (a closure over the old selection would overwrite the new one).
+  const seen = useRef(new Map());
   useEffect(() => {
-    if (!s.roots) return;
-    const alive = s.sel.filter((k) => byKey.has(k));
-    if (alive.length !== s.sel.length) dispatch({ type: 'set', patch: { sel: alive, focus: byKey.has(s.focus) ? s.focus : alive[0] || null } });
+    const gone = new Set([...seen.current.keys()].filter((k) => !byKey.has(k)));
+    seen.current = byKey;
+    if (gone.size) dispatch({ type: 'prune', gone });
   }, [byKey]);
 
   useEffect(() => {
@@ -372,7 +401,7 @@ export function Pane({ side, draft, tick, handle }) {
         if (row) { e.preventDefault(); onRowClick({ ctrlKey: true }, row); }
         break;
       case 'F2':
-        if (row && row.node.path && editable && !row.node.quarantine) { e.preventDefault(); dispatch({ type: 'set', patch: { renaming: row.key } }); }
+        if (row && row.node.path && editable && !row.node.quarantine) { e.preventDefault(); beginRename(row); }
         break;
       default:
     }
@@ -486,11 +515,31 @@ export function Pane({ side, draft, tick, handle }) {
     }
   }
 
-  function commitRename(row, value) {
+  /**
+   * Open the name editor. A row that merges two different files under one name (a clash) has no single file to
+   * rename: the rename would apply to both, so the person is shown the way out instead.
+   */
+  function beginRename(row) {
+    if (row.node.conflict) { ctx.resolveClash(side, row.node.origins || [], row.node.name); return; }
+    dispatch({ type: 'set', patch: { renaming: row.key } });
+  }
+
+  /**
+   * Leave the editor and stage the rename. `refocus` (Enter or Escape) keeps the keyboard in the tree: the editor
+   * held the focus, and the renamed row has a new key, so without this the focus falls to <body>.
+   */
+  async function commitRename(row, value, { refocus = false } = {}) {
     dispatch({ type: 'set', patch: { renaming: null } });
-    const name = value.trim();
+    if (refocus) focusRow(row.key);
+    const name = value ? value.trim() : '';
     if (!name || name === row.node.name) return;
-    ctx.rename({ remote: row.node.remote, path: row.node.path, is_dir: row.node.is_dir }, name);
+    const loc = { remote: row.node.remote, path: joinPath(parentOf(row.node.path), name) };
+    const ok = await ctx.rename({ remote: row.node.remote, path: row.node.path, is_dir: row.node.is_dir }, name);
+    if (!ok || !refocus) return;
+    const a = document.activeElement;
+    if (a && a !== document.body && !(box.current && box.current.contains(a))) return;  // the person moved on
+    await reveal(loc);
+    focusRow(keyOf(loc.remote, loc.path));
   }
 
   async function runSearch(q) {
@@ -585,7 +634,7 @@ export function Pane({ side, draft, tick, handle }) {
           const key = keyOf(c.remote, c.path);
           return html`<span class="crumb-wrap" key=${key}>
             ${i > 0 && html`<${Icon} name="chevron" size=${11} class="crumb-sep" />`}
-            <button class=${'crumb' + (s.dropKey === 'crumb:' + key ? ' drop' : '')} data-testid=${'crumb-' + key}
+            <button class=${'crumb' + (s.dropKey === 'crumb:' + key ? ' drop' : '')} data-testid=${'crumb-' + key} title=${c.label}
               onClick=${() => reveal({ remote: c.remote, path: c.path })}
               onDragOver=${(e) => {
                 if (currentDrag && canDrop(currentDrag, crumbNode(c))) {
@@ -607,27 +656,33 @@ export function Pane({ side, draft, tick, handle }) {
         editable=${editable} onClick=${onRowClick} onFocus=${(key) => { if (st.current.focus !== key) dispatch({ type: 'set', patch: { focus: key } }); }}
         onToggle=${toggle} dispatch=${dispatch}
         onDragStart=${onDragStart} onDragOver=${onRowDragOver} onDrop=${onDrop}
-        onRename=${commitRename} onMore=${(dirKey) => { const { remote, path } = splitKey(dirKey); loadDir(remote, path, { append: true }); }}
+        onRename=${commitRename} onBeginRename=${beginRename} onMore=${(dirKey) => { const { remote, path } = splitKey(dirKey); loadDir(remote, path, { append: true }); }}
         onGhost=${(g) => ctx.reveal(side === 'left' ? 'right' : 'left', g.moved_to)} />`)}
     </div>
   </section>`;
 }
 
+/** One badge: icon or dot, then the word. A narrow pane drops the word (CSS); the tooltip says what it means. */
+function Badge({ kind, title, icon, children }) {
+  return html`<span class=${'badge badge-' + kind} data-badge=${kind === 'new' ? 'virtual' : kind} title=${title}>
+    ${icon ? html`<${Icon} name=${icon} size=${10} />` : html`<span class="badge-dot" aria-hidden="true"></span>`}
+    <span class="badge-label">${children}</span></span>`;
+}
+
 function Badges({ node }) {
   const origin = (node.origins || []).map(fmtLoc).join(', ');
   return html`<span class="badges">
-    ${node.virtual && html`<span class="badge badge-new" data-badge="virtual">${t('badge.new')}</span>`}
-    ${node.moved_here && html`<span class="badge badge-moved" data-badge="moved" title=${t('tip.movedFrom', { from: origin })}>
-      <${Icon} name="arrow" size=${10} />${t('badge.moved')}</span>`}
-    ${node.merged && html`<span class="badge badge-merged" data-badge="merged" title=${t('tip.merged')}>${t('badge.merged')}</span>`}
-    ${node.conflict && html`<span class="badge badge-conflict" data-badge="conflict" title=${t('tip.conflict')}>${t('badge.conflict')}</span>`}
-    ${node.dedupe && html`<span class="badge badge-dedupe" data-badge="dedupe" title=${t('tip.dedupe')}>${t('badge.dedupe')}</span>`}
-    ${!node.dedupe && node.dup_files > 0 && html`<span class="badge badge-dup" data-badge="dup"
-      title=${t('tip.dup', { n: node.dup_files })}>${node.is_dir ? t('badge.dupN', { n: fmtNum(node.dup_files) }) : t('badge.dup')}</span>`}
+    ${node.virtual && html`<${Badge} kind="new" title=${t('badge.new')}>${t('badge.new')}<//>`}
+    ${node.moved_here && html`<${Badge} kind="moved" icon="arrow" title=${t('tip.movedFrom', { from: origin })}>${t('badge.moved')}<//>`}
+    ${node.merged && html`<${Badge} kind="merged" title=${t('tip.merged')}>${t('badge.merged')}<//>`}
+    ${node.conflict && html`<${Badge} kind="conflict" title=${t('tip.conflict')}>${t('badge.conflict')}<//>`}
+    ${node.dedupe && html`<${Badge} kind="dedupe" title=${t('tip.dedupe')}>${t('badge.dedupe')}<//>`}
+    ${!node.dedupe && node.dup_files > 0 && html`<${Badge} kind="dup" title=${t('tip.dup', { n: node.dup_files })}>
+      ${node.is_dir ? t('badge.dupN', { n: fmtNum(node.dup_files) }) : t('badge.dup')}<//>`}
   </span>`;
 }
 
-function Row({ row, s, tabbable, editable, onClick, onFocus, onToggle, dispatch, onDragStart, onDragOver, onDrop, onRename, onMore, onGhost }) {
+function Row({ row, s, tabbable, editable, onClick, onFocus, onToggle, dispatch, onDragStart, onDragOver, onDrop, onRename, onBeginRename, onMore, onGhost }) {
   const indent = { paddingLeft: `${8 + row.level * 16}px` };
   if (row.kind === 'loading') return html`<div class="row row-msg" role="presentation" style=${indent}>${t('common.loading')}</div>`;
   if (row.kind === 'empty') return html`<div class="row row-msg" role="presentation" style=${indent}>${t('pane.empty')}</div>`;
@@ -693,12 +748,19 @@ function Row({ row, s, tabbable, editable, onClick, onFocus, onToggle, dispatch,
         onClick=${(e) => e.stopPropagation()} onDblClick=${(e) => e.stopPropagation()}
         onKeyDown=${(e) => {
           e.stopPropagation();
-          if (e.key === 'Enter') onRename(row, e.target.value);
-          else if (e.key === 'Escape') dispatch({ type: 'set', patch: { renaming: null } });
+          // The Enter that picks an IME candidate (and the Escape that cancels one) belongs to the composition.
+          if (e.isComposing || e.keyCode === 229) return;
+          if (e.key === 'Enter') { e.target.dataset.done = '1'; onRename(row, e.target.value, { refocus: true }); }
+          else if (e.key === 'Escape') { e.target.dataset.done = '1'; onRename(row, '', { refocus: true }); }
         }}
-        onBlur=${() => dispatch({ type: 'set', patch: { renaming: null } })} />`
+        onBlur=${(e) => {
+          // Clicking elsewhere keeps what was typed, as file managers do. Leaving the window does not end the edit.
+          if (e.target.dataset.done || !document.hasFocus()) return;
+          e.target.dataset.done = '1';
+          onRename(row, e.target.value);
+        }} />`
     : html`<span class="name" title=${tip || n.name} data-testid=${n.quarantine_root ? 'quarantine-label' : undefined} onDblClick=${(e) => {
-      if (editable && n.path && !locked) { e.stopPropagation(); dispatch({ type: 'set', patch: { renaming: key } }); }
+      if (editable && n.path && !locked) { e.stopPropagation(); onBeginRename(row); }
     }}>${n.quarantine_root ? t('quarantine.label') : n.name}</span>
     ${n.quarantine_root && html`<span class="q-dir" title=${tip}>${n.name}</span>`}`}
     <${Badges} node=${n} />

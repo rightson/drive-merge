@@ -5,7 +5,10 @@ import * as api from './api.js';
 import { Icon } from './icons.js';
 import { Modal } from './ui.js';
 import { AppCtx } from './ctx.js';
-import { describeAction, errorText, fmtBytes, fmtLoc, fmtNum, locationInMessage, sleep, staleText } from './util.js';
+import {
+  baseName, describeAction, errorText, fmtBytes, fmtLoc, fmtNum, problemDetail, rescanText, rootCauses, sleep, staleText,
+  violationLoc,
+} from './util.js';
 
 const KIND_ICON = { move: 'arrow', 'copy+delete': 'cloud', merge: 'merge', dedupe: 'copy' };
 
@@ -41,10 +44,10 @@ function Card({ id, label, value, sub, tone }) {
 }
 
 /**
- * One violation, warning or conflict. The head and the explanation are in the person's language;
- * the code and the engine's own English sentence stay below as secondary monospace text, for reports and bug trackers.
+ * One violation, warning or conflict. The head, the explanation and the detail line are in the person's language;
+ * the code stays beside the detail as secondary monospace text, for reports and bug trackers.
  */
-function Problem({ ns, code, message, loc, onReveal, tone, testid, children }) {
+function Problem({ ns, code, detail, loc, onReveal, tone, testid, children }) {
   const title = t(`${ns}.${code}.title`, null, code);
   const text = t(`${ns}.${code}.text`, null, '');
   return html`<li class=${'problem problem-' + tone} data-testid=${testid} data-code=${code}>
@@ -52,7 +55,7 @@ function Problem({ ns, code, message, loc, onReveal, tone, testid, children }) {
       ${loc && html`<button class="link" data-testid="reveal-link" onClick=${() => onReveal(loc)}>
         <${Icon} name="jump" size=${12} /> ${t('prev.reveal')}</button>`}</div>
     ${text && html`<p class="problem-text">${text}</p>`}
-    <p class="problem-detail" data-testid="problem-raw"><code class="code-pill">${code}</code>${message ? ` ${message}` : ''}</p>
+    <p class="problem-detail" data-testid="problem-raw"><code class="code-pill">${code}</code>${detail ? ` ${detail}` : ''}</p>
     ${children}
   </li>`;
 }
@@ -68,6 +71,17 @@ function StaleBox({ actions }) {
       <span class="seq">#${a.seq}</span>
       <div><div class="stale-title">${describeAction(a).title}</div>
         <div class="stale-why">${staleText(a.stale_reason)}</div></div></li>`)}</ul>
+  </section>`;
+}
+
+/** Folders the draft moves that hold no files: a cloud changes through files only, so these stay where they are. */
+function EmptyDirsBox({ dirs }) {
+  if (!dirs.length) return null;
+  return html`<section class="stale-box" data-testid="empty-dirs-skipped">
+    <h3><${Icon} name="alert" size=${16} /> ${t('prev.skippedTitle', { n: dirs.length })}</h3>
+    <p>${t('prev.skippedText')}</p>
+    <ul class="stale-list">${dirs.map((d, i) => html`<li key=${i} data-testid="empty-dir-skipped">
+      <span class="change-path"><span>${fmtLoc(d.from)}</span><${Icon} name="arrow" size=${12} /><span>${fmtLoc(d.to)}</span></span></li>`)}</ul>
   </section>`;
 }
 
@@ -102,10 +116,11 @@ export function PreviewModal({ draft, onClose }) {
   useEffect(() => { run(); }, []);
 
   const sim = (data && data.simulation) || {};
-  const violations = sim.violations || [];
-  const warnings = sim.warnings || [];
   const conflicts = (data && data.conflicts) || [];
+  const violations = rootCauses(sim.violations || [], conflicts, remoteNames);
+  const warnings = sim.warnings || [];
   const staleActions = (data && data.stale_actions) || [];
+  const skippedDirs = (data && data.empty_dirs_skipped) || [];
   const summary = (data && data.summary) || {};
   const isOk = data ? (data.ok !== undefined ? !!data.ok : !!sim.ok && conflicts.length === 0) : false;
   const problems = violations.length + conflicts.length;
@@ -126,6 +141,11 @@ export function PreviewModal({ draft, onClose }) {
     if (!loc) return;
     onClose();
     ctx.reveal('right', loc);
+  };
+  // A clash inside a merge is not fixed by renaming the merged row; the way out starts from the step that caused it.
+  const fixClash = (c) => {
+    onClose();
+    ctx.resolveClash('right', [c.from], baseName(c.to.path));
   };
 
   async function pollJob(id, withPlan) {
@@ -171,22 +191,27 @@ export function PreviewModal({ draft, onClose }) {
     const failed = out.job.status === 'failed' || (out.prog && (out.prog.failed > 0 || out.prog.status === 'failed'))
       || (out.job.result && (out.job.result.error || out.job.result.status === 'failed'));
     setPhase(failed ? 'failed' : 'done');
+    ctx.markOutdated(summary.remotes_touched, draft.id);  // the executor does not touch the catalog; only a scan does
   }
 
   async function rescan() {
+    const back = phase;  // where to return to if the scan fails: the finished run, or the review
     setError('');
     setPhase('rescanning');
     setJob(null);
     try {
-      const remotes = summary.remotes_touched && summary.remotes_touched.length ? summary.remotes_touched : remoteNames;
+      const behind = ctx.outdated && ctx.outdated.remotes;
+      const remotes = behind && behind.length ? behind
+        : summary.remotes_touched && summary.remotes_touched.length ? summary.remotes_touched : remoteNames;
       const out = await pollJob((await api.rescan(remotes)).job_id, false);
       if (!out) return;
-      if (out.job.status === 'failed') { setError(out.job.error || t('prog.rescanFailed')); setPhase('done'); return; }
+      if (out.job.status === 'failed') { setError(out.job.error || t('prog.rescanFailed')); setPhase(back); return; }
       setPhase('rescanned');
+      ctx.catalogRefreshed();
       ctx.afterExecution();
     } catch (e) {
       setError(errorText(e));
-      setPhase('done');
+      setPhase(back);
     }
   }
 
@@ -209,7 +234,8 @@ export function PreviewModal({ draft, onClose }) {
       ${t('prog.nums', { done: fmtNum(finished), total: fmtNum(total), failed: fmtNum(prog ? prog.failed || 0 : 0), skipped: fmtNum(prog ? prog.skipped || 0 : 0) })}</div>`}
     ${phase === 'executing' && prog && prog.current && html`<div class="progress-current" data-testid="progress-current">
       <${Icon} name="arrow" size=${13} /> ${describeCurrent(prog.current)}</div>`}
-    ${failureLines.length > 0 && html`<ul class="progress-failures" data-testid="progress-failures">
+    ${failureLines.length > 0 && html`<p class="note" data-testid="failure-raw-note">${t('prog.rawDetails')}</p>
+      <ul class="progress-failures" data-testid="progress-failures">
       ${failureLines.map((x, i) => html`<li key=${i}><${Icon} name="alert" size=${13} /> ${x}</li>`)}</ul>`}
     ${phase === 'failed' && html`<p class="note" data-testid="failure-help">${t('prog.failedHelp', { id: planId })}</p>`}
     ${phase === 'done' && html`<p class="note" data-testid="rescan-help">${t('prog.rescanHelp')}</p>`}
@@ -242,7 +268,8 @@ export function PreviewModal({ draft, onClose }) {
     if (running) {
       return html`<span class="spinner" aria-hidden="true"></span><span class="muted">${phase === 'approving' ? t('prev.approving') : t('prog.wait')}</span>`;
     }
-    const canApprove = phase === 'review' && config.approvals_enabled && config.execution_enabled !== false && isOk && !!code;
+    const canApprove = phase === 'review' && config.approvals_enabled && config.execution_enabled !== false && isOk && !!code
+      && !ctx.outdated;
     if (canApprove) {
       return html`<div class="approval" data-testid="approval-area">
         <div class="approval-code"><span>${t('prev.code')}</span><code data-testid="approval-code">${code}</code></div>
@@ -272,10 +299,14 @@ export function PreviewModal({ draft, onClose }) {
       ${phase === 'error' && html`<div class="note error" data-testid="preview-error">${error}
         <button class="btn btn-small" onClick=${run}>${t('common.retry')}</button></div>`}
       ${phase === 'empty' && html`<div class="center-msg" data-testid="preview-empty">
-        ${staleActions.length ? t('prev.nothingStale') : t('prev.nothing')}</div>
-        <${StaleBox} actions=${staleActions} />`}
+        ${staleActions.length ? t('prev.nothingStale') : skippedDirs.length ? t('prev.nothingEmptyDirs') : t('prev.nothing')}</div>
+        <${StaleBox} actions=${staleActions} /><${EmptyDirsBox} dirs=${skippedDirs} />`}
       ${stale && html`<div class="banner banner-warn" data-testid="stale-banner"><${Icon} name="alert" size=${16} />
         <span>${t('prev.stale')}</span><button class="btn btn-small" data-testid="repreview" onClick=${run}>${t('prev.repreview')}</button></div>`}
+      ${phase === 'review' && ctx.outdated && html`<div class="banner banner-warn" data-testid="outdated-note">
+        <${Icon} name="alert" size=${16} /><span>${t('catalog.blocked')}</span>
+        ${config.approvals_enabled && html`<button class="btn btn-small" data-testid="outdated-rescan" onClick=${rescan}>
+          <${Icon} name="refresh" size=${14} /> ${t('catalog.rescan')}</button>`}</div>`}
       ${progressBox}
       ${data && planId && html`
         <section class="cards" data-testid="preview-summary">
@@ -295,17 +326,19 @@ export function PreviewModal({ draft, onClose }) {
           <div><strong>${isOk ? t('prev.simOk') : t('prev.simBad', { n: problems || 1 })}</strong>
             <span class="muted">${isOk ? t('prev.simOkHint') : t('prev.simBadHint')}</span></div>
         </section>
-        <${StaleBox} actions=${staleActions} />
+        <${StaleBox} actions=${staleActions} /><${EmptyDirsBox} dirs=${skippedDirs} />
         ${violations.length > 0 && html`<ul class="problems" data-testid="violation-list">
-          ${violations.map((v, i) => html`<${Problem} key=${i} ns="viol" tone="bad" testid="violation" code=${v.code} message=${v.message}
-            loc=${locationInMessage(v.message, remoteNames)} onReveal=${reveal} />`)}</ul>`}
+          ${violations.map((v, i) => html`<${Problem} key=${i} ns="viol" tone="bad" testid="violation" code=${v.code} detail=${problemDetail('viol', v)}
+            loc=${violationLoc(v, remoteNames)} onReveal=${reveal} />`)}</ul>`}
         ${conflicts.length > 0 && html`<h3 class="section-title">${t('prev.conflictList')}</h3><ul class="problems" data-testid="conflict-list">
-          ${conflicts.map((c, i) => html`<${Problem} key=${i} ns="conflict" tone="bad" testid="conflict" code=${c.code} message=${c.reason}
+          ${conflicts.map((c, i) => html`<${Problem} key=${i} ns="conflict" tone="bad" testid="conflict" code=${c.code} detail=${problemDetail('conflict', c)}
             loc=${c.to} onReveal=${reveal}>
             <p class="problem-path" data-testid="conflict-path">${anyLoc(c.from)} → ${anyLoc(c.to)}${c.with ? ` (${t('prev.with')} ${anyLoc(c.with)})` : ''}</p>
+            ${c.code === 'DIFFERENT_CONTENT' && c.from && c.to && html`<button class="link" data-testid="conflict-fix"
+              onClick=${() => fixClash(c)}>${t('clash.fix')}</button>`}
           <//>`)}</ul>`}
         ${warnings.length > 0 && html`<details class="warnings" data-testid="warning-list"><summary>${t('prev.warnings', { n: warnings.length })}</summary>
-          <ul class="problems">${warnings.map((w, i) => html`<${Problem} key=${i} ns="viol" tone="warn" testid="warning" code=${w.code} message=${w.message} />`)}</ul></details>`}
+          <ul class="problems">${warnings.map((w, i) => html`<${Problem} key=${i} ns="viol" tone="warn" testid="warning" code=${w.code} detail=${problemDetail('viol', w)} />`)}</ul></details>`}
         ${(sim.remotes || []).length > 0 && html`<h3 class="section-title">${t('prev.perCloud')}</h3>
           <table class="table" data-testid="cloud-table"><thead><tr>
             <th>${t('prev.cloud')}</th><th class="num">${t('prev.filesBefore')}</th><th class="num">${t('prev.filesAfter')}</th>
@@ -328,13 +361,6 @@ export function PreviewModal({ draft, onClose }) {
     </div>
     <footer class="modal-foot">${footer}</footer>
   <//>`;
-}
-
-function rescanText(job) {
-  const p = (job && job.progress) || {};
-  if (p.stage === 'identity' || p.stage === 'dir_stats') return t(`prog.stage.${p.stage}`);
-  if (!p.remote) return t('prog.wait');
-  return t('prog.scanning', { remote: p.remote, i: p.remote_index || 1, n: p.remotes_total || 1, files: fmtNum(p.files || 0) });
 }
 
 function delta(n) {

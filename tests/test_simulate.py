@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import json
 import time
 import unicodedata
 
 import pytest
 
-from drivemerge import db, plans
-from drivemerge.models import Op
+import hashlib
+
+from drivemerge import db, identity, plans
+from drivemerge.models import Op, SimulationReport
 from drivemerge.simulate import MAX_REPORTED, SafetyPolicy, simulate_ops, simulate_plan
 
 
@@ -111,6 +114,47 @@ def test_witness_hash_proven_different_is_never_probable(conn, world):
     put(cat, g, "q/f.bin", size=11)
     rep = sim(conn, [rm(g, "p/f.bin", g, "q/f.bin")], allow_probable_delete=True)
     assert not rep.ok and "WITNESS_MISMATCH" in codes(rep)
+
+
+def _bridge(conn, tag: str, quickxor: str, source: int, mtime: str = "2024-01-01T00:00:00Z") -> None:
+    """What `bridge` records after downloading `source`: all five hashes of its bytes."""
+    raw = tag.encode()
+    identity.record_bridge(conn, {
+        "md5": hashlib.md5(raw).hexdigest(), "sha1": hashlib.sha1(raw).hexdigest(),
+        "sha256": hashlib.sha256(raw).hexdigest(), "dropbox": hashlib.sha256(b"d" + raw).hexdigest(),
+        "quickxor": quickxor, "size": 320}, source_entry_id=source, source_mtime=mtime)
+
+
+def test_a_onedrive_witness_that_only_shares_a_quickxor_is_no_witness(conn, catalog):
+    """Same size, same QuickXorHash: the files may still differ (swapped rows), so the real identity pass leaves
+    them apart and the simulator, which trusts that pass, refuses the delete."""
+    od = catalog.remote("od", "onedrive")
+    qx = "ab" * 20
+    catalog.file(od, "keep/a.bin", size=320, quickxor=qx)
+    catalog.file(od, "other/a.bin", size=320, quickxor=qx)
+    identity.rebuild_groups(conn)
+    ops = [rm(od, "other/a.bin", od, "keep/a.bin")]
+    rep = sim(conn, ops)
+    assert not rep.ok and codes(rep) == ["WITNESS_MISMATCH"]
+    assert delta(rep, "od").files_quarantined == 0
+
+
+def test_a_onedrive_witness_whose_bytes_were_hashed_is_a_witness(conn, catalog):
+    od = catalog.remote("od", "onedrive")
+    qx = "ab" * 20
+    a = catalog.file(od, "keep/a.bin", size=320, quickxor=qx)
+    b = catalog.file(od, "other/a.bin", size=320, quickxor=qx)
+    _bridge(conn, "same bytes", qx, a)
+    _bridge(conn, "same bytes", qx, b)
+    identity.rebuild_groups(conn)
+    rep = sim(conn, [rm(od, "other/a.bin", od, "keep/a.bin")])
+    assert rep.ok, rep.violations
+    # ... and not when the two downloads came out different (the collision case)
+    conn.execute("DELETE FROM bridge_sources WHERE entry_id = ?", (b,))
+    _bridge(conn, "other bytes", qx, b)
+    identity.rebuild_groups(conn)
+    rep = sim(conn, [rm(od, "other/a.bin", od, "keep/a.bin")])
+    assert not rep.ok and codes(rep) == ["WITNESS_MISMATCH"]
 
 
 def test_unhashed_witness_is_mismatch_by_default_and_probable_when_allowed(conn, world):
@@ -1047,7 +1091,7 @@ def test_simulate_plan_ok_moves_plan_to_simulated_and_enables_approval(conn, wor
     plan = plans.get_plan(conn, pid)
     assert plan.status == "simulated" and plan.digest == rep.digest
     assert plan.snapshot == db.snapshot(conn)
-    assert rep.digest == plans.compute_digest(pid, plans.load_ops(conn, pid), db.snapshot(conn))
+    assert rep.digest == plans.compute_digest(conn, pid, plans.load_ops(conn, pid), db.snapshot(conn))
     stored = plans.latest_simulation(conn, pid)
     assert stored is not None and stored.ok and stored.digest == rep.digest
     assert stored.remotes == rep.remotes and stored.op_counts == rep.op_counts
@@ -1359,3 +1403,88 @@ def test_whenever_the_simulator_says_ok_a_concrete_replay_is_safe(catalog):
         finally:
             c.close()
     assert passed >= 30 and passed_with_delete >= 6, (passed, passed_with_delete)   # not vacuous
+
+
+# ------------------------------------------------- messages a page can word itself
+
+def loc(remote: str, path: str) -> dict:
+    return {"remote": remote, "path": path}
+
+
+def test_violations_carry_params_beside_the_english_message(conn, world):
+    """`message` stays the English sentence; `params` are its facts (places as {"remote", "path"}), so that the
+    web page can write the same sentence in the person's language."""
+    cat, g, d, i = world
+    put(cat, g, "a", size=5, group=1)
+    put(cat, g, "b", size=5, group=2)
+    put(cat, g, "dir/file", size=5, group=3)
+    put(cat, g, "old", size=5, group=1, present=False)
+    put(cat, d, "Docs/readme.txt", size=5, group=4)
+
+    def one(ops, code, **policy):
+        rep = sim(conn, ops, **policy)
+        (v,) = only(rep, code)
+        assert isinstance(v.message, str) and v.message
+        return v
+
+    assert one([cp(g, "nothing", g, "z")], "SRC_MISSING").params == {
+        "variant": "missing", "at": loc("gdrive", "nothing"), "why": "absent"}
+    assert one([cp(g, "old", g, "z")], "SRC_MISSING").params["why"] == "tombstone"
+    assert one([cp(g, "dir", g, "z")], "SRC_MISSING").params["why"] == "directory"
+    assert one([mv(g, "a", "a2"), cp(g, "a", g, "z")], "SRC_MISSING").params == {
+        "variant": "missing", "at": loc("gdrive", "a"), "why": "moved", "by": 1}
+    assert one([cp(g, "a", g, "b")], "DST_EXISTS").params == {"variant": "different", "at": loc("gdrive", "b")}
+    assert one([cp(g, "a", g, "b/c")], "DST_EXISTS").params == {
+        "variant": "file_above", "at": loc("gdrive", "b"), "dst": loc("gdrive", "b/c")}
+    assert one([cp(g, "a", g, "dir")], "DST_EXISTS").params == {"variant": "directory", "at": loc("gdrive", "dir")}
+    assert one([cp(g, "a", d, "docs")], "CASE_COLLISION").params == {
+        "variant": "name", "at": loc("dropbox", "docs"), "other": loc("dropbox", "Docs")}
+    assert one([rm(g, "a", g, "a")], "NO_WITNESS").params == {"variant": "is_source", "at": loc("gdrive", "a")}
+    assert one([Op("delete", g, "a")], "NO_WITNESS").params == {"variant": "none_given"}
+    assert one([rm(g, "a", g, "gone")], "NO_WITNESS").params["variant"] == "missing"
+    assert one([rm(g, "a", g, "b")], "WITNESS_MISMATCH").params == {
+        "variant": "differs", "at": loc("gdrive", "b"), "why": "unproven"}
+    put(cat, g, "w1", size=5, group=7)
+    put(cat, g, "w2", size=6, group=8)
+    assert one([rm(g, "w1", g, "w2")], "WITNESS_MISMATCH").params["why"] == "different"      # sizes differ: proof
+    assert one([cp(g, "../x", g, "z")], "BAD_PATH").params == {
+        "variant": "path", "role": "source", "path": "../x", "problem": "dot_segment", "segment": ".."}
+    assert one([cp(g, "a", 999, "z")], "BAD_PATH").params == {"variant": "remote", "role": "destination", "rid": "999"}
+    assert one([Op("copy", g, "a")], "BAD_PATH").params == {"variant": "no_destination", "kind": "copy"}
+    assert one([cp(g, "a", g, "z", depends_on=9)], "DEPENDENCY").params == {"variant": "not_earlier", "dep": "9"}
+    assert one([cp(g, "a", g, "z", seq=0), cp(g, "a", g, "y", seq=1)], "DEPENDENCY").params == {
+        "variant": "position", "seq": 0}
+    assert one([Op("move", g, "a", dst_remote_id=d, dst_path="a")], "CROSS_REMOTE_MOVE").params == {}
+    assert one([cp(g, "a", d, "z")], "QUOTA", free_bytes={d: 3}).params == {
+        "at": loc("dropbox", ""), "bytes": 5, "free": 3}
+    put(cat, d, "k", size=5, group=1)
+    assert one([rm(g, "old", d, "k")], "SRC_MISSING").params["why"] == "tombstone"
+    v = one([rm(g, "a", d, "k")], "CONTENT_LOST", min_copies=3)
+    assert v.params == {"at": loc("gdrive", "a"), "n": 1, "need": 2}
+
+
+def test_warnings_carry_params_too(conn, world):
+    cat, g, d, i = world
+    put(cat, g, "a", size=5, group=1)
+    put(cat, d, "a", size=5, group=1)
+    assert sim(conn, [cp(g, "a", d, "a")]).warnings[0].params == {"variant": "identical", "at": loc("dropbox", "a")}
+    assert sim(conn, [mv(g, "a", "a")]).warnings[0].params == {"variant": "onto_itself", "at": loc("gdrive", "a")}
+    put(cat, d, "b", size=5, group=1)
+    (w,) = sim(conn, [Op("move", d, "a", dst_remote_id=d, dst_path="b")]).warnings
+    assert w.params == {"variant": "identical_move", "at": loc("dropbox", "b"), "removed": loc("dropbox", "a")}
+    put(cat, i, "pics/IMG_1.jpg", size=50)
+    put(cat, g, "pics/IMG_1.jpg", size=50)
+    rep = sim(conn, [rm(i, "pics/IMG_1.jpg", g, "pics/IMG_1.jpg")], allow_probable_delete=True)
+    assert rep.warnings[0].params == {"at": loc("gdrive", "pics/IMG_1.jpg")}
+
+
+def test_params_survive_storage_and_old_reports_still_load(conn, world):
+    cat, g, d, i = world
+    put(cat, g, "a", size=5, group=1)
+    rep = sim(conn, [cp(g, "nothing", g, "z")])
+    back = SimulationReport.from_json(rep.to_json())
+    assert back.violations[0].params == rep.violations[0].params and back.violations[0].params["why"] == "absent"
+    old = json.loads(rep.to_json())
+    for v in old["violations"]:
+        del v["params"]                                       # a report stored before `params` existed
+    assert SimulationReport.from_json(json.dumps(old)).violations[0].params == {}

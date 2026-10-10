@@ -10,11 +10,20 @@ below that directory. A move onto a destination that already holds identical
 content is a delete in disguise (the simulator models it so): the source is
 quarantined, the destination is its witness, and nothing is overwritten.
 
-"Provably identical" never rests on size alone. Two files are proven equal by
-a hash type both clouds report, or by a hash_bridges row linking their hash
-domains, or by downloading what is needed and hashing it locally. A file
-without native hashes (iCloud) must always be downloaded. A download that
-supplied the missing link is recorded as a bridge so later ops need none.
+"Provably identical" never rests on size alone, nor on a weak hash. Two files
+are proven equal by a collision-resistant hash type (identity.STRONG_TYPES:
+sha256, the Dropbox content hash) both clouds report, or by a
+hash_bridges row linking their hash domains, or by downloading what is needed
+and hashing it locally. md5, sha1 and QuickXorHash (OneDrive) only prove a
+difference: a file with nothing stronger, like one with no hash at all
+(iCloud), must be downloaded unless a bridge made from its own bytes vouches
+for it. A download that supplied the missing link is recorded as a bridge so
+later ops need none.
+
+A path is never trusted to name two different objects just because it is
+spelled differently: a local disk can be case-insensitive (APFS, NTFS) without
+the config saying so, and a rename to another case, or a witness spelled in
+another case, would then be the file itself (see _Run.may_be_same_object).
 """
 
 from __future__ import annotations
@@ -140,16 +149,27 @@ class _Proof:
     detail: str = ""
 
 
-def _compare(a: dict[str, str], b: dict[str, str]) -> str | None:
-    """'same' / 'different' over the hash types both sides know, None when they share none.
+def _compare(a: dict[str, str], b: dict[str, str], *, weak_ok: bool = False) -> str | None:
+    """'same' / 'different' over the hash types both sides know, None when that settles nothing.
 
     Any disagreement beats any agreement: a side whose hashes contradict each
-    other is not "mostly the same".
+    other is not "mostly the same". Disagreement on any shared type, md5, sha1
+    and QuickXor included, proves a difference. Agreement proves identity only
+    through a collision-resistant type; agreeing md5/sha1/QuickXor is exactly what
+    two different files can do, so alone it is None. `weak_ok` accepts it, for
+    the one caller whose two sides are the same object (a rename).
     """
     common = a.keys() & b.keys()
-    if not common:
-        return None
-    return "different" if any(a[t] != b[t] for t in common) else "same"
+    if any(a[t] != b[t] for t in common):
+        return "different"
+    if common.intersection(identity.STRONG_TYPES) or (weak_ok and common):
+        return "same"
+    return None
+
+
+def _has_strong(hashes: dict[str, str]) -> bool:
+    """Can these hashes, compared with a file's, prove it identical (not only different)?"""
+    return any(t in hashes for t in identity.STRONG_TYPES)
 
 
 def _native_hashes(raw: dict) -> dict[str, str]:
@@ -247,22 +267,27 @@ class _Run:
     def _bridge_hashes(self, side: _Side) -> dict[str, str] | None:
         """All five hashes of the one bridge that describes this file now, or None.
 
-        A bridge describes the file when it has the same size and shares a hash
-        value the cloud reports for it, or when it was computed from this very
-        catalog entry and the file's size and mtime are still what was hashed.
-        A bridge that contradicts any hash the cloud reports is ignored, and so
+        A bridge describes the file when it has the same size and shares a
+        collision-resistant hash value the cloud reports for it, or when it was
+        computed from this very catalog entry and the file's size and mtime are
+        still what was hashed. A shared md5, sha1 or QuickXor value is not enough: it
+        would let any other file with that weak hash borrow someone else's
+        bridge. A bridge that contradicts any hash the cloud reports (weak ones
+        included, they are how an in-place edit is noticed) is ignored, and so
         is an ambiguous match: both fall through to a download.
         """
         cur = self.conn.cursor()
         cur.row_factory = sqlite3.Row
         rows = []
-        if side.native:
-            clause = " OR ".join(f"{t} = ?" for t in side.native)
+        strong = [t for t in identity.STRONG_TYPES if t in side.native]
+        if strong:
+            clause = " OR ".join(f"{t} = ?" for t in strong)
             rows += cur.execute(f"SELECT * FROM hash_bridges WHERE size = ? AND ({clause})",
-                                (side.size, *side.native.values())).fetchall()
+                                (side.size, *(side.native[t] for t in strong))).fetchall()
         if side.entry_id is not None and side.mtime is not None:
-            rows += cur.execute("SELECT * FROM hash_bridges WHERE source_entry_id = ? AND size = ? "
-                                "AND source_mtime = ?", (side.entry_id, side.size, side.mtime)).fetchall()
+            rows += cur.execute("SELECT b.* FROM bridge_sources s JOIN hash_bridges b ON b.id = s.bridge_id "
+                                "WHERE s.entry_id = ? AND s.size = ? AND s.mtime = ? AND b.size = s.size",
+                                (side.entry_id, side.size, side.mtime)).fetchall()
         usable = {r["sha256"]: r for r in rows if all(r[t] == v for t, v in side.native.items())}
         if len(usable) != 1:
             return None
@@ -315,7 +340,7 @@ class _Run:
         self.log("hash", op, location=side.loc, size=side.size, bridge_id=bridge_id, sha256=computed["sha256"])
 
     def prove(self, a: _Side, b: _Side, op: Op) -> _Proof:
-        """Are these two files provably the same bytes? Never decided by size alone."""
+        """Are these two files provably the same bytes? Never decided by size or a weak hash alone."""
         if a.size != b.size:
             return _Proof("different", "size", f"{a.loc} is {a.size} bytes, {b.loc} is {b.size}")
         verdict = _compare(a.native, b.native)
@@ -324,8 +349,9 @@ class _Run:
         verdict = _compare(self._know(a), self._know(b))
         if verdict:
             return _Proof(verdict, "hash bridge")
-        # No evidence links the two: read the side that has none, else the second (the copy / witness).
-        for side in [s for s in (a, b) if not s.known] or [b]:
+        # Nothing strong links the two: read each side that has no strong hash (md5, sha1 and QuickXor agreeing
+        # proves nothing), else the second (the copy / witness) so that the sides share a type.
+        for side in [s for s in (a, b) if not _has_strong(s.known)] or [b]:
             self._fingerprint(side, op)
         verdict = _compare(a.known, b.known)
         if verdict is None:
@@ -347,6 +373,46 @@ class _Run:
             raise _OpFailed(f"{what}: size changed {held.size} -> {now.size}")
         if _compare(held.native, now.native) == "different":
             raise _OpFailed(f"{what}: hashes changed")
+
+    def verify_renamed(self, op: Op, src: _Side, out: _Side, what: str) -> None:
+        """After a rename the cloud did itself, is the object that now sits at the new path the one that was moved?
+
+        Telling an object from itself needs no collision resistance (that is only needed to tell two
+        objects apart, see prove): the same size and the same md5/sha1/QuickXor values as before will do, and
+        a OneDrive library can be reorganised without reading a byte. A cloud that reports nothing
+        comparable is proven the long way (the source was read before it moved).
+        """
+        weak = _compare(src.native, out.native, weak_ok=True)
+        if src.size == out.size and weak == "same" and _compare(src.native, out.native) is None:
+            self.log("verify", op, what=what, a=src.loc, b=out.loc, verdict="same", how="native hash (same object)")
+            return
+        self.require_same(op, src, out, what)
+
+    def may_be_same_object(self, rid: int, a: str, b: str) -> bool:
+        """Could paths `a` and `b` on one remote be a single object spelled two ways?
+
+        Not when they differ by more than case and Unicode form. When they do not, a remote flagged
+        case-insensitive says yes. Any other cannot be believed to be case-sensitive (provider 'local'
+        is never flagged, yet APFS and NTFS folders are not), so the first folder where the two
+        spellings part is listed: a case-sensitive disk shows both names, a case-insensitive one only
+        the name the object was created with. A failing listing fails the op.
+        """
+        if a == b:
+            return True
+        if _fold(a, True) != _fold(b, True):
+            return False
+        _, rc, ci = self.remote(rid)
+        if ci:
+            return True
+        sa, sb = a.split("/"), b.split("/")
+        part = next((i for i, (x, y) in enumerate(zip(sa, sb)) if x != y), None)
+        if part is None or len(sa) != len(sb):
+            return True
+        try:
+            names = {item.get("Name") for item in self.rclone.lsjson(rc.read, "/".join(sa[:part]), recursive=False)}
+        except RcloneError as e:
+            raise _OpFailed(f"cannot list {self.name(rid)}:{'/'.join(sa[:part])} to tell {a!r} from {b!r}: {e}") from e
+        return not (sa[part] in names and sb[part] in names)
 
     # ------------------------------------------------------------------- ops
 
@@ -436,7 +502,7 @@ class _Run:
         if out is None:
             raise _OpFailed(f"destination {src.name}:{dst_path} is missing after the move")
         self.log("move", op, source=src.loc, destination=out.loc, bytes=out.size)
-        self.require_same(op, src, out, "move verification")
+        self.verify_renamed(op, src, out, "move verification")
         if self.probe("source", src.rid, src.path) is not None:
             raise _OpFailed(f"source {src.loc} is still there after the move")
         return "done"
@@ -444,13 +510,12 @@ class _Run:
     def _move_onto_existing(self, op: Op, src: _Side, existing: _Side, write: str) -> str:
         """The destination is taken. If it provably holds the same bytes the move has nothing left to do
         but remove the source, which goes to quarantine like a deleted duplicate; otherwise nothing changes."""
-        _, _, ci = self.remote(src.rid)
-        if _fold(existing.path, ci) == _fold(src.path, ci):
-            if existing.path != src.path:
-                raise _OpFailed(f"destination {existing.loc} is the source {src.loc} under a name that differs "
-                                "only in case; nothing was changed")
+        if existing.path == src.path:
             self.log("verify", op, what="move onto itself", a=src.loc, b=existing.loc, verdict="same", how="same path")
             return "skipped"
+        if self.may_be_same_object(src.rid, existing.path, src.path):
+            raise _OpFailed(f"destination {existing.loc} is the source {src.loc} under a name that differs "
+                            "only in case or Unicode form; nothing was changed")
         self._require_live("destination", existing.rid, existing.path)
         proof = self.prove(src, existing, op)
         self.log("verify", op, what="existing destination", a=src.loc, b=existing.loc,
@@ -463,17 +528,15 @@ class _Run:
 
     def _require_live(self, role: str, rid: int, path: str) -> None:
         """Fail unless this location can count as a live copy, i.e. is not inside the quarantine directory."""
-        _, _, ci = self.remote(rid)
-        root = _fold(_quarantine_root(self.config), ci)
-        folded = _fold(path, ci)
+        root = _fold(_quarantine_root(self.config), True)     # like the simulator: any case, on any disk
+        folded = _fold(path, True)
         if folded == root or folded.startswith(root + "/"):
             raise _OpFailed(f"{role} {self.name(rid)}:{path} is inside the quarantine directory, "
                             "which is not a live copy")
 
     def _witness(self, rid: int, path: str, victim: _Side) -> _Side:
         """Probe the surviving copy that vouches for `victim`: another file, outside quarantine, still there."""
-        _, _, ci = self.remote(rid)
-        if rid == victim.rid and _fold(path, ci) == _fold(victim.path, ci):
+        if rid == victim.rid and self.may_be_same_object(rid, path, victim.path):
             raise _OpFailed(f"the witness is the file being deleted ({victim.loc})")
         self._require_live("witness", rid, path)
         wit = self.probe("witness", rid, path)

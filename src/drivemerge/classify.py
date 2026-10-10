@@ -492,7 +492,7 @@ def _profile_remote(conn: sqlite3.Connection, rid: int, rname: str, prefix: str,
 
     rows = conn.execute(
         f"""SELECT e.path, e.name, e.ext, e.category, e.size, e.mtime,
-                   CASE WHEN e.content_group IS NULL THEN 0 ELSE EXISTS (
+                   CASE WHEN e.content_group IS NULL OR e.size = 0 THEN 0 ELSE EXISTS (
                        SELECT 1 FROM entries d WHERE d.content_group = e.content_group
                           AND d.id <> e.id AND d.is_dir = 0 AND d.present = 1) END
             FROM entries e

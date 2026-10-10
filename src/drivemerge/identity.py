@@ -1,22 +1,32 @@
 """Content identity: which catalog entries hold the same bytes, and how sure we are.
 
 Exact identity is a union-find over live files. Two files are joined when they
-share a hash value of any one type *and* the same size, or when one row of
-hash_bridges (all five hashes of a single download) matches both. A bridge is
-the only way two hash domains (Drive md5 / Dropbox / OneDrive QuickXor) ever
-meet, so exactness is never inferred from names, sizes or mtimes.
+share a hash value of a collision-resistant type (STRONG_TYPES) *and* the same
+size, or when one row of hash_bridges (all five hashes of a single download)
+matches both on such a type. A bridge is the only way two hash domains (Drive
+sha256 / Dropbox) ever meet, so exactness is never inferred from names,
+sizes or mtimes.
+
+md5, sha1 and QuickXorHash (WEAK_TYPES) never join anything. They can still show
+two files apart (a difference is a difference) and they narrow bridging
+candidates, but agreement proves nothing: QuickXorHash is a 160-bit XOR fold, so
+same-size files whose 160-byte rows are a permutation of each other share it (by
+accident in record-structured data, or by hand), and md5 and sha1 collisions can
+be crafted in practice. Every provider that reports sha1 (Google Drive) reports
+sha256 too, so nothing is lost by not trusting it.
 
 A join is refused when the two sides already know different values of one hash
-type (md5 equal but sha256 different, a chain that only contradicts itself
+type (sha256 equal but md5 different, a chain that only contradicts itself
 after several joins): those bytes are provably different, so the shared value
 proves nothing. Refusals are counted in GroupStats.hash_conflicts.
 
 `content_group` is the smallest entry id of the component and is set for every
-live file that is identified (singletons included): it has at least one hash,
-or it is the source of a bridge that still describes it. A file without hashes
-(iCloud) is exact only through such a bridge (bridge_sources), i.e. only after
-its own bytes were downloaded and hashed, and only while its size and mtime are
-unchanged; otherwise it can be at most a "probable" duplicate.
+live file that is identified (singletons included): it has a strong hash, or it
+is the source of a bridge that still describes it. A file with nothing stronger
+than md5/sha1/QuickXor (OneDrive) or no hash at all (iCloud) is exact only through
+such a bridge (bridge_sources), i.e. only after its own bytes were downloaded
+and hashed, and only while its size and mtime are unchanged; otherwise it can be
+at most a "probable" duplicate.
 """
 
 from __future__ import annotations
@@ -34,7 +44,11 @@ from typing import Any, Mapping, NamedTuple
 from . import db, hashing, providers
 
 HASH_TYPES = providers.HASH_TYPES
-_ALL_TYPES_MASK = (1 << len(HASH_TYPES)) - 1
+# The types whose agreement (with the size) proves identity; the rest only tell files apart (module docstring).
+STRONG_TYPES: tuple[str, ...] = tuple(t for t in HASH_TYPES if t in ("sha256", "dropbox"))
+WEAK_TYPES: tuple[str, ...] = tuple(t for t in HASH_TYPES if t not in STRONG_TYPES)
+_STRONG_IDX = tuple(i for i, t in enumerate(HASH_TYPES) if t in STRONG_TYPES)
+_STRONG_MASK = sum(1 << i for i in _STRONG_IDX)
 _NO_GROUP = -(1 << 62)          # array('q') stand-in for NULL
 _HEX = re.compile(r"[0-9a-f]+")
 # Cheapest download first; providers not listed rank last.
@@ -52,7 +66,8 @@ def _live(conn: sqlite3.Connection, a: str = "") -> str:
 
 
 def _hashed(a: str = "") -> str:
-    return "(" + " OR ".join(f"COALESCE({a}{t}, '') <> ''" for t in HASH_TYPES) + ")"
+    """SQL for 'carries a hash that can prove identity' (a strong one); md5/sha1/QuickXor alone do not count."""
+    return "(" + " OR ".join(f"COALESCE({a}{t}, '') <> ''" for t in STRONG_TYPES) + ")"
 
 
 def _rows(conn: sqlite3.Connection) -> sqlite3.Cursor:
@@ -75,7 +90,7 @@ def _tuples(conn: sqlite3.Connection) -> sqlite3.Cursor:
 
 @dataclass
 class GroupStats:
-    files_hashed: int = 0         # identified live files: have a hash or a valid bridge link (all got a content_group)
+    files_hashed: int = 0         # identified live files: a strong hash or a valid bridge link (got a content_group)
     groups: int = 0               # distinct content_groups, singletons included
     duplicate_groups: int = 0     # groups with >= 2 live files
     redundant_files: int = 0      # sum(members - 1) over duplicate groups
@@ -160,6 +175,7 @@ class _Components:
 def _union_by_hash(conn: sqlite3.Connection, comps: _Components) -> int:
     """Join consecutive rows with equal (hash, size); returns the size-conflict count.
 
+    Only STRONG_TYPES join: equal md5, sha1 or QuickXor values are no evidence of equal bytes.
     Sorting by (hash, size, id) turns the join into one linear scan per hash type,
     with no pairwise comparison (a covering-index pre-filter skips hashes that
     occur only once); the first row of a run anchors it, so which rows win a
@@ -168,7 +184,7 @@ def _union_by_hash(conn: sqlite3.Connection, comps: _Components) -> int:
     instead.
     """
     conflicts = 0
-    for t in HASH_TYPES:
+    for t in STRONG_TYPES:
         cur = _tuples(conn)
         cur.execute(                                    # values that occur once cannot link anything
             f"SELECT id, size, {t}, {_sig_cols()} FROM entries "
@@ -238,15 +254,17 @@ def _bridge_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
 
 
 def _union_by_bridges(conn: sqlite3.Connection, comps: _Components) -> int:
-    """A bridge row carries every hash of one content, so it joins all entries matching any of them.
+    """A bridge row carries every hash of one content, so it joins all entries matching one of its strong hashes.
 
     Each bridge is a node of its own, carrying all five hashes: an entry whose
     component knows a different value of any type is refused, which is how a
-    stored md5 that matches while the sha256 does not stays out. Its valid source
-    entries join too: that is how a file with no stored hash (iCloud) becomes
-    exact, even when it is the only member for now. `+size` keeps SQLite on the
-    (selective) hash index instead of the size index. Returns the number of
-    sources dropped as ambiguous (_valid_links).
+    stored md5 that matches while the sha256 does not stays out. A match on md5,
+    sha1 or QuickXor alone joins nothing (the bridge may be another file's bytes with
+    the same weak hash). Its valid source entries join too: that is how a file
+    with no strong hash (iCloud, OneDrive) becomes exact, even when it is the
+    only member for now. `+size` keeps SQLite on the (selective) hash index
+    instead of the size index. Returns the number of sources dropped as
+    ambiguous (_valid_links).
     """
     links, ambiguous = _valid_links(conn)
     sources: dict[int, dict[int, _Sig]] = defaultdict(dict)
@@ -256,7 +274,7 @@ def _union_by_bridges(conn: sqlite3.Connection, comps: _Components) -> int:
         node = _NODE + b["id"]
         comps.add(node, tuple(b[t] for t in HASH_TYPES))
         members = dict(sources.get(b["id"], ()))
-        for t in HASH_TYPES:
+        for t in STRONG_TYPES:
             for row in _tuples(conn).execute(
                 f"SELECT id, {_sig_cols(fold=True)} FROM entries WHERE {t} = ? AND +size = ? AND {_live(conn)}",
                 (b[t], b["size"])
@@ -289,11 +307,11 @@ def rebuild_groups(conn: sqlite3.Connection) -> GroupStats:
 
         cur = _tuples(conn)
         cur.execute(
-            f"SELECT id, size, content_group, md5, sha1, sha256, dropbox, quickxor FROM entries WHERE {_live(conn)}"
+            f"SELECT id, size, content_group, {', '.join(STRONG_TYPES)} FROM entries WHERE {_live(conn)}"
         )
         for row in cur:
             eid = row[0]
-            if eid in parent or row[3] or row[4] or row[5] or row[6] or row[7]:
+            if eid in parent or any(row[3:]):
                 stats.files_hashed += 1
                 new = eid
                 if eid in parent:
@@ -388,10 +406,13 @@ def duplicate_groups(conn: sqlite3.Connection, *, confidence: str = "exact", rem
                      limit: int = 100, offset: int = 0) -> list[DupGroup]:
     """Groups of live files that are duplicates, biggest reclaimable bytes first.
 
-    exact     content_group groups with >= 2 live copies (proof: matching hashes).
+    exact     content_group groups with >= 2 live copies (proof: matching strong hashes).
     probable  (size, name_norm) groups with >= 2 live copies that are not all in
-              one exact group (an unhashed copy, or copies in different/unknown
-              groups). Candidates only, never proof.
+              one exact group and hold at least one pair that is neither proven
+              the same (one group) nor proven different (the two report unequal
+              values of one hash type, md5, sha1 and QuickXor included). Candidates
+              only, never proof; a difference only the bridges know about is not
+              seen here.
 
     `remote` / `path_prefix` keep a group when at least one copy matches, but
     every copy is listed. `path_prefix` matches whole path segments. Unknown
@@ -415,7 +436,8 @@ def duplicate_groups(conn: sqlite3.Connection, *, confidence: str = "exact", rem
                 f"FROM entries e WHERE {live} AND e.size >= :min_size "
                 f"GROUP BY e.size, e.name_norm "
                 f"HAVING COUNT(*) >= 2 "
-                f"AND NOT (COUNT(e.content_group) = COUNT(*) AND MIN(e.content_group) = MAX(e.content_group)){having} "
+                f"AND NOT (COUNT(e.content_group) = COUNT(*) AND MIN(e.content_group) = MAX(e.content_group)) "
+                f"AND EXISTS ({_open_pair(conn)}){having} "
                 f"ORDER BY red DESC, k LIMIT :limit OFFSET :offset")
         join = "e.size = page.size AND e.name_norm = page.name_norm"
     cur = _tuples(conn)
@@ -425,6 +447,20 @@ def duplicate_groups(conn: sqlite3.Connection, *, confidence: str = "exact", rem
         f"WHERE {live} ORDER BY page.red DESC, page.k, r.name, e.path, e.id", params)
     return [_dup_group(key, confidence, [Copy(*r[1:]) for r in rows])
             for key, rows in groupby(cur.fetchall(), key=lambda r: r[0])]
+
+
+def _open_pair(conn: sqlite3.Connection) -> str:
+    """SQL (for the group of outer row `e`) of two live copies that no hash settles either way.
+
+    Settled means one content_group, or unequal values of a hash type both report (the files cannot
+    be the same bytes). Unknown (NULL) never counts as different. Uses the (name_norm, size) index.
+    """
+    differs = " OR ".join(f"(COALESCE(a.{t}, '') <> '' AND COALESCE(b.{t}, '') <> '' AND a.{t} <> b.{t})"
+                          for t in HASH_TYPES)
+    return (f"SELECT 1 FROM entries a JOIN entries b ON b.name_norm = a.name_norm AND b.size = a.size AND b.id > a.id "
+            f"WHERE a.name_norm = e.name_norm AND a.size = e.size AND {_live(conn, 'a.')} AND {_live(conn, 'b.')} "
+            f"AND (a.content_group IS NULL OR b.content_group IS NULL OR a.content_group <> b.content_group) "
+            f"AND NOT ({differs})")
 
 
 def _dup_group(key: str, confidence: str, copies: list[Copy]) -> DupGroup:
@@ -496,10 +532,11 @@ def bridge_candidates(conn: sqlite3.Connection, *, max_bytes: int | None = None,
     """Which files to download once, so that one hash set settles the most ambiguity.
 
     Per size, files are units (a content_group, or a lone file). A unit's hash
-    domain is the set of hash types its files carry; a unit matched by a bridge
-    (or whose file is a bridge's valid source) counts as holding all five. Two
-    units with disjoint domains cannot be compared, so such a size class is
-    ambiguous. Two kinds of candidate come out of it:
+    domain is the set of strong hash types its files carry (md5, sha1 and QuickXor
+    cannot prove identity, see STRONG_TYPES); a unit matched by a bridge on a
+    strong hash (or whose file is a bridge's valid source) counts as holding all
+    of them. Two units with disjoint domains cannot be compared, so such a size
+    class is ambiguous. Two kinds of candidate come out of it:
 
     * hashed domains, one per class: a download from unit U (with all five
       hashes) settles U against every unit disjoint from it, and
@@ -507,27 +544,38 @@ def bridge_candidates(conn: sqlite3.Connection, *, max_bytes: int | None = None,
       name with an unresolved copy first, then the most unresolved copies, then
       the cheapest provider (local > drive > dropbox > onedrive > iclouddrive,
       more native hashes breaking ties).
-    * every unhashed file (iCloud) with a same-size counterpart on another
-      remote or another unhashed file, unless a bridge_sources row already
-      links it. A bridge cannot prove it equal to anything unless its own bytes
-      were hashed, so each needs its own download (even when another copy of
-      the same bytes is linked); `unresolved_copies` counts the counterparts.
-      Once linked it carries all five hashes, which is why it no longer takes
-      part in the hashed-domain pairs.
+    * every file without a strong hash (iCloud, OneDrive) with a same-size
+      counterpart on another remote or another such file, unless a
+      bridge_sources row already links it. A bridge cannot prove it equal to
+      anything unless its own bytes were hashed, so each needs its own download
+      (even when another copy of the same bytes is linked, and even when a
+      bridge shares its QuickXor); `unresolved_copies` counts the counterparts.
+      A counterpart that an md5/sha1/QuickXor value both carry already proves
+      different is no counterpart (small classes only; larger ones count it, so
+      they may offer a download that was not needed). Once linked, the file
+      carries all five hashes, which is why it no longer takes part in the
+      hashed-domain pairs.
+
+    A file with neither a strong hash nor an mtime is left out altogether
+    (candidate or counterpart): a bridge is tied to a file by its size and
+    mtime, so a download of it could never make it exact and would be offered
+    again on every run.
 
     Candidates are ranked name+size before size-only, then by
     size * unresolved_copies, and filled greedily within `max_bytes`.
     """
-    bridged = {(t, b[t], b["size"]) for b in _bridge_rows(conn) for t in HASH_TYPES}
-    linked = {link.entry_id for link in _valid_links(conn)[0]}
-    sig = " + ".join(f"{1 << i} * (COALESCE({t}, '') <> '')" for i, t in enumerate(HASH_TYPES))
+    bridge_rows = _bridge_rows(conn)
+    full = {b["id"]: tuple(b[t] for t in HASH_TYPES) for b in bridge_rows}
+    bridged = {(t, b[t], b["size"]): full[b["id"]] for b in bridge_rows for t in STRONG_TYPES}
+    linked = {link.entry_id: full[link.bridge_id] for link in _valid_links(conn)[0]}
+    sig = " + ".join(f"{1 << i} * (COALESCE({t}, '') <> '')" for i, t in enumerate(HASH_TYPES) if t in STRONG_TYPES)
     hashed = _hashed()
     size_cap = "" if max_bytes is None else " AND size <= :max_bytes"
     cur = _tuples(conn)
     cur.execute(
         f"""WITH cls AS (
                 SELECT size FROM entries
-                WHERE {_live(conn)} AND size >= :min_size{size_cap}
+                WHERE {_live(conn)} AND ({hashed} OR mtime IS NOT NULL) AND size >= :min_size{size_cap}
                 GROUP BY size
                 HAVING (COUNT(DISTINCT CASE WHEN {hashed} THEN {sig} END) >= 2
                         AND COUNT(DISTINCT CASE WHEN {hashed} THEN COALESCE(content_group, -id) END) >= 2)
@@ -536,7 +584,7 @@ def bridge_candidates(conn: sqlite3.Connection, *, max_bytes: int | None = None,
             SELECT e.size, e.id, e.name_norm, e.path, e.content_group, r.name, r.provider, e.remote_id,
                    {', '.join('e.' + t for t in HASH_TYPES)}
             FROM entries e JOIN remotes r ON r.id = e.remote_id
-            WHERE e.size IN (SELECT size FROM cls) AND {_live(conn, 'e.')}
+            WHERE e.size IN (SELECT size FROM cls) AND {_live(conn, 'e.')} AND ({_hashed('e.')} OR e.mtime IS NOT NULL)
             ORDER BY e.size, e.id""",
         {"min_size": min_size, "max_bytes": max_bytes},
     )
@@ -559,20 +607,29 @@ def bridge_candidates(conn: sqlite3.Connection, *, max_bytes: int | None = None,
     return out
 
 
-def _class_candidates(size: int, files: list[_File], bridged: set[tuple[str, str, int]],
-                      linked: set[int]) -> list[BridgeCandidate]:
-    """Candidates of one size class: at most one hashed-domain download plus one per unlinked bare file."""
+def _class_candidates(size: int, files: list[_File], bridged: dict[tuple[str, str, int], tuple],
+                      linked: dict[int, tuple]) -> list[BridgeCandidate]:
+    """Candidates of one size class: at most one hashed-domain download plus one per unlinked bare file.
+
+    `bridged` maps (strong type, value, size) and `linked` maps an entry id to the five hashes of the
+    bridge that vouches for it. "Bare" means no strong hash and no such bridge: a OneDrive file whose
+    QuickXor equals a bridge's is as unproven as one with no hash at all.
+    """
     hashed: list[tuple[_File, int]] = []
     bare: list[_File] = []
+    known: dict[int, tuple] = {}            # vouched-for file -> what its bridge says its bytes hash to
     for f in files:
-        mask = 0
-        for i, t in enumerate(HASH_TYPES):
+        mask, bridge = 0, None
+        for i in _STRONG_IDX:
             if f.hashes[i]:
                 mask |= 1 << i
-                if (t, f.hashes[i], size) in bridged:
-                    mask = _ALL_TYPES_MASK
+                hit = bridged.get((HASH_TYPES[i], f.hashes[i], size))
+                if hit is not None:
+                    mask, bridge = _STRONG_MASK, hit
         if f.id in linked:
-            mask = _ALL_TYPES_MASK
+            mask, bridge = _STRONG_MASK, linked[f.id]
+        if bridge is not None and not _contradict(f.hashes, bridge):
+            known[f.id] = bridge
         if mask:
             hashed.append((f, mask))
         else:
@@ -581,7 +638,7 @@ def _class_candidates(size: int, files: list[_File], bridged: set[tuple[str, str
     cand = _hashed_candidate(size, hashed)
     if cand is not None:
         out.append(cand)
-    out.extend(_bare_candidates(size, files, bare))
+    out.extend(_bare_candidates(size, files, bare, known))
     return out
 
 
@@ -616,15 +673,33 @@ def _hashed_candidate(size: int, hashed: list[tuple[_File, int]]) -> BridgeCandi
     return BridgeCandidate(f.id, f.remote, f.path, size, unresolved, "name+size" if name_match else "size")
 
 
-def _bare_candidates(size: int, files: list[_File], bare: list[_File]) -> list[BridgeCandidate]:
-    """One candidate per unlinked hashless file that has a counterpart to be compared with.
+# Below this many (bare files x class size) comparisons a class is checked pair by pair.
+_PAIRWISE_LIMIT = 40_000
 
-    A counterpart is any other file on a different remote, or any other
-    hashless file. Counted with tallies so a big class stays linear.
+
+def _contradict(a: tuple[str | None, ...], b: tuple[str | None, ...]) -> bool:
+    """True when some hash type both tuples carry holds two values: those bytes are provably different."""
+    return any(x and y and x != y for x, y in zip(a, b))
+
+
+def _has_strong(f: _File) -> bool:
+    return any(f.hashes[i] for i in _STRONG_IDX)
+
+
+def _bare_candidates(size: int, files: list[_File], bare: list[_File],
+                     known: dict[int, tuple] | None = None) -> list[BridgeCandidate]:
+    """One candidate per unlinked file without a strong hash that has a counterpart to be compared with.
+
+    A counterpart is any other file on a different remote, or any other file
+    without a strong hash. In a small class a counterpart is dropped when a
+    hash type both carry differs (md5/sha1/QuickXor still prove a difference), the
+    hashes of a vouched-for file (`known`) being those of its bridge; a big
+    class is counted with tallies so it stays linear, and keeps them.
     """
     if not bare:
         return []
-    is_bare = {f.id for f in bare}
+    if len(bare) * len(files) <= _PAIRWISE_LIMIT:
+        return _bare_candidates_pairwise(size, files, bare, known or {})
     total = len(files)
     n_remote: dict[int, int] = defaultdict(int)
     n_bare_remote: dict[int, int] = defaultdict(int)
@@ -632,7 +707,7 @@ def _bare_candidates(size: int, files: list[_File], bare: list[_File]) -> list[B
     n_name_remote: dict[tuple[int, str], int] = defaultdict(int)
     n_name_bare_remote: dict[tuple[int, str], int] = defaultdict(int)
     for f in files:
-        hashless = not any(f.hashes)
+        hashless = not _has_strong(f)
         n_remote[f.remote_id] += 1
         n_name[f.name] += 1
         n_name_remote[f.remote_id, f.name] += 1
@@ -648,6 +723,19 @@ def _bare_candidates(size: int, files: list[_File], bare: list[_File]) -> list[B
         same_name = n_name[f.name] - n_name_remote[r, f.name] + n_name_bare_remote[r, f.name] - 1
         out.append(BridgeCandidate(f.id, f.remote, f.path, size, counterparts,
                                    "name+size" if same_name > 0 else "size"))
+    return out
+
+
+def _bare_candidates_pairwise(size: int, files: list[_File], bare: list[_File],
+                              known: dict[int, tuple]) -> list[BridgeCandidate]:
+    out = []
+    strong = {f.id: _has_strong(f) for f in files}
+    for f in bare:
+        others = [g for g in files if g.id != f.id and (g.remote_id != f.remote_id or not strong[g.id])
+                  and not _contradict(f.hashes, known.get(g.id, g.hashes))]
+        if others:
+            out.append(BridgeCandidate(f.id, f.remote, f.path, size, len(others),
+                                       "name+size" if any(g.name == f.name for g in others) else "size"))
     return out
 
 
@@ -678,7 +766,7 @@ def record_bridge(conn: sqlite3.Connection, hashes: Mapping[str, Any], *, source
     rebuild_groups links it only while its size and mtime still match.
     hash_bridges.source_* keeps the first source for readers that predate
     bridge_sources: a later copy takes that slot over only when the previous
-    holder is stale or hashed (hashed files are linked by their hashes anyway).
+    holder is stale or has a strong hash (those are linked by their hashes anyway).
     All or nothing. Run rebuild_groups afterwards for the bridge to take effect.
     """
     clean = _clean_bridge(hashes)
@@ -708,7 +796,7 @@ def record_bridge(conn: sqlite3.Connection, hashes: Mapping[str, Any], *, source
 
 
 def _slot_is_free(conn: sqlite3.Connection, bridge: sqlite3.Row, taker: int) -> bool:
-    """May `taker` have hash_bridges.source_*? Yes when empty, its own, stale, or held by a hashed file."""
+    """May `taker` have hash_bridges.source_*? Yes when empty, its own, stale, or held by a file with a strong hash."""
     holder = bridge["source_entry_id"]
     if holder in (None, taker):
         return True
@@ -724,9 +812,10 @@ def bridge_entry(conn: sqlite3.Connection, rclone: Any, entry_id: int, tmpdir: s
     catalog already holds for the entry must match the downloaded bytes, else
     the file changed since the scan and nothing is recorded (ValueError).
     The result has `linked`: whether rebuild_groups will now tie this entry to
-    the bridge (always for a hashed entry; for a hashless one when it has an
-    mtime and no other bridge claims the same size and mtime). Several
-    hashless copies of the same bytes are each linked by their own download.
+    the bridge (always for an entry with a strong hash; for one without, i.e.
+    hashless or md5/sha1/QuickXor only, when it has an mtime and no other bridge
+    claims the same size and mtime). Several such copies of the same bytes are
+    each linked by their own download.
     Run rebuild_groups afterwards.
     """
     cur = _rows(conn)
@@ -753,6 +842,6 @@ def bridge_entry(conn: sqlite3.Connection, rclone: Any, entry_id: int, tmpdir: s
         if row[t] and row[t].lower() != hashes[t]:
             raise ValueError(f"entry {entry_id} changed since the scan: {t} {row[t]} -> {hashes[t]}")
     bridge_id = record_bridge(conn, hashes, source_entry_id=entry_id, source_mtime=row["mtime"])
-    linked = any(row[t] for t in HASH_TYPES) or \
+    linked = any(row[t] for t in STRONG_TYPES) or \
         any(link.bridge_id == bridge_id for link in _valid_links(conn, entry_id)[0])
     return {"bridge_id": bridge_id, "hashes": hashes, "entry_id": entry_id, "linked": linked}

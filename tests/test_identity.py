@@ -88,9 +88,9 @@ def test_same_md5_same_size_on_two_drives_is_one_group(conn, catalog, clouds):
     assert stats.duplicate_groups == 1 and stats.redundant_files == 1
 
 
-def test_same_md5_different_size_is_not_grouped(conn, catalog, clouds):
-    a = catalog.file(clouds["d1"], "a.bin", size=10, md5="aa")
-    b = catalog.file(clouds["d2"], "b.bin", size=11, md5="aa")
+def test_same_hash_different_size_is_not_grouped(conn, catalog, clouds):
+    a = catalog.file(clouds["d1"], "a.bin", size=10, sha256="aa")
+    b = catalog.file(clouds["d2"], "b.bin", size=11, sha256="aa")
     stats = rebuild_groups(conn)
     g = groups(conn)
     assert g[a] == a and g[b] == b          # each hash-identified, but alone
@@ -100,14 +100,20 @@ def test_same_md5_different_size_is_not_grouped(conn, catalog, clouds):
 
 def test_size_conflict_is_counted_once_per_hash_value(conn, catalog, clouds):
     for i, size in enumerate((10, 11, 12, 12)):
-        catalog.file(clouds["d1"], f"f{i}.bin", size=size, md5="aa")
+        catalog.file(clouds["d1"], f"f{i}.bin", size=size, sha256="aa")
     stats = rebuild_groups(conn)
     assert stats.size_conflicts == 1
     assert stats.duplicate_groups == 1       # the two size-12 files still match each other
 
 
-@pytest.mark.parametrize("hash_type", HASH_TYPES)
-def test_every_hash_type_links_entries(conn, catalog, hash_type):
+def test_the_hash_types_are_split_into_strong_and_weak():
+    assert identity.STRONG_TYPES == ("sha256", "dropbox")
+    assert identity.WEAK_TYPES == ("md5", "sha1", "quickxor")
+    assert set(identity.STRONG_TYPES) | set(identity.WEAK_TYPES) == set(HASH_TYPES)
+
+
+@pytest.mark.parametrize("hash_type", identity.STRONG_TYPES)
+def test_every_strong_hash_type_links_entries(conn, catalog, hash_type):
     r = catalog.remote("loc", "local")
     a = catalog.file(r, "a", size=5, **{hash_type: "ab12"})
     b = catalog.file(r, "b", size=5, **{hash_type: "ab12"})
@@ -118,11 +124,26 @@ def test_every_hash_type_links_entries(conn, catalog, hash_type):
     assert g[c] == c
 
 
+@pytest.mark.parametrize("hash_type", identity.WEAK_TYPES)
+def test_a_weak_hash_never_links_entries_and_never_identifies_one(conn, catalog, hash_type):
+    """md5 and QuickXorHash agreeing is what two different files can do (QuickXor: any two same-size files whose
+    160-byte rows are a permutation of each other): the entries stay unidentified until their bytes are hashed."""
+    r = catalog.remote("loc", "local")
+    a = catalog.file(r, "x/a.bin", size=5, **{hash_type: "ab12"})
+    b = catalog.file(r, "y/a.bin", size=5, **{hash_type: "ab12"})
+    stats = rebuild_groups(conn)
+    assert groups(conn)[a] is None and groups(conn)[b] is None
+    assert (stats.files_hashed, stats.groups, stats.duplicate_groups) == (0, 0, 0)
+    assert duplicate_groups(conn) == [] and not same_content(conn, a, b)
+    (probable,) = duplicate_groups(conn, confidence="probable")          # a candidate, never a proof
+    assert sorted(c.entry_id for c in probable.copies) == [a, b]
+
+
 def test_transitive_chain_through_mixed_hash_types(conn, catalog, clouds):
-    """Drive --md5-- local --dropbox-- Dropbox: no direct shared hash between the ends."""
+    """Drive --sha256-- local --dropbox-- Dropbox: no direct shared hash between the ends."""
     loc = catalog.remote("loc", "local")
-    d = catalog.file(clouds["d1"], "d", size=7, md5="m1")
-    mid = catalog.file(loc, "mid", size=7, md5="m1", dropbox="dd")
+    d = catalog.file(clouds["d1"], "d", size=7, sha256="m1")
+    mid = catalog.file(loc, "mid", size=7, sha256="m1", dropbox="dd")
     b = catalog.file(clouds["db"], "b", size=7, dropbox="dd")
     rebuild_groups(conn)
     g = groups(conn)
@@ -221,16 +242,46 @@ def test_stats(conn, catalog, clouds):
 def test_drive_and_dropbox_are_unlinked_until_bridged(conn, catalog, clouds):
     d = drive(catalog, clouds["d1"], "doc.pdf", "A", size=500)
     b = dropbox(catalog, clouds["db"], "doc.pdf", "A", size=500)
-    o = onedrive(catalog, clouds["od"], "doc.pdf", "A", size=500)
     rebuild_groups(conn)
     g = groups(conn)
-    assert len({g[d], g[b], g[o]}) == 3                   # same name, same size, still not proof
+    assert g[d] != g[b]                                   # same name, same size, still not proof
 
     record_bridge(conn, H("A", 500))
     stats = rebuild_groups(conn)
     g = groups(conn)
+    assert g[d] == g[b] == d
+    assert stats.duplicate_groups == 1 and stats.redundant_files == 1 and stats.redundant_bytes == 500
+
+
+def test_a_onedrive_file_joins_a_bridge_only_through_its_own_download(conn, catalog, clouds):
+    """The bridge of another file shares the OneDrive file's QuickXor; that is not its bytes."""
+    d = drive(catalog, clouds["d1"], "doc.pdf", "A", size=500)
+    b = dropbox(catalog, clouds["db"], "doc.pdf", "A", size=500)
+    o = onedrive(catalog, clouds["od"], "doc.pdf", "A", size=500, mtime=T0)
+    record_bridge(conn, H("A", 500))
+    rebuild_groups(conn)
+    g = groups(conn)
+    assert g[d] == g[b] == d and g[o] is None
+    assert not same_content(conn, d, o)
+
+    record_bridge(conn, H("A", 500), source_entry_id=o, source_mtime=T0)        # o's own bytes were hashed
+    stats = rebuild_groups(conn)
+    g = groups(conn)
     assert g[d] == g[b] == g[o] == d
     assert stats.duplicate_groups == 1 and stats.redundant_files == 2 and stats.redundant_bytes == 1000
+
+
+def test_a_onedrive_file_with_other_bytes_and_the_same_quickxor_stays_apart(conn, catalog, clouds):
+    """The crafted collision: same size, same QuickXor, other sha256. Its own download says so."""
+    d = drive(catalog, clouds["d1"], "doc.pdf", "A", size=500)
+    o = catalog.file(clouds["od"], "doc.pdf", size=500, mtime=T0, quickxor=H("A")["quickxor"])
+    mine = H("B", 500) | {"quickxor": H("A")["quickxor"]}
+    record_bridge(conn, H("A", 500))
+    record_bridge(conn, mine, source_entry_id=o, source_mtime=T0)
+    rebuild_groups(conn)
+    g = groups(conn)
+    assert g[d] == d and g[o] == o and not same_content(conn, d, o)
+    assert duplicate_groups(conn) == []
 
 
 def test_bridge_joins_only_matching_content(conn, catalog, clouds):
@@ -291,14 +342,42 @@ def test_two_bridges_for_different_contents_stay_apart(conn, catalog, clouds):
 
 
 def test_conflicting_hash_values_are_not_joined_and_are_counted(conn, catalog, clouds):
-    """Same md5+size but different sha1 (a crafted collision?): the shared md5 proves nothing, so no group."""
-    a = catalog.file(clouds["d1"], "a", size=9, md5="aa", sha1="11")
-    b = catalog.file(clouds["d2"], "b", size=9, md5="aa", sha1="22")
+    """Same Dropbox hash+size but different sha256 (a crafted collision?): the shared hash proves nothing, so no group."""
+    a = catalog.file(clouds["d1"], "a", size=9, dropbox="dd", sha256="s1")
+    b = catalog.file(clouds["d2"], "b", size=9, dropbox="dd", sha256="s2")
     stats = rebuild_groups(conn)
     assert groups(conn)[a] == a and groups(conn)[b] == b
     assert stats.hash_conflicts == 1 and stats.duplicate_groups == 0
     assert not same_content(conn, a, b)
     assert duplicate_groups(conn) == []
+
+
+@pytest.mark.parametrize("shared", identity.WEAK_TYPES)
+def test_a_shared_weak_hash_is_neither_a_join_nor_a_conflict(conn, catalog, clouds, shared):
+    """md5, sha1 or QuickXor equal, another weak type different: nobody tried to join them, so nothing is refused."""
+    other = next(t for t in identity.WEAK_TYPES if t != shared)
+    a = catalog.file(clouds["d1"], "a", size=9, **{shared: "aa", other: "11"})
+    b = catalog.file(clouds["d2"], "b", size=9, **{shared: "aa", other: "22"})
+    stats = rebuild_groups(conn)
+    assert groups(conn)[a] is None and groups(conn)[b] is None           # no strong hash: not identified at all
+    assert stats.hash_conflicts == 0 and stats.duplicate_groups == 0 and not same_content(conn, a, b)
+
+
+def test_sha1_is_no_proof_of_identity(conn, catalog, clouds):
+    """sha1 has practical collision attacks: the same sha1 and size is a lead, never a join (Drive also has sha256)."""
+    a = catalog.file(clouds["d1"], "x.bin", size=5, sha1="aa", sha256="s1")
+    b = catalog.file(clouds["d2"], "x.bin", size=5, sha1="aa")                 # same sha1, no sha256 to compare
+    c = catalog.file(clouds["d2"], "y.bin", size=5, sha1="aa", sha256="s1")    # sha256 is what joins a and c
+    d = catalog.file(clouds["d1"], "z.bin", size=5, sha1="bb")
+    e = catalog.file(clouds["d2"], "z.bin", size=5, sha1="bb")
+    stats = rebuild_groups(conn)
+    g = groups(conn)
+    assert g[a] == g[c] == a and g[b] is None and g[d] is None and g[e] is None
+    assert stats.hash_conflicts == 0 and stats.duplicate_groups == 1
+    assert not same_content(conn, a, b) and not same_content(conn, d, e)
+    assert [grp.key for grp in duplicate_groups(conn)] == [f"g:{a}"]
+    probable = {cp.entry_id for grp in duplicate_groups(conn, confidence="probable") for cp in grp.copies}
+    assert {d, e} <= probable                                                # still a lead for a bridge download
 
 
 def test_consistent_groups_report_no_conflict(conn, catalog, clouds):
@@ -309,32 +388,32 @@ def test_consistent_groups_report_no_conflict(conn, catalog, clouds):
 
 # -- conflict-aware union: a join between components that disagree on a hash type is refused
 
-def test_md5_equal_but_sha256_different_are_different_groups(conn, catalog, clouds):
-    """The delete-safety case: a shared md5 must not make one file the witness for the other."""
-    a = catalog.file(clouds["d1"], "a/report.pdf", size=50, md5="aa", sha256="s1")
-    b = catalog.file(clouds["d2"], "b/report.pdf", size=50, md5="aa", sha256="s2")
+@pytest.mark.parametrize("shared", ["md5", "sha1"])
+def test_md5_or_sha1_equal_but_sha256_different_are_different_groups(conn, catalog, clouds, shared):
+    """The delete-safety case: a shared md5 or sha1 must not make one file the witness for the other."""
+    a = catalog.file(clouds["d1"], "a/report.pdf", size=50, sha256="s1", **{shared: "aa"})
+    b = catalog.file(clouds["d2"], "b/report.pdf", size=50, sha256="s2", **{shared: "aa"})
     stats = rebuild_groups(conn)
     g = groups(conn)
     assert g[a] == a and g[b] == b
-    assert stats.hash_conflicts == 1 and stats.duplicate_groups == 0 and stats.redundant_files == 0
+    assert stats.hash_conflicts == 0 and stats.duplicate_groups == 0 and stats.redundant_files == 0
     assert not same_content(conn, a, b)
     assert [c.entry_id for c in locations(conn, a)] == [a]
     assert duplicate_groups(conn) == []
-    (probable,) = duplicate_groups(conn, confidence="probable")      # same name+size: a candidate, never a proof
-    assert probable.confidence == "probable"
+    assert duplicate_groups(conn, confidence="probable") == []       # sha256 proves they differ: not even a candidate
 
 
 def test_every_refused_edge_is_counted(conn, catalog, clouds):
-    """md5 and sha1 both link the pair and both are refused; sha256 is what tells them apart."""
-    catalog.file(clouds["d1"], "a", size=5, md5="aa", sha1="11", sha256="s1")
-    catalog.file(clouds["d2"], "b", size=5, md5="aa", sha1="11", sha256="s2")
+    """sha256 and the Dropbox hash both link the pair and both are refused; sha1 is what tells them apart."""
+    catalog.file(clouds["d1"], "a", size=5, sha256="s", dropbox="dd", sha1="11")
+    catalog.file(clouds["d2"], "b", size=5, sha256="s", dropbox="dd", sha1="22")
     assert rebuild_groups(conn).hash_conflicts == 2
 
 
 @pytest.mark.parametrize("hash_type", HASH_TYPES)
 def test_a_contradiction_in_any_hash_type_blocks_the_join(conn, catalog, hash_type):
     r = catalog.remote("loc", "local")
-    other = next(t for t in HASH_TYPES if t != hash_type)
+    other = next(t for t in identity.STRONG_TYPES if t != hash_type)        # the type that links the pair
     a = catalog.file(r, "a", size=5, **{other: "same", hash_type: "x1"})
     b = catalog.file(r, "b", size=5, **{other: "same", hash_type: "x2"})
     stats = rebuild_groups(conn)
@@ -342,74 +421,72 @@ def test_a_contradiction_in_any_hash_type_blocks_the_join(conn, catalog, hash_ty
 
 
 def test_a_hash_the_other_side_does_not_know_is_not_a_contradiction(conn, catalog, clouds):
-    """Drive (md5, sha256) vs a local copy with only md5: nothing disagrees, so they are one content."""
-    a = catalog.file(clouds["d1"], "a", size=5, md5="aa", sha256="s1")
-    b = catalog.file(clouds["d2"], "b", size=5, md5="aa")
-    c = catalog.file(clouds["d2"], "c", size=5, md5="aa", sha256="s1")
+    """Drive (sha1, sha256) vs a copy with only sha256: nothing disagrees, so they are one content."""
+    a = catalog.file(clouds["d1"], "a", size=5, sha1="aa", sha256="s1")
+    b = catalog.file(clouds["d2"], "b", size=5, sha256="s1")
+    c = catalog.file(clouds["d2"], "c", size=5, sha1="aa", sha256="s1")
     stats = rebuild_groups(conn)
     assert groups(conn)[a] == groups(conn)[b] == groups(conn)[c] == a and stats.hash_conflicts == 0
 
 
 def test_contradiction_only_appears_after_several_joins(conn, catalog, clouds):
-    """a~b by md5, b~c by dropbox, c~d by sha1, but a and d disagree on md5: no pair is contradictory
-    on its own (b and c agree), only the components that grew out of them are."""
+    """a~b by sha256, b~c by dropbox, but a and c disagree on sha1: no linked pair is contradictory
+    on its own (b says nothing about sha1), only the component that grew out of a~b is."""
     loc = catalog.remote("loc", "local")
-    a = catalog.file(loc, "a", size=7, md5="m1")
-    b = catalog.file(loc, "b", size=7, md5="m1", dropbox="d")
-    c = catalog.file(loc, "c", size=7, dropbox="d", sha1="x")
-    d = catalog.file(loc, "d", size=7, sha1="x", md5="m2")
+    a = catalog.file(loc, "a", size=7, sha256="x", sha1="m1")
+    b = catalog.file(loc, "b", size=7, sha256="x", dropbox="d")
+    c = catalog.file(loc, "c", size=7, dropbox="d", sha1="m2")
     stats = rebuild_groups(conn)
     g = groups(conn)
-    assert g[a] == g[b] == a and g[c] == g[d] == c and g[a] != g[c]
-    assert stats.hash_conflicts == 1 and stats.duplicate_groups == 2
+    assert g[a] == g[b] == a and g[c] == c
+    assert stats.hash_conflicts == 1 and stats.duplicate_groups == 1
 
 
-def test_chain_through_all_five_hash_types_is_cut_at_its_last_link(conn, catalog):
-    """Four joins build one component; the fifth file shares only quickxor but contradicts its md5."""
+def test_chain_through_all_strong_hash_types_is_cut_at_its_last_link(conn, catalog):
+    """Two joins build one component; the fourth file shares only the Dropbox hash but contradicts its sha1.
+    The weak hashes ride along in the chain and change nothing."""
     loc = catalog.remote("loc", "local")
     chain = [
-        catalog.file(loc, "f0", size=3, md5="m"),
-        catalog.file(loc, "f1", size=3, md5="m", sha1="s"),
-        catalog.file(loc, "f2", size=3, sha1="s", sha256="t"),
-        catalog.file(loc, "f3", size=3, sha256="t", dropbox="d"),
-        catalog.file(loc, "f4", size=3, dropbox="d", quickxor="q"),
+        catalog.file(loc, "f0", size=3, sha256="t", sha1="s", md5="m"),
+        catalog.file(loc, "f1", size=3, sha256="t", sha1="s", dropbox="d", md5="m"),
+        catalog.file(loc, "f2", size=3, dropbox="d", quickxor="q"),
     ]
-    odd = catalog.file(loc, "f5", size=3, quickxor="q", md5="OTHER")
+    odd = catalog.file(loc, "f3", size=3, dropbox="d", sha1="OTHER", quickxor="q")
     stats = rebuild_groups(conn)
     g = groups(conn)
     assert {g[e] for e in chain} == {chain[0]}
     assert g[odd] == odd
-    assert (stats.hash_conflicts, stats.duplicate_groups, stats.redundant_files) == (1, 1, 4)
+    assert (stats.hash_conflicts, stats.duplicate_groups, stats.redundant_files) == (1, 1, 2)
 
 
 def test_conflicting_run_does_not_depend_on_row_order_within_a_value(conn, catalog):
-    """Three files share an md5; the lowest id anchors the run, the one that contradicts it is left out."""
+    """Three files share a sha256; the lowest id anchors the run, the one that contradicts it is left out."""
     loc = catalog.remote("loc", "local")
-    a = catalog.file(loc, "a", size=3, md5="m", sha1="1")
-    b = catalog.file(loc, "b", size=3, md5="m", sha1="2")
-    c = catalog.file(loc, "c", size=3, md5="m")
+    a = catalog.file(loc, "a", size=3, sha256="m", sha1="1")
+    b = catalog.file(loc, "b", size=3, sha256="m", sha1="2")
+    c = catalog.file(loc, "c", size=3, sha256="m")
     rebuild_groups(conn)
     g = groups(conn)
     assert g[a] == g[c] == a and g[b] == b
 
 
 def test_bridge_does_not_pull_in_a_file_that_contradicts_it(conn, catalog, clouds):
-    """A Drive file with the bridge's md5 but another sha256 stays out; the Dropbox copy still joins."""
-    good = catalog.file(clouds["d1"], "g", size=10, md5=H("A")["md5"], sha256=H("A")["sha256"])
-    fake = catalog.file(clouds["d2"], "f", size=10, md5=H("A")["md5"], sha256=H("FAKE")["sha256"])
+    """A Drive file with the bridge's sha256 but another sha1 stays out; the Dropbox copy still joins."""
+    good = drive(catalog, clouds["d1"], "g", "A")
+    fake = catalog.file(clouds["d2"], "f", size=10, sha256=H("A")["sha256"], sha1=H("FAKE")["sha1"])
     dbx = dropbox(catalog, clouds["db"], "g", "A")
     record_bridge(conn, H("A"))
     stats = rebuild_groups(conn)
     g = groups(conn)
     assert g[good] == g[dbx] == good and g[fake] == fake
-    assert stats.hash_conflicts == 2          # md5 edge good~fake was refused directly, then the bridge's edge to fake
+    assert stats.hash_conflicts == 2          # sha256 edge good~fake was refused directly, then the bridge's edge to fake
     assert not same_content(conn, fake, dbx)
 
 
 def test_bridge_that_contradicts_a_native_group_is_refused_whole(conn, catalog, clouds):
-    """Two Drive copies agree with each other; a bridge with their md5 but a different sha1 describes other bytes."""
-    a = catalog.file(clouds["d1"], "a", size=10, md5=H("A")["md5"], sha1="aa")
-    b = catalog.file(clouds["d2"], "b", size=10, md5=H("A")["md5"], sha1="aa")
+    """Two Drive copies agree with each other; a bridge with their sha256 but a different sha1 describes other bytes."""
+    a = catalog.file(clouds["d1"], "a", size=10, sha256=H("A")["sha256"], sha1="aa")
+    b = catalog.file(clouds["d2"], "b", size=10, sha256=H("A")["sha256"], sha1="aa")
     o = dropbox(catalog, clouds["db"], "o", "A")
     record_bridge(conn, H("A"))                                   # its sha1 is not "aa"
     stats = rebuild_groups(conn)
@@ -427,7 +504,9 @@ def test_hashless_source_cannot_be_forced_into_a_contradicting_component(conn, c
 
 
 def _naive_components(conn, edges_by_value=True):
-    """What the old, unconditional union-find would produce (independent reimplementation)."""
+    """What an unconditional union-find over the strong hashes would produce (independent reimplementation).
+
+    Weak hashes (md5, QuickXor) are no edges; they are only passengers of the entries."""
     live = [r for r in conn.execute(
         "SELECT * FROM entries WHERE present = 1 AND is_dir = 0 AND is_native_doc = 0 AND size IS NOT NULL")]
     parent = {r["id"]: r["id"] for r in live}
@@ -443,11 +522,12 @@ def _naive_components(conn, edges_by_value=True):
 
     seen: dict = {}
     for r in live:
-        for t in HASH_TYPES:
+        for t in identity.STRONG_TYPES:
             if r[t]:
                 union(r["id"], seen.setdefault((t, r[t], r["size"]), r["id"]))
     for b in conn.execute("SELECT * FROM hash_bridges"):
-        members = [r["id"] for r in live if r["size"] == b["size"] and any(r[t] == b[t] for t in HASH_TYPES)]
+        members = [r["id"] for r in live
+                   if r["size"] == b["size"] and any(r[t] == b[t] for t in identity.STRONG_TYPES)]
         members += [x["entry_id"] for x in conn.execute(
             "SELECT s.entry_id FROM bridge_sources s JOIN entries e ON e.id = s.entry_id "
             "WHERE s.bridge_id = ? AND e.size = s.size AND e.mtime = s.mtime AND e.present = 1", (b["id"],))]
@@ -920,6 +1000,58 @@ def test_probable_filters_ordering_and_pagination(conn, catalog, clouds):
     assert [g.size for g in duplicate_groups(conn, confidence="probable", limit=1, offset=1)] == [300]
 
 
+def test_same_name_and_size_with_different_hashes_is_not_a_probable_duplicate(conn, catalog, clouds):
+    """Probable means "no hash proof", not "proof of the opposite": md5 aa vs bb cannot be the same bytes."""
+    catalog.file(clouds["d1"], "a/report.pdf", size=100, md5="aa")
+    catalog.file(clouds["d2"], "b/report.pdf", size=100, md5="bb")
+    rebuild_groups(conn)
+    assert duplicate_groups(conn, confidence="exact") == []
+    assert duplicate_groups(conn, confidence="probable") == []
+
+
+def test_a_weak_hash_that_differs_also_rules_a_pair_out(conn, catalog, clouds):
+    """QuickXor proves a difference too, even though it never proves a match."""
+    onedrive(catalog, clouds["od"], "a/x.bin", "A", size=9)
+    onedrive(catalog, clouds["od"], "b/x.bin", "B", size=9)
+    rebuild_groups(conn)
+    assert duplicate_groups(conn, confidence="probable") == []
+
+
+def test_a_weak_hash_that_agrees_leaves_a_pair_probable(conn, catalog, clouds):
+    onedrive(catalog, clouds["od"], "a/x.bin", "A", size=9)
+    onedrive(catalog, clouds["od"], "b/x.bin", "A", size=9)
+    rebuild_groups(conn)
+    assert duplicate_groups(conn, confidence="exact") == []
+    (prob,) = duplicate_groups(conn, confidence="probable")
+    assert prob.redundant_bytes == 9
+
+
+def test_an_unknown_hash_is_not_a_difference(conn, catalog, clouds):
+    """Drive reports md5/sha1/sha256, Dropbox only its own hash: no type in common, so nothing is ruled out."""
+    drive(catalog, clouds["d1"], "a/x.bin", "A", size=9)
+    dropbox(catalog, clouds["db"], "b/x.bin", "B", size=9)
+    rebuild_groups(conn)
+    assert len(duplicate_groups(conn, confidence="probable")) == 1
+
+
+def test_a_group_stays_probable_while_one_pair_is_open(conn, catalog, clouds):
+    """Two Drive copies prove each other different, but the unhashed third is unsettled against both."""
+    catalog.file(clouds["d1"], "a/x.bin", size=9, md5="aa")
+    catalog.file(clouds["d2"], "b/x.bin", size=9, md5="bb")
+    icloud(catalog, clouds["ic"], "x.bin", size=9)
+    rebuild_groups(conn)
+    (prob,) = duplicate_groups(conn, confidence="probable")
+    assert len(prob.copies) == 3
+
+
+def test_copies_that_all_prove_each_other_different_are_not_probable(conn, catalog, clouds):
+    for rid, md5 in (("d1", "aa"), ("d2", "bb")):
+        catalog.file(clouds[rid], f"{rid}/x.bin", size=9, md5=md5)
+    catalog.file(clouds["d1"], "z/x.bin", size=9, md5="cc")
+    rebuild_groups(conn)
+    assert duplicate_groups(conn, confidence="probable") == []
+
+
 # --------------------------------------------------------------------------- record_bridge
 
 def test_record_bridge_inserts_and_is_idempotent_on_sha256(conn):
@@ -968,6 +1100,16 @@ def test_hashed_holder_does_not_block_a_hashless_source(conn, catalog, clouds):
     assert _source(conn, bid) == (i, t)
     record_bridge(conn, H("A"), source_entry_id=d, source_mtime=t)       # and a hashed one never takes it back
     assert _source(conn, bid) == (i, t)
+
+
+def test_a_weak_only_holder_keeps_the_slot_like_a_hashless_one(conn, catalog, clouds):
+    """A OneDrive file is identified by its link only, so it is not displaced the way a strongly hashed holder is."""
+    t = "2024-02-02T00:00:00Z"
+    o = onedrive(catalog, clouds["od"], "a/x", "A", mtime=t)
+    i = icloud(catalog, clouds["ic"], "b/x", mtime=t)
+    bid = record_bridge(conn, H("A"), source_entry_id=o, source_mtime=t)
+    record_bridge(conn, H("A"), source_entry_id=i, source_mtime=t)
+    assert _source(conn, bid) == (o, t)
 
 
 def test_record_bridge_unknown_source_entry_is_rejected(conn):
@@ -1068,9 +1210,9 @@ def test_non_live_files_do_not_make_candidates(conn, catalog, clouds):
 
 def test_download_preference_follows_provider_order(conn, catalog, clouds):
     loc = catalog.remote("loc", "local")
-    # onedrive vs dropbox: dropbox is the cheaper download
-    onedrive(catalog, clouds["od"], "x", "A", size=10)
-    dbx = dropbox(catalog, clouds["db"], "x", "A", size=10)
+    # onedrive vs dropbox: QuickXor proves nothing, so it is the OneDrive file itself that has to be read
+    od = onedrive(catalog, clouds["od"], "x", "A", size=10)
+    dropbox(catalog, clouds["db"], "x", "A", size=10)
     # a partial local entry (only the dropbox hash) vs drive: local wins
     drive(catalog, clouds["d1"], "y", "B", size=20)
     loc_e = catalog.file(loc, "y", size=20, dropbox=H("B")["dropbox"], quickxor=H("B")["quickxor"])
@@ -1079,7 +1221,7 @@ def test_download_preference_follows_provider_order(conn, catalog, clouds):
     dropbox(catalog, clouds["db"], "z", "C", size=30)
     rebuild_groups(conn)
     by_size = {c.size: c for c in bridge_candidates(conn)}
-    assert by_size[10].entry_id == dbx
+    assert by_size[10].entry_id == od
     assert by_size[20].entry_id == loc_e
     assert by_size[30].entry_id == d
 
@@ -1101,7 +1243,7 @@ def test_ranking_name_matches_first_then_saving(conn, catalog, clouds):
     # two name+size candidates: saving 200 and 3000
     drive(catalog, clouds["d1"], "m.bin", "M", size=100)
     dropbox(catalog, clouds["db"], "m.bin", "M", size=100)
-    onedrive(catalog, clouds["od"], "m.bin", "M", size=100)
+    dropbox(catalog, clouds["db"], "copy/m.bin", "M", size=100)
     drive(catalog, clouds["d1"], "n.bin", "N", size=3000)
     dropbox(catalog, clouds["db"], "n.bin", "N", size=3000)
     rebuild_groups(conn)
@@ -1142,25 +1284,65 @@ def test_limit_and_min_size(conn, catalog, clouds):
 def test_bridged_class_stops_being_a_candidate(conn, catalog, clouds):
     drive(catalog, clouds["d1"], "a", "A", size=10)
     dropbox(catalog, clouds["db"], "a", "A", size=10)
-    onedrive(catalog, clouds["od"], "a", "A", size=10)
+    drive(catalog, clouds["d2"], "b", "B", size=11)
+    dropbox(catalog, clouds["db"], "b", "B", size=11)
     rebuild_groups(conn)
-    assert len(bridge_candidates(conn)) == 1
-    record_bridge(conn, H("A"))
-    assert bridge_candidates(conn) == []            # even before the regroup: the work is done
+    assert sorted(c.size for c in bridge_candidates(conn)) == [10, 11]
+    record_bridge(conn, H("A", 10))
+    assert [c.size for c in bridge_candidates(conn)] == [11]       # even before the regroup: the work is done
+    rebuild_groups(conn)
+    assert [c.size for c in bridge_candidates(conn)] == [11]
+
+
+def test_a_bridge_does_not_close_the_class_of_a_onedrive_file(conn, catalog, clouds):
+    """The bridge made from the Drive copy has the OneDrive file's QuickXor, which is not its bytes: only its own
+    download settles it, so it is the candidate; the Drive/Dropbox pair, bridged, is not."""
+    d = drive(catalog, clouds["d1"], "a", "A", size=10)
+    dropbox(catalog, clouds["db"], "a", "A", size=10)
+    o = onedrive(catalog, clouds["od"], "a", "A", size=10, mtime=T0)
+    rebuild_groups(conn)
+    assert sorted(c.entry_id for c in bridge_candidates(conn)) == [d, o]    # the hashed-domain pair, and the OneDrive file
+    record_bridge(conn, H("A", 10))
+    rebuild_groups(conn)
+    (c,) = bridge_candidates(conn)
+    assert c.entry_id == o and c.unresolved_copies == 2 and c.reason == "name+size"
+    record_bridge(conn, H("A", 10), source_entry_id=o, source_mtime=T0)
     rebuild_groups(conn)
     assert bridge_candidates(conn) == []
 
 
 def test_bridge_that_proves_difference_also_closes_the_class(conn, catalog, clouds):
-    """Drive and Dropbox match, the OneDrive file has other bytes: nothing left to bridge."""
+    """Drive and Dropbox match, the OneDrive file has other bytes: its QuickXor differs from the bridge's, so
+    nothing is left to download."""
     d = drive(catalog, clouds["d1"], "a", "A", size=10)
     b = dropbox(catalog, clouds["db"], "a", "A", size=10)
     o = onedrive(catalog, clouds["od"], "a", "OTHER", size=10)
     record_bridge(conn, H("A"))
     rebuild_groups(conn)
     g = groups(conn)
-    assert g[d] == g[b] and g[o] == o
+    assert g[d] == g[b] and g[o] is None
     assert bridge_candidates(conn) == []
+
+
+def test_a_quickxor_that_differs_closes_a_onedrive_pair_without_a_download(conn, catalog, clouds):
+    """Same size, different QuickXor: provably different files, no candidate. Equal QuickXor proves nothing: both are."""
+    a = onedrive(catalog, clouds["od"], "x/a.bin", "A", size=10)
+    b = onedrive(catalog, clouds["od"], "y/b.bin", "B", size=10)
+    c = onedrive(catalog, clouds["od"], "x/c.bin", "C", size=20)
+    c2 = catalog.file(clouds["od"], "y/c.bin", size=20, quickxor=H("C")["quickxor"])       # same QuickXor as c
+    rebuild_groups(conn)
+    assert sorted(x.entry_id for x in bridge_candidates(conn)) == [c, c2]
+    assert a not in [x.entry_id for x in bridge_candidates(conn)] and b not in [x.entry_id for x in bridge_candidates(conn)]
+
+
+def test_a_big_class_is_counted_without_dropping_counterparts(conn, catalog, clouds, monkeypatch):
+    """The tally path of a big class cannot pair files up, so it keeps counterparts the pairwise path would drop."""
+    onedrive(catalog, clouds["od"], "x/a.bin", "A", size=10)
+    onedrive(catalog, clouds["od"], "y/b.bin", "B", size=10)
+    rebuild_groups(conn)
+    assert bridge_candidates(conn) == []
+    monkeypatch.setattr(identity, "_PAIRWISE_LIMIT", 0)
+    assert len(bridge_candidates(conn)) == 2
 
 
 def test_bridge_for_one_content_leaves_other_contents_of_the_size_open(conn, catalog, clouds):
@@ -1223,7 +1405,7 @@ def fake_hash(monkeypatch):
 def test_bridge_entry_records_bridge_and_cleans_up(conn, catalog, clouds, fake_hash, tmp_path):
     data = b"hello bridge"
     fh = fake_hashes(data)
-    d = catalog.file(clouds["d1"], "docs/a.txt", size=len(data), md5=fh["md5"], sha1=fh["sha1"])
+    d = catalog.file(clouds["d1"], "docs/a.txt", size=len(data), md5=fh["md5"], sha256=fh["sha256"])
     b = catalog.file(clouds["db"], "other/a.txt", size=len(data), dropbox=fh["dropbox"])
     o = catalog.file(clouds["od"], "o/a.txt", size=len(data), quickxor=fh["quickxor"])
     rc = FakeRclone({("d1:", "docs/a.txt"): data})
@@ -1238,6 +1420,13 @@ def test_bridge_entry_records_bridge_and_cleans_up(conn, catalog, clouds, fake_h
     r = conn.execute("SELECT * FROM hash_bridges WHERE id = ?", (out["bridge_id"],)).fetchone()
     assert r["source_entry_id"] == d and r["sha256"] == fh["sha256"] and r["size"] == len(data)
 
+    rebuild_groups(conn)
+    g = groups(conn)
+    assert g[d] == g[b] == d and g[o] is None            # the OneDrive file shares a QuickXor, not the bytes
+
+    out = bridge_entry(conn, FakeRclone({("od:", "o/a.txt"): data}), o, tmp_path)
+    assert out["linked"] is True and out["bridge_id"] == conn.execute(
+        "SELECT id FROM hash_bridges WHERE sha256 = ?", (fh["sha256"],)).fetchone()[0]
     rebuild_groups(conn)
     g = groups(conn)
     assert g[d] == g[b] == g[o] == d
@@ -1367,21 +1556,22 @@ def test_end_to_end_candidates_then_bridge_then_regroup(conn, catalog, clouds, f
         data = f"content of {name}".encode() * (n + 1)
         fh = fake_hashes(data)
         files[("d1:", f"{name}.bin")] = data
+        files[("od:", f"copy/{name}.bin")] = data
         catalog.file(clouds["d1"], f"{name}.bin", size=len(data), md5=fh["md5"], sha1=fh["sha1"], sha256=fh["sha256"])
         catalog.file(clouds["db"], f"copy/{name}.bin", size=len(data), dropbox=fh["dropbox"])
-        catalog.file(clouds["od"], f"copy/{name}.bin", size=len(data), quickxor=fh["quickxor"])
+        catalog.file(clouds["od"], f"copy/{name}.bin", size=len(data), mtime=T0, quickxor=fh["quickxor"])
     rebuild_groups(conn)
     assert duplicate_groups(conn) == [] and len(duplicate_groups(conn, confidence="probable")) == 3
     rc = FakeRclone(files)
     cands = bridge_candidates(conn)
-    assert len(cands) == 3
+    assert len(cands) == 6                              # per content: the Drive/Dropbox pair, and the OneDrive file
     for cand in cands:
         bridge_entry(conn, rc, cand.entry_id, tmp_path)
     stats = rebuild_groups(conn)
     assert stats.duplicate_groups == 3 and stats.redundant_files == 6
     assert bridge_candidates(conn) == []
     assert duplicate_groups(conn, confidence="probable") == []
-    assert len(rc.calls) == 3                           # one download per content, not per copy
+    assert len(rc.calls) == 6                           # one download per hash domain, and one per OneDrive copy
 
 
 # --------------------------------------------------------------------------- hashless files via their own bridge
@@ -1447,11 +1637,16 @@ def test_source_link_needs_a_recorded_mtime(conn, catalog, clouds):
 def test_source_with_a_contradicting_native_hash_is_not_linked(conn, catalog, clouds):
     """A hashed source whose stored hash disagrees with the bridge must not be pulled into its group."""
     d = drive(catalog, clouds["d1"], "a", "A", mtime=T0)
-    liar = catalog.file(clouds["d2"], "b", size=10, mtime=T0, md5=H("OTHER")["md5"])
+    liar = catalog.file(clouds["d2"], "b", size=10, mtime=T0, sha256=H("OTHER")["sha256"])
+    sha1_liar = catalog.file(clouds["d2"], "e", size=10, mtime=T0, sha1=H("OTHER")["sha1"])
+    weak_liar = catalog.file(clouds["od"], "c", size=10, mtime=T0, quickxor=H("OTHER")["quickxor"])
     record_bridge(conn, H("A"), source_entry_id=liar, source_mtime=T0)
+    record_bridge(conn, H("A"), source_entry_id=sha1_liar, source_mtime=T0)
+    record_bridge(conn, H("A"), source_entry_id=weak_liar, source_mtime=T0)
     rebuild_groups(conn)
     g = groups(conn)
     assert g[d] == d and g[liar] == liar
+    assert g[sha1_liar] is None and g[weak_liar] is None                # not even a weak hash may disagree
 
 
 def test_lone_linked_source_is_a_singleton_group(conn, catalog, clouds):
@@ -1603,7 +1798,7 @@ def test_ambiguous_source_is_reported_unlinked_by_bridge_entry(conn, catalog, cl
 
 def test_hashed_source_contradicting_the_bridge_is_not_linked_even_with_many_sources(conn, catalog, clouds):
     good = icloud(catalog, clouds["ic"], "a", mtime=T0)
-    liar = catalog.file(clouds["d2"], "b", size=10, mtime=T0, md5=H("OTHER")["md5"])
+    liar = catalog.file(clouds["d2"], "b", size=10, mtime=T0, sha256=H("OTHER")["sha256"])
     bid = record_bridge(conn, H("A"), source_entry_id=good, source_mtime=T0)
     record_bridge(conn, H("A"), source_entry_id=liar, source_mtime=T0)
     rebuild_groups(conn)
@@ -1619,12 +1814,76 @@ def test_bridge_entry_reports_linked_for_hashed_entries(conn, catalog, clouds, f
     assert bridge_entry(conn, FakeRclone({("d1:", "a"): data}), d, tmp_path)["linked"] is True
 
 
+def test_bridge_entry_reports_a_weak_only_entry_linked_only_through_its_source_row(conn, catalog, clouds, fake_hash,
+                                                                                  tmp_path):
+    data = b"onedrive bytes"
+    fh = fake_hashes(data)
+    o = catalog.file(clouds["od"], "a", size=len(data), mtime=T0, quickxor=fh["quickxor"])
+    nomtime = catalog.file(clouds["od"], "b", size=len(data), quickxor=fh["quickxor"])
+    conn.execute("UPDATE entries SET mtime = NULL WHERE id = ?", (nomtime,))
+    rc = FakeRclone({("od:", "a"): data, ("od:", "b"): data})
+    assert bridge_entry(conn, rc, o, tmp_path)["linked"] is True
+    assert bridge_entry(conn, rc, nomtime, tmp_path)["linked"] is False       # its QuickXor is no substitute
+    stats = rebuild_groups(conn)
+    assert groups(conn)[o] == o and groups(conn)[nomtime] is None and stats.files_hashed == 1
+
+
 def test_bridge_entry_hashless_without_mtime_is_not_linked(conn, catalog, clouds, fake_hash, tmp_path):
     data = b"no mtime"
     i = catalog.file(clouds["ic"], "a", size=len(data))
     conn.execute("UPDATE entries SET mtime = NULL WHERE id = ?", (i,))
     out = bridge_entry(conn, FakeRclone({("ic:", "a"): data}), i, tmp_path)
     assert out["linked"] is False and _source(conn, out["bridge_id"]) == (i, None)
+
+
+def test_two_onedrive_copies_become_exact_only_when_both_were_downloaded(conn, catalog, clouds, fake_hash, tmp_path):
+    """The dedupe case: equal QuickXor and size is a reason to look, two downloads are the proof."""
+    data = b"the same onedrive bytes"
+    qx = fake_hashes(data)["quickxor"]
+    a = catalog.file(clouds["od"], "a/x.bin", size=len(data), mtime=T0, quickxor=qx)
+    b = catalog.file(clouds["od"], "b/x.bin", size=len(data), mtime=T0, quickxor=qx)
+    rc = FakeRclone({("od:", "a/x.bin"): data, ("od:", "b/x.bin"): data})
+    rebuild_groups(conn)
+    assert duplicate_groups(conn) == [] and sorted(c.entry_id for c in bridge_candidates(conn)) == [a, b]
+    bridge_entry(conn, rc, a, tmp_path)
+    rebuild_groups(conn)
+    assert duplicate_groups(conn) == [] and not same_content(conn, a, b)      # one proven file proves nothing about b
+    assert [c.entry_id for c in bridge_candidates(conn)] == [b]
+    bridge_entry(conn, rc, b, tmp_path)
+    rebuild_groups(conn)
+    (grp,) = duplicate_groups(conn)
+    assert [c.entry_id for c in grp.copies] == [a, b] and same_content(conn, a, b)
+    assert bridge_candidates(conn) == []
+
+
+def test_a_rebuild_unlearns_groups_that_rested_on_a_weak_hash(conn, catalog, clouds):
+    """A catalog grouped by an older version (md5 / QuickXor as proof) is cleaned by the next rebuild."""
+    a = onedrive(catalog, clouds["od"], "a", "A")
+    b = onedrive(catalog, clouds["od"], "b", "A")
+    c = catalog.file(clouds["d1"], "c", size=10, md5=H("A")["md5"])
+    conn.executemany("UPDATE entries SET content_group = ? WHERE id = ?", [(a, a), (a, b), (c, c)])
+    stats = rebuild_groups(conn)
+    assert set(groups(conn).values()) == {None} and stats.changed == 3
+    assert duplicate_groups(conn) == []
+
+
+@pytest.mark.parametrize("seed", range(8))
+def test_big_and_small_classes_count_the_same_when_no_hash_can_tell_files_apart(conn, catalog, clouds, monkeypatch,
+                                                                              seed):
+    """The tally path (big classes) and the pairwise path agree wherever the pairwise path has nothing to drop."""
+    rng = random.Random(seed)
+    for n in range(rng.randint(3, 12)):
+        kind = rng.choice("dbi")
+        if kind == "d":
+            drive(catalog, clouds[rng.choice(("d1", "d2"))], f"{n}/{rng.choice('ab')}.bin", rng.choice("AB"), size=10)
+        elif kind == "b":
+            dropbox(catalog, clouds["db"], f"{n}/{rng.choice('ab')}.bin", rng.choice("AB"), size=10)
+        else:
+            icloud(catalog, clouds["ic"], f"{n}/{rng.choice('ab')}.bin", size=10, mtime=T0)
+    rebuild_groups(conn)
+    pairwise = bridge_candidates(conn, limit=1000)
+    monkeypatch.setattr(identity, "_PAIRWISE_LIMIT", 0)
+    assert bridge_candidates(conn, limit=1000) == pairwise
 
 
 def test_rebuild_with_source_links_is_idempotent(conn, catalog, clouds):
@@ -1638,12 +1897,17 @@ def test_rebuild_with_source_links_is_idempotent(conn, catalog, clouds):
 
 
 def test_linked_hashless_file_joins_a_cross_cloud_group(conn, catalog, clouds):
-    """iCloud copy bridged; its all-five bridge also pulls in the Dropbox and OneDrive copies."""
+    """iCloud copy bridged; its all-five bridge also pulls in the Drive and Dropbox copies, through their strong
+    hashes. The OneDrive copy only shares the QuickXor, so it waits for its own download."""
     i = icloud(catalog, clouds["ic"], "a.bin", mtime=T0)
     d = drive(catalog, clouds["d1"], "a.bin", "A")
     b = dropbox(catalog, clouds["db"], "a.bin", "A")
-    o = onedrive(catalog, clouds["od"], "a.bin", "A")
+    o = onedrive(catalog, clouds["od"], "a.bin", "A", mtime=T0)
     record_bridge(conn, H("A"), source_entry_id=i, source_mtime=T0)
+    rebuild_groups(conn)
+    g = groups(conn)
+    assert g[i] == g[d] == g[b] == min(i, d, b) and g[o] is None
+    record_bridge(conn, H("A"), source_entry_id=o, source_mtime=T0)
     rebuild_groups(conn)
     g = groups(conn)
     assert g[i] == g[d] == g[b] == g[o] == min(i, d, b, o)
@@ -1663,6 +1927,29 @@ def test_hashless_file_with_a_counterpart_is_its_own_candidate(conn, catalog, cl
 def test_hashless_candidate_without_a_counterpart_is_skipped(conn, catalog, clouds):
     icloud(catalog, clouds["ic"], "alone.bin", size=500)
     drive(catalog, clouds["d1"], "other-size.bin", "A", size=501)
+    rebuild_groups(conn)
+    assert bridge_candidates(conn) == []
+
+
+def test_a_hashless_file_with_an_unknown_mtime_is_never_offered(conn, catalog, clouds, fake_hash, tmp_path):
+    """A bridge is tied to a file by size and mtime; with no mtime the download could never link it, so it
+    would be offered (and paid for out of --max-bytes) on every bridge run."""
+    data = b"no usable modification time"
+    fh = fake_hashes(data)
+    catalog.file(clouds["d1"], "a.txt", size=len(data), md5=fh["md5"], sha256=fh["sha256"])
+    i = catalog.file(clouds["ic"], "a.txt", size=len(data))
+    other = catalog.file(clouds["ic"], "b/a.txt", size=len(data), mtime=T0)
+    conn.execute("UPDATE entries SET mtime = NULL WHERE id = ?", (i,))
+    rebuild_groups(conn)
+    assert [c.entry_id for c in bridge_candidates(conn)] == [other]           # not `i`, and not a counterpart of `other`
+    assert [c.unresolved_copies for c in bridge_candidates(conn)] == [1]       # the Drive copy only
+    rc = FakeRclone({("ic:", "a.txt"): data, ("ic:", "b/a.txt"): data})
+    for _ in range(3):                                                         # what Service.bridge does, repeatedly
+        for cand in bridge_candidates(conn):
+            bridge_entry(conn, rc, cand.entry_id, tmp_path)
+        rebuild_groups(conn)
+    assert [path for _, path, _ in rc.calls] == ["b/a.txt"]                   # one download; `i` is never fetched
+    conn.execute("UPDATE entries SET mtime = NULL WHERE id = ?", (other,))
     rebuild_groups(conn)
     assert bridge_candidates(conn) == []
 
@@ -1703,7 +1990,7 @@ def test_hashless_candidates_rank_name_matches_first(conn, catalog, clouds):
 def test_linked_hashless_file_is_no_longer_a_candidate(conn, catalog, clouds, fake_hash, tmp_path):
     data = b"a linked hashless file"
     fh = fake_hashes(data)
-    catalog.file(clouds["d1"], "a.bin", size=len(data), md5=fh["md5"])
+    catalog.file(clouds["d1"], "a.bin", size=len(data), md5=fh["md5"], sha256=fh["sha256"])
     i = catalog.file(clouds["ic"], "a.bin", size=len(data), mtime=T0)
     rebuild_groups(conn)
     assert [c.entry_id for c in bridge_candidates(conn)] == [i]
@@ -1740,7 +2027,7 @@ def test_hashless_bridge_does_not_double_count_other_pairs(conn, catalog, clouds
     data = b"three way class"
     fh = fake_hashes(data)
     i = catalog.file(clouds["ic"], "a.bin", size=len(data), mtime=T0)
-    catalog.file(clouds["d1"], "elsewhere.bin", size=len(data), md5=H("D-ONLY")["md5"])
+    catalog.file(clouds["d1"], "elsewhere.bin", size=len(data), sha256=H("D-ONLY")["sha256"])
     catalog.file(clouds["db"], "other.bin", size=len(data), dropbox=H("B-ONLY")["dropbox"])
     rebuild_groups(conn)
     before = {c.entry_id: c for c in bridge_candidates(conn)}
@@ -1806,7 +2093,7 @@ def test_50k_entry_rebuild_is_fast_and_correct(conn, catalog):
         if c % 3 == 0:
             add("db", c, f"db/{c}/f", dropbox=dbx, ident=("c", c) if c % 6 == 0 else ("db", c))
         if c % 5 == 0:
-            add("od", c, f"od/{c}/f", quickxor=qx, ident=("c", c) if c % 30 == 0 else ("od", c))
+            add("od", c, f"od/{c}/f", quickxor=qx)       # QuickXor identifies nothing: never grouped, bridge or not
         if c % 4 == 0:
             add("ic", c, f"ic/{c}/f")
         if c % 5 == 1:

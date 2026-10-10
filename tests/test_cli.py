@@ -105,9 +105,9 @@ def catalog_db(env):
     conn = db.connect(env.db_path)
     cat = Catalog(conn)
     a, b = cat.remote("alpha"), cat.remote("beta", writable=False)
-    cat.file(a, "Docs/report.pdf", size=100, md5="aa")
-    cat.file(a, "Photos/img1.jpg", size=2048, md5="bb")
-    cat.file(b, "Backup/report copy.pdf", size=100, md5="aa")
+    cat.file(a, "Docs/report.pdf", size=100, sha256="aa")
+    cat.file(a, "Photos/img1.jpg", size=2048, sha256="bb")
+    cat.file(b, "Backup/report copy.pdf", size=100, sha256="aa")
     conn.close()
     return env
 
@@ -425,6 +425,19 @@ def test_scan_one_and_all(run, monkeypatch):
     assert rc == 0 and [c[0][0] for c in calls] == ["alpha", "beta"]
 
 
+def test_scan_says_how_many_items_share_a_name_with_another_file(run, monkeypatch):
+    """Names that differ only in invalid UTF-8 (or two Drive files at one path) are kept as separate, flagged rows."""
+    def fake(self, remote, *, root="", progress=None, force=False):
+        return {"scan_id": 1, "remote": remote, "root": "", "status": "complete", "files": 3, "dirs": 1,
+                "bytes": 2048, "tombstoned": 0, "error": None, "ambiguous": 2}
+    monkeypatch.setattr(Service, "scan", fake)
+    rc, out, _ = run("scan", "alpha")
+    assert rc == 0 and "alpha: 3 files, 1 dirs, 2.0 KiB, 0 no longer present, 2 share a name with another file" in out
+    assert "AMBIGUOUS_PATH" in out
+    rc, out, _ = run("--json", "scan", "alpha")
+    assert json.loads(out)["ambiguous"] == 2
+
+
 def test_scan_all_continues_after_a_failure(run, monkeypatch):
     def fake(self, remote, *, root="", progress=None, force=False):
         if remote == "alpha":
@@ -572,6 +585,21 @@ def test_plan_simulate_exit_code(run, monkeypatch):
     record(monkeypatch, "simulate", sim_report(ok=False, violations=[{"code": "SRC_MISSING", "seq": 1, "message": "gone"}]))
     rc, out, _ = run("plan", "simulate", "7")
     assert rc == 3 and "SRC_MISSING" in out
+
+
+def test_json_output_hides_everything_that_lets_someone_approve(planned, run, env):
+    """digest, approval code and the snapshot it binds to: the MCP server and the REST routes drop them too."""
+    conn = db.connect(env.db_path)
+    try:
+        plan = plans.get_plan(conn, planned, with_ops=False)
+    finally:
+        conn.close()
+    assert plan.digest and plan.snapshot, "the fixture plan must carry both"
+    for argv in (("plan", "show", "1"), ("plan", "list"), ("plan", "simulate", "1")):
+        _, out, _ = run("--json", *argv)
+        assert plan.digest not in out and plans.short_code(plan.digest) not in out, argv
+        for key in ('"digest"', '"approval_code"', '"snapshot"'):
+            assert key not in out, (argv, key)
 
 
 def test_plan_list_show_cancel(planned, run, jrun):

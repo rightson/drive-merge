@@ -339,14 +339,66 @@ def test_cancel_finished_plan_is_400(client, conn):
     assert "cannot cancel" in r.json()["error"]
 
 
-def test_simulate_returns_the_service_report(client, service, conn, monkeypatch):
+def test_simulate_returns_the_service_report_without_the_approval_secrets(client, service, conn, monkeypatch):
     pid = _draft(conn)
-    report = {"ok": False, "violations": [], "approval_code": None}
+    report = {"ok": True, "violations": [], "approval_code": "0123abcd", "digest": "0123abcd" + "e" * 56,
+              "remotes": [{"remote": "gdrive", "digest": "nested"}]}
     calls = _record(monkeypatch, service, "simulate", returns=report)
     r = client.post(f"/v1/plans/{pid}/simulate", headers=AUTH)
     assert r.status_code == 200
-    assert r.json() == report
+    assert r.json() == {"ok": True, "violations": [], "remotes": [{"remote": "gdrive"}]}
     assert calls == [((pid,), {})]
+
+
+# The first 8 characters of the digest ARE the approval code: only the human may read them, so no plan route
+# hands them to a caller that holds just the bearer token (the workspace preview and MCP already withhold them).
+
+SECRET_KEYS = {"digest", "approval_code", "snapshot"}
+
+
+def _secret_keys_in(value) -> set[str]:
+    if isinstance(value, dict):
+        return (SECRET_KEYS & value.keys()).union(*(_secret_keys_in(v) for v in value.values()))
+    if isinstance(value, list):
+        return set().union(*(_secret_keys_in(v) for v in value))
+    return set()
+
+
+def test_scrub_secrets_drops_the_keys_at_any_depth():
+    nested = {"a": [{"digest": "x" * 64, "keep": 1, "deep": {"approval_code": "01234567", "snapshot": {"1": 2}}}],
+              "snapshot": {"1": 2}, "t": ({"approval_code": "z"},), "name": "digest"}
+    assert api.scrub_secrets(nested) == {"a": [{"keep": 1, "deep": {}}], "t": [{}], "name": "digest"}
+
+
+def test_no_plan_route_returns_the_digest_the_approval_code_or_the_snapshot(client, service, conn):
+    pid = _draft(conn)
+    report = service.simulate(pid)
+    assert report["ok"] and report["approval_code"], "the fixture plan must pass, or there is no code to leak"
+    digest = plans.get_plan(conn, pid, with_ops=False).digest
+    code = plans.short_code(digest)
+    new_ops = [{"op": "copy", "src": "gdrive:Docs/budget-2024.pdf", "dst": "dropbox:Docs/copy.pdf"}]
+
+    responses = {
+        "GET /v1/plans/{id}": client.get(f"/v1/plans/{pid}", headers=AUTH),
+        "GET /v1/plans": client.get("/v1/plans", headers=AUTH),
+        "POST /v1/plans/{id}/simulate": client.post(f"/v1/plans/{pid}/simulate", headers=AUTH),
+        "POST /v1/plans": client.post("/v1/plans", headers=AUTH, json={"kind": "manual", "params": {"ops": new_ops}}),
+    }
+    for route, r in responses.items():
+        assert r.status_code in (200, 201), (route, r.text)
+        assert not _secret_keys_in(r.json()), route
+        assert code not in r.text and digest not in r.text, route
+    # the proposal was simulated too, so its response is where a code used to appear for a brand-new plan
+    created = responses["POST /v1/plans"].json()
+    assert created["plan_id"] and created["simulation"]["ok"] is True
+    new_digest = plans.get_plan(conn, created["plan_id"], with_ops=False).digest
+    assert new_digest and new_digest not in responses["POST /v1/plans"].text
+
+    # what a caller needs is still there
+    shown = responses["GET /v1/plans/{id}"].json()
+    assert shown["status"] == "simulated" and shown["simulation"]["ok"] is True and shown["ops_total"] == 2
+    assert [p["id"] for p in responses["GET /v1/plans"].json()["plans"]] == [pid]
+    assert responses["POST /v1/plans/{id}/simulate"].json()["ok"] is True
 
 
 def test_create_plan_returns_201_and_records_api_as_creator(client, service, monkeypatch):
@@ -357,6 +409,16 @@ def test_create_plan_returns_201_and_records_api_as_creator(client, service, mon
     assert r.status_code == 201
     assert r.json() == {"plan_id": 7, "ops": 1}
     assert calls == [(("manual", {"ops": [{"op": "copy"}]}), {"created_by": "api", "title": "Copy budget"})]
+
+
+@pytest.mark.parametrize("claim", [{"draft_id": 1}, {"draft_version": 1}, {"draft_id": 1, "draft_version": 3}])
+def test_create_plan_refuses_params_that_claim_a_workspace_draft(client, conn, claim):
+    """`draft_id` makes the server treat a plan as that draft's preview (and close the draft when it runs):
+    only workspace.preview may write it, so a proposal that carries it is refused and nothing is saved."""
+    ops = [{"op": "copy", "src": "gdrive:Docs/budget-2024.pdf", "dst": "dropbox:Docs/copy.pdf"}]
+    r = client.post("/v1/plans", headers=AUTH, json={"kind": "manual", "params": {"ops": ops, **claim}})
+    assert r.status_code == 400 and "reserved for workspace previews" in r.json()["error"]
+    assert plans.list_plans(conn) == []
 
 
 def test_create_plan_cannot_set_its_own_creator(client, service, monkeypatch):

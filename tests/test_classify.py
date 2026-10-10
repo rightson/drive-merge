@@ -950,3 +950,14 @@ def test_profile_top_lists_are_capped_and_ordered(conn, catalog):
     assert list(mix.categories) == ["photo", "video", "audio", "pdf", "spreadsheet", "presentation"]   # top 6, by count
     assert mix.top_exts == [("jpg", 7), ("mp4", 6), ("mp3", 5), ("pdf", 4), ("xlsx", 3)]
     assert mix.files == 29
+
+
+def test_profile_duplicate_files_ignore_empty_files(conn, catalog):
+    g = catalog.remote("g", "drive")
+    e1 = catalog.file(g, "p1/__init__.py", size=0)
+    e2 = catalog.file(g, "p2/__init__.py", size=0)
+    r1 = catalog.file(g, "p1/real.bin", size=5)
+    r2 = catalog.file(g, "p2/real.bin", size=5)
+    for eid, group in ((e1, 1), (e2, 1), (r1, 2), (r2, 2)):
+        conn.execute("UPDATE entries SET content_group = ? WHERE id = ?", (group, eid))
+    assert {p.path: p.duplicate_files for p in folder_profiles(conn)} == {"p1": 1, "p2": 1}
