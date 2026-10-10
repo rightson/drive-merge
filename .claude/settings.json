@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "deny": [
+      "Bash(drivemerge plan approve:*)",
+      "Bash(drivemerge plan execute:*)",
+      "Bash(drivemerge plan purge:*)",
+      "Bash(drivemerge plan restore:*)",
+      "Bash(*drivemerge plan approve*)",
+      "Bash(*drivemerge plan execute*)",
+      "Bash(*drivemerge plan purge*)",
+      "Bash(*drivemerge plan restore*)",
+      "Bash(rclone delete:*)",
+      "Bash(rclone deletefile:*)",
+      "Bash(rclone purge:*)",
+      "Bash(rclone sync:*)",
+      "Bash(rclone move:*)",
+      "Bash(rclone moveto:*)",
+      "Bash(rclone rmdir:*)",
+      "Bash(rclone rmdirs:*)",
+      "Bash(rclone dedupe:*)",
+      "Bash(rclone cleanup:*)"
+    ]
+  }
+}

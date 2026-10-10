@@ -71,11 +71,13 @@ def parse_config(data: dict) -> Config:
     for r in data.get("remotes", []):
         if r.get("provider", "other") not in providers.PROVIDERS:
             raise ValueError(f"remote {r.get('name')!r}: unknown provider {r.get('provider')!r}")
+        # rclone does not expand '~'; do it for local paths.
+        expand = (lambda p: os.path.expanduser(p) if p else p) if r.get("provider") == "local" else (lambda p: p)
         remotes.append(RemoteConfig(
             name=r["name"],
             provider=r.get("provider", "other"),
-            read=r["read"],
-            write=r.get("write"),
+            read=expand(r["read"]),
+            write=expand(r.get("write")),
             hash_types=tuple(r["hash_types"]) if "hash_types" in r else None,
             extra_args=tuple(r.get("extra_args", ())),
         ))

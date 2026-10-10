@@ -8,4 +8,4 @@ build/
 *.db
 *.db-wal
 *.db-shm
-config.toml
+/config.toml

@@ -91,7 +91,9 @@ class Violation:
       BAD_PATH          empty, absolute, or '..' path segment
       DEPENDENCY        depends_on names a missing or later op
       QUOTA             bytes added exceed the remote's known free space
+      EXPECT_MISMATCH   the op's expect_size no longer matches the catalog (stale plan)
       NOOP              (warning) op changes nothing, e.g. copy onto identical content
+      PROBABLE_ONLY     (warning) delete justified by name+size only; allowed only by policy
     """
 
     code: str

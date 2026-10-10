@@ -83,21 +83,22 @@ CREATE INDEX IF NOT EXISTS entries_rowver   ON entries(row_version);
 -- Full-text search over names and paths. The trigram tokenizer gives
 -- substring search that works for CJK file names (unicode61 does not
 -- segment Chinese/Japanese). Queries shorter than 3 characters fall back to
--- LIKE in search.py.
+-- LIKE in search.py. The name column indexes name_norm (NFC + casefold) so
+-- NFD names written by macOS/iCloud match NFC queries.
 CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(
-    name, path,
+    name_norm, path,
     content = 'entries', content_rowid = 'id',
     tokenize = 'trigram'
 );
 CREATE TRIGGER IF NOT EXISTS entries_fts_ai AFTER INSERT ON entries BEGIN
-    INSERT INTO entries_fts(rowid, name, path) VALUES (new.id, new.name, new.path);
+    INSERT INTO entries_fts(rowid, name_norm, path) VALUES (new.id, new.name_norm, new.path);
 END;
 CREATE TRIGGER IF NOT EXISTS entries_fts_ad AFTER DELETE ON entries BEGIN
-    INSERT INTO entries_fts(entries_fts, rowid, name, path) VALUES ('delete', old.id, old.name, old.path);
+    INSERT INTO entries_fts(entries_fts, rowid, name_norm, path) VALUES ('delete', old.id, old.name_norm, old.path);
 END;
-CREATE TRIGGER IF NOT EXISTS entries_fts_au AFTER UPDATE OF name, path ON entries BEGIN
-    INSERT INTO entries_fts(entries_fts, rowid, name, path) VALUES ('delete', old.id, old.name, old.path);
-    INSERT INTO entries_fts(rowid, name, path) VALUES (new.id, new.name, new.path);
+CREATE TRIGGER IF NOT EXISTS entries_fts_au AFTER UPDATE OF name_norm, path ON entries BEGIN
+    INSERT INTO entries_fts(entries_fts, rowid, name_norm, path) VALUES ('delete', old.id, old.name_norm, old.path);
+    INSERT INTO entries_fts(rowid, name_norm, path) VALUES (new.id, new.name_norm, new.path);
 END;
 
 -- Hashes computed locally from one download of the bytes. Each row links
@@ -112,7 +113,11 @@ CREATE TABLE IF NOT EXISTS hash_bridges (
     sha256          TEXT NOT NULL UNIQUE,
     dropbox         TEXT NOT NULL,
     quickxor        TEXT NOT NULL,
+    -- The entry whose bytes were hashed. For an entry without native hashes
+    -- (iCloud) this link is its only route to an exact identity, valid while
+    -- its size and mtime still equal what was downloaded.
     source_entry_id INTEGER REFERENCES entries(id),
+    source_mtime    TEXT,
     computed_at     TEXT NOT NULL
 );
 
