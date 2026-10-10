@@ -1,10 +1,12 @@
 # drive-merge
 
+**English** | [繁體中文](README.zh-TW.md)
+
 Merge files from Google Drive, Dropbox, OneDrive and iCloud into one place — with deduplication and a dry-run plan before anything moves.
 
 drive-merge runs on your machine. It catalogs **metadata** (never file contents) from every cloud into a local SQLite database via [rclone](https://rclone.org), tells you where each piece of content lives, proves which files are duplicates, proposes a clean folder layout, and — only through simulated, human-approved plans — consolidates everything into one cloud.
 
-設計文件（繁體中文）：[docs/DESIGN.md](docs/DESIGN.md) — architecture, safety model, and the open decisions you can adjust.
+Design documents: [docs/DESIGN.md](docs/DESIGN.md) — architecture, safety model, and the open decisions you can adjust — and [docs/WORKSPACE.md](docs/WORKSPACE.md) — the visual workspace. Traditional Chinese versions exist as `docs/*.zh-TW.md`.
 
 ## Why it is built this way
 
