@@ -2,7 +2,8 @@
 
 Every command goes through `service.Service` (plus config loading). Commands
 that change a cloud (`plan approve|execute|restore|purge`) are human-only and
-share one gate, `_gate`.
+share one gate, `_gate`. `plan reset` only fixes a plan's state in the catalog,
+so it is not gated.
 
 Exit codes: 0 ok, 1 error, 2 usage error or refused (not a human at a
 terminal), 3 simulation has violations, 130 interrupted.
@@ -235,19 +236,26 @@ def format_report(sim: dict | None, *, warnings_shown: int = 0, plan_id: int | s
         return [f"Simulation: none yet (run `drivemerge plan simulate {plan_id}`)"]
     violations = sim.get("violations") or []
     warnings = sim.get("warnings") or []
+    # The report keeps only its first violations and warnings; the totals count them all.
+    v_total = max(sim.get("violations_total") or 0, len(violations))
+    w_total = max(sim.get("warnings_total") or 0, len(warnings))
     lines = ["Simulation: OK, no violations" if sim.get("ok")
-             else f"Simulation: FAILED, {len(violations)} violation(s)"]
-    for v in violations[:MAX_VIOLATIONS_SHOWN]:
+             else f"Simulation: FAILED, {_n(v_total)} violation(s)"]
+    shown = violations[:MAX_VIOLATIONS_SHOWN]
+    for v in shown:
         where = f"op {v['seq']}" if v.get("seq") else "plan"
         lines.append(f"  {v.get('code', '?'):<18} {where:<7} {v.get('message', '')}")
-    if len(violations) > MAX_VIOLATIONS_SHOWN:
-        lines.append(f"  ... and {len(violations) - MAX_VIOLATIONS_SHOWN} more")
-    lines.append(f"Warnings: {len(warnings)}")
-    for w in warnings[:warnings_shown]:
+    if v_total > len(shown):
+        lines.append(f"  ... and {_n(v_total - len(shown))} more")
+        if sim.get("violations_by_code"):
+            lines.append("  by code: " + _by_code(sim["violations_by_code"]))
+    lines.append(f"Warnings: {_n(w_total)}")
+    shown = warnings[:warnings_shown]
+    for w in shown:
         where = f"op {w['seq']}" if w.get("seq") else "plan"
         lines.append(f"  {w.get('code', '?'):<18} {where:<7} {w.get('message', '')}")
-    if warnings_shown and len(warnings) > warnings_shown:
-        lines.append(f"  ... and {len(warnings) - warnings_shown} more")
+    if warnings_shown and w_total > len(shown):
+        lines.append(f"  ... and {_n(w_total - len(shown))} more")
     if any((sim.get("op_counts") or {}).values()):
         lines.append("Ops: " + ", ".join(f"{n} {k}" for k, n in sorted(sim["op_counts"].items()) if n))
     remotes = sim.get("remotes") or []
@@ -262,6 +270,11 @@ def format_report(sim: dict | None, *, warnings_shown: int = 0, plan_id: int | s
     lines.append(f"Contents: {_n(sim.get('contents_before'))} -> {_n(sim.get('contents_after'))}"
                  f", lost: {_n(sim.get('contents_lost'))}")
     return lines
+
+
+def _by_code(counts: dict | None) -> str:
+    """'SRC_MISSING 1,500, DST_EXISTS 12', most frequent first."""
+    return ", ".join(f"{code} {_n(n)}" for code, n in sorted((counts or {}).items(), key=lambda kv: (-kv[1], kv[0])))
 
 
 def _short(value: Any) -> str:
@@ -800,6 +813,17 @@ def cmd_plan_simulate(ctx: Ctx) -> int:
     return EXIT_VIOLATIONS if _violations(sim) else EXIT_OK
 
 
+def cmd_plan_reset(ctx: Ctx) -> int:
+    """Free a plan that a crashed run left 'executing'. Not gated: it never touches a cloud."""
+    pid = ctx.args.id
+    plans.reset_stuck(ctx.service.conn, pid)
+    if ctx.json:
+        _dump({"plan_id": pid, "status": "failed"})
+    else:
+        print(f"Plan {pid} reset to failed. It resumes where it stopped: drivemerge plan execute {pid}")
+    return EXIT_OK
+
+
 def cmd_plan_cancel(ctx: Ctx) -> int:
     ctx.service.cancel(ctx.args.id)
     if ctx.json:
@@ -856,6 +880,8 @@ def cmd_plan_execute(ctx: Ctx) -> int:
                 "execution is disabled. To allow drive-merge to change your clouds, set "
                 f"`execution_enabled = true` under [safety] in {ctx.config_path}, then run this again")
         plan = ctx.service.plan(pid, ops_limit=10)
+        if plan.get("status") in ("approved", "failed"):
+            plans.require_current(ctx.service.conn, pid)  # a failed plan whose catalog changed needs a new plan
         return Confirmation(_summary(ctx, plan), f'This will change your clouds. Type "execute {pid}" to run plan {pid}: ',
                             f"execute {pid}")
 
@@ -1091,6 +1117,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = add(plan, "simulate", cmd_plan_simulate, "re-run the simulation")
     p.add_argument("id", type=int, metavar="ID")
     p = add(plan, "cancel", cmd_plan_cancel, "cancel a plan that has not run")
+    p.add_argument("id", type=int, metavar="ID")
+    p = add(plan, "reset", cmd_plan_reset,
+            "mark a plan left 'executing' by a crashed run as failed, if no process still runs it")
     p.add_argument("id", type=int, metavar="ID")
 
     p = add(plan, "approve", cmd_plan_approve, "approve a simulated plan (human, interactive terminal only)")

@@ -5,7 +5,7 @@ import * as api from './api.js';
 import { Icon } from './icons.js';
 import { Modal } from './ui.js';
 import { AppCtx } from './ctx.js';
-import { errorText, fmtBytes, fmtLoc, fmtNum, locationInMessage, sleep } from './util.js';
+import { describeAction, errorText, fmtBytes, fmtLoc, fmtNum, locationInMessage, sleep, staleText } from './util.js';
 
 const KIND_ICON = { move: 'arrow', 'copy+delete': 'cloud', merge: 'merge', dedupe: 'copy' };
 
@@ -40,16 +40,35 @@ function Card({ id, label, value, sub, tone }) {
   </div>`;
 }
 
-function Problem({ code, message, loc, onReveal, tone }) {
-  const title = t(`viol.${code}.title`, null, code);
-  const text = t(`viol.${code}.text`, null, '');
-  return html`<li class=${'problem problem-' + tone} data-testid=${tone === 'warn' ? 'warning' : 'violation'} data-code=${code}>
-    <div class="problem-head"><code class="code-pill">${code}</code><strong>${title}</strong>
+/**
+ * One violation, warning or conflict. The head and the explanation are in the person's language;
+ * the code and the engine's own English sentence stay below as secondary monospace text, for reports and bug trackers.
+ */
+function Problem({ ns, code, message, loc, onReveal, tone, testid, children }) {
+  const title = t(`${ns}.${code}.title`, null, code);
+  const text = t(`${ns}.${code}.text`, null, '');
+  return html`<li class=${'problem problem-' + tone} data-testid=${testid} data-code=${code}>
+    <div class="problem-head"><strong>${title}</strong>
       ${loc && html`<button class="link" data-testid="reveal-link" onClick=${() => onReveal(loc)}>
         <${Icon} name="jump" size=${12} /> ${t('prev.reveal')}</button>`}</div>
     ${text && html`<p class="problem-text">${text}</p>`}
-    ${message && html`<p class="problem-detail">${message}</p>`}
+    <p class="problem-detail" data-testid="problem-raw"><code class="code-pill">${code}</code>${message ? ` ${message}` : ''}</p>
+    ${children}
   </li>`;
+}
+
+/** Steps that a rescan left with nothing to act on: named, struck through, and explained. */
+function StaleBox({ actions }) {
+  if (!actions.length) return null;
+  return html`<section class="stale-box" data-testid="stale-actions">
+    <h3><${Icon} name="alert" size=${16} /> ${t('prev.staleTitle', { n: actions.length })}</h3>
+    <p>${t('prev.staleText')}</p>
+    <ul class="stale-list">${actions.map((a) => html`<li key=${a.id} data-testid="stale-action" data-action-id=${a.id}
+      data-code=${a.stale_reason && a.stale_reason.code}>
+      <span class="seq">#${a.seq}</span>
+      <div><div class="stale-title">${describeAction(a).title}</div>
+        <div class="stale-why">${staleText(a.stale_reason)}</div></div></li>`)}</ul>
+  </section>`;
 }
 
 export function PreviewModal({ draft, onClose }) {
@@ -86,6 +105,7 @@ export function PreviewModal({ draft, onClose }) {
   const violations = sim.violations || [];
   const warnings = sim.warnings || [];
   const conflicts = (data && data.conflicts) || [];
+  const staleActions = (data && data.stale_actions) || [];
   const summary = (data && data.summary) || {};
   const isOk = data ? (data.ok !== undefined ? !!data.ok : !!sim.ok && conflicts.length === 0) : false;
   const problems = violations.length + conflicts.length;
@@ -251,7 +271,9 @@ export function PreviewModal({ draft, onClose }) {
       ${phase === 'loading' && html`<div class="center-msg" data-testid="preview-loading"><span class="spinner"></span> ${t('prev.loading')}</div>`}
       ${phase === 'error' && html`<div class="note error" data-testid="preview-error">${error}
         <button class="btn btn-small" onClick=${run}>${t('common.retry')}</button></div>`}
-      ${phase === 'empty' && html`<div class="center-msg" data-testid="preview-empty">${t('prev.nothing')}</div>`}
+      ${phase === 'empty' && html`<div class="center-msg" data-testid="preview-empty">
+        ${staleActions.length ? t('prev.nothingStale') : t('prev.nothing')}</div>
+        <${StaleBox} actions=${staleActions} />`}
       ${stale && html`<div class="banner banner-warn" data-testid="stale-banner"><${Icon} name="alert" size=${16} />
         <span>${t('prev.stale')}</span><button class="btn btn-small" data-testid="repreview" onClick=${run}>${t('prev.repreview')}</button></div>`}
       ${progressBox}
@@ -273,17 +295,17 @@ export function PreviewModal({ draft, onClose }) {
           <div><strong>${isOk ? t('prev.simOk') : t('prev.simBad', { n: problems || 1 })}</strong>
             <span class="muted">${isOk ? t('prev.simOkHint') : t('prev.simBadHint')}</span></div>
         </section>
+        <${StaleBox} actions=${staleActions} />
         ${violations.length > 0 && html`<ul class="problems" data-testid="violation-list">
-          ${violations.map((v, i) => html`<${Problem} key=${i} tone="bad" code=${v.code} message=${v.message}
+          ${violations.map((v, i) => html`<${Problem} key=${i} ns="viol" tone="bad" testid="violation" code=${v.code} message=${v.message}
             loc=${locationInMessage(v.message, remoteNames)} onReveal=${reveal} />`)}</ul>`}
         ${conflicts.length > 0 && html`<h3 class="section-title">${t('prev.conflictList')}</h3><ul class="problems" data-testid="conflict-list">
-          ${conflicts.map((c, i) => html`<li key=${i} class="problem problem-bad" data-testid="conflict" data-code=${c.code}>
-            <div class="problem-head"><code class="code-pill">${c.code}</code><strong>${t(`viol.${c.code}.title`, null, t('prev.conflictOne'))}</strong>
-              ${c.to && html`<button class="link" data-testid="reveal-link" onClick=${() => reveal(c.to)}><${Icon} name="jump" size=${12} /> ${t('prev.reveal')}</button>`}</div>
-            <p class="problem-detail">${c.reason}</p>
-            <p class="problem-path">${anyLoc(c.from)} → ${anyLoc(c.to)}${c.with ? ` (${t('prev.with')} ${anyLoc(c.with)})` : ''}</p></li>`)}</ul>`}
+          ${conflicts.map((c, i) => html`<${Problem} key=${i} ns="conflict" tone="bad" testid="conflict" code=${c.code} message=${c.reason}
+            loc=${c.to} onReveal=${reveal}>
+            <p class="problem-path" data-testid="conflict-path">${anyLoc(c.from)} → ${anyLoc(c.to)}${c.with ? ` (${t('prev.with')} ${anyLoc(c.with)})` : ''}</p>
+          <//>`)}</ul>`}
         ${warnings.length > 0 && html`<details class="warnings" data-testid="warning-list"><summary>${t('prev.warnings', { n: warnings.length })}</summary>
-          <ul class="problems">${warnings.map((w, i) => html`<${Problem} key=${i} tone="warn" code=${w.code} message=${w.message} />`)}</ul></details>`}
+          <ul class="problems">${warnings.map((w, i) => html`<${Problem} key=${i} ns="viol" tone="warn" testid="warning" code=${w.code} message=${w.message} />`)}</ul></details>`}
         ${(sim.remotes || []).length > 0 && html`<h3 class="section-title">${t('prev.perCloud')}</h3>
           <table class="table" data-testid="cloud-table"><thead><tr>
             <th>${t('prev.cloud')}</th><th class="num">${t('prev.filesBefore')}</th><th class="num">${t('prev.filesAfter')}</th>

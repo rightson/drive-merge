@@ -62,6 +62,13 @@ export function describeAction(a) {
   return { title: t('act.move', { n: items.length, dst }), detail };
 }
 
+/** Why a staged step no longer fits the catalog, in words: its `stale_reason` ({code, message, items}). */
+export function staleText(reason) {
+  if (!reason) return '';
+  const items = (reason.items || []).map(fmtLoc).join('、');
+  return t(`stale.${reason.code}`, { items }, reason.message);
+}
+
 export const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export function todayStamp() {

@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from importlib import resources
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2          # 2: hash_bridges.source_mtime, FTS on name_norm, bridge_sources
 DEFAULT_QUARANTINE_DIR = ".drive-merge-quarantine"
 
 
@@ -33,15 +33,80 @@ def connect(path: str | Path) -> sqlite3.Connection:
     return conn
 
 
+# Columns added after the first release. CREATE TABLE IF NOT EXISTS (schema.sql) never touches an
+# existing table, so a catalog from an older release gets them here.
+_ADDED_COLUMNS = (("hash_bridges", "source_mtime", "TEXT"),)
+
+
 def migrate(conn: sqlite3.Connection) -> None:
+    """Create the schema, or bring a catalog from an older release up to date (idempotent).
+
+    schema.sql only creates what is missing, so an older catalog is first stripped of what it
+    cannot add (see _upgrade_before) and afterwards given the data the new objects need.
+    meta.schema_version is written last: a crash in between just repeats the steps.
+    """
     sql = resources.files("drivemerge").joinpath("schema.sql").read_text(encoding="utf-8")
+    current = _schema_version(conn)
+    if current is not None and current > SCHEMA_VERSION:
+        raise RuntimeError(f"catalog has schema version {current}, newer than this drive-merge ({SCHEMA_VERSION})")
+    upgrading = current is not None and current < SCHEMA_VERSION
+    if upgrading:
+        _upgrade_before(conn)
     conn.executescript(sql)
-    conn.execute(
-        "INSERT INTO meta(key, value) VALUES ('schema_version', ?) "
-        "ON CONFLICT(key) DO NOTHING",
-        (str(SCHEMA_VERSION),),
-    )
+    if upgrading:
+        _upgrade_after(conn)
+    elif current is None:
+        conn.execute("INSERT INTO meta(key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO NOTHING",
+                     (str(SCHEMA_VERSION),))
     conn.execute("INSERT INTO meta(key, value) VALUES ('row_version', '0') ON CONFLICT(key) DO NOTHING")
+
+
+def _schema_version(conn: sqlite3.Connection) -> int | None:
+    """The version a catalog records, None for a file that has none yet."""
+    try:
+        row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+    except sqlite3.OperationalError:               # no meta table: a new file
+        return None
+    return None if row is None else int(row[0])
+
+
+def _columns(conn: sqlite3.Connection, table: str) -> list[str]:
+    """Column names of a table or virtual table ([] when it does not exist)."""
+    return [r[1] for r in conn.execute(f"PRAGMA table_info({table})")]
+
+
+def _upgrade_before(conn: sqlite3.Connection) -> None:
+    """Add missing columns and drop the full-text index when it still covers `name` instead of `name_norm`.
+
+    The index and its triggers are recreated from schema.sql, then refilled by _upgrade_after;
+    the meta flag is written in the same transaction as the drop so that refill cannot be lost.
+    Everything is re-checked inside the transaction, so two processes upgrading at once cannot both ALTER.
+    """
+    with transaction(conn):
+        for table, column, decl in _ADDED_COLUMNS:
+            cols = _columns(conn, table)
+            if cols and column not in cols:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+        fts = _columns(conn, "entries_fts")
+        if fts and "name_norm" not in fts:
+            for trigger in ("entries_fts_ai", "entries_fts_ad", "entries_fts_au"):
+                conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+            conn.execute("DROP TABLE entries_fts")
+            conn.execute("INSERT INTO meta(key, value) VALUES ('fts_rebuild', '1') "
+                         "ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+
+
+def _upgrade_after(conn: sqlite3.Connection) -> None:
+    """Fill what schema.sql just created from the old data, then record the new version."""
+    with transaction(conn):
+        if conn.execute("SELECT 1 FROM meta WHERE key = 'fts_rebuild'").fetchone():
+            conn.execute("INSERT INTO entries_fts(entries_fts) VALUES ('rebuild')")
+            conn.execute("DELETE FROM meta WHERE key = 'fts_rebuild'")
+        conn.execute(                                  # the one source slot of version 1 becomes a row
+            "INSERT OR IGNORE INTO bridge_sources(bridge_id, entry_id, size, mtime) "
+            "SELECT id, source_entry_id, size, source_mtime FROM hash_bridges WHERE source_entry_id IS NOT NULL")
+        conn.execute("INSERT INTO meta(key, value) VALUES ('schema_version', ?) "
+                     "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (str(SCHEMA_VERSION),))
 
 
 def next_row_version(conn: sqlite3.Connection) -> int:
@@ -76,6 +141,26 @@ class transaction:
             self.conn.execute("COMMIT")
         else:
             self.conn.execute("ROLLBACK")
+
+
+class savepoint:
+    """`with savepoint(conn):` — all-or-nothing writes that also work inside a `transaction` (or alone).
+
+    Rolls back to the start of the block when it raises; the exception propagates.
+    """
+
+    def __init__(self, conn: sqlite3.Connection, name: str = "dm_savepoint"):
+        self.conn = conn
+        self.name = name
+
+    def __enter__(self) -> sqlite3.Connection:
+        self.conn.execute(f"SAVEPOINT {self.name}")
+        return self.conn
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if exc_type is not None:
+            self.conn.execute(f"ROLLBACK TO {self.name}")
+        self.conn.execute(f"RELEASE {self.name}")
 
 
 def remote_id(conn: sqlite3.Connection, name: str) -> int:

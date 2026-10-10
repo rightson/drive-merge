@@ -4,7 +4,7 @@ import { t } from './i18n.js';
 import * as api from './api.js';
 import { Icon } from './icons.js';
 import { AppCtx } from './ctx.js';
-import { describeAction, errorText, fmtBytes, fmtLoc, fmtNum } from './util.js';
+import { describeAction, errorText, fmtBytes, fmtLoc, fmtNum, staleText } from './util.js';
 
 const SUGGESTION_NOTE = /^(related|duplicates):[0-9a-f]+$/i;
 
@@ -25,12 +25,16 @@ function StagedItem({ a, undone }) {
   const ctx = useContext(AppCtx);
   const d = describeAction(a);
   const note = a.note && !SUGGESTION_NOTE.test(a.note) ? a.note : a.note ? t('staged.fromSuggestion') : '';
-  return html`<li class=${'staged-item' + (undone ? ' undone' : '')} data-testid=${undone ? 'staged-item-undone' : 'staged-item'}
-    data-action-id=${a.id} data-seq=${a.seq} data-created-by=${a.created_by}>
+  const stale = !undone && !!a.stale;
+  return html`<li class=${'staged-item' + (undone ? ' undone' : '') + (stale ? ' stale' : '')}
+    data-testid=${undone ? 'staged-item-undone' : 'staged-item'}
+    data-action-id=${a.id} data-seq=${a.seq} data-created-by=${a.created_by} data-stale=${stale ? 'true' : 'false'}>
     <span class="seq">#${a.seq}</span>
     <div class="staged-main">
       <button class="staged-title" title=${t('staged.reveal')} onClick=${() => ctx.reveal('right', a.dst)}>${d.title}</button>
       ${d.detail && html`<div class="staged-detail">${d.detail}</div>`}
+      ${stale && html`<div class="staged-why" data-testid="staged-stale" data-code=${a.stale_reason && a.stale_reason.code}>
+        <${Icon} name="alert" size=${13} /><span><strong class="badge badge-stale">${t('stale.badge')}</strong>${staleText(a.stale_reason)} ${t('stale.remove')}</span></div>`}
       ${note && html`<div class="staged-note">${note}</div>`}
     </div>
     ${a.created_by === 'mcp' && html`<span class="badge badge-claude" data-testid="claude-badge"
@@ -57,6 +61,8 @@ export function StagedDrawer({ draft, onClose }) {
     ${sum.moved_files > 0 && html`<p class="drawer-summary" data-testid="staged-summary">
       ${t('staged.summary', { files: fmtNum(sum.moved_files), bytes: fmtBytes(sum.moved_bytes) })}
       ${sum.cross_remote_bytes > 0 && ` ${t('staged.summaryCross', { bytes: fmtBytes(sum.cross_remote_bytes) })}`}</p>`}
+    ${sum.stale_actions > 0 && html`<p class="drawer-stale" data-testid="staged-stale-summary">
+      <${Icon} name="alert" size=${14} /> ${t('staged.staleSummary', { n: sum.stale_actions })}</p>`}
     ${active.length === 0 && html`<p class="empty-hint">${t('staged.empty')}</p>`}
     <ol class="staged-list" data-testid="staged-list">
       ${active.map((a) => html`<${StagedItem} key=${a.id} a=${a} />`)}

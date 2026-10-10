@@ -14,7 +14,7 @@ from collections import Counter
 
 import pytest
 
-from drivemerge import plans, simulate
+from drivemerge import db, plans, simulate
 from drivemerge import workspace as ws
 from drivemerge.workspace import WorkspaceError
 
@@ -118,7 +118,8 @@ def test_draft_lifecycle(conn):
     d = ws.create_draft(conn, "  my plan ")
     assert d["title"] == "my plan" and d["status"] == "open" and d["version"] == 0
     assert d["actions"] == [] and not d["undo_available"] and not d["redo_available"]
-    assert d["summary"] == {"moved_files": 0, "moved_bytes": 0, "cross_remote_bytes": 0, "remotes_touched": []}
+    assert d["summary"] == {"moved_files": 0, "moved_bytes": 0, "cross_remote_bytes": 0, "remotes_touched": [],
+                            "stale_actions": 0}
     assert ws.create_draft(conn, "   ")["title"] == "Untitled"
     other = ws.create_draft(conn, "other")["id"]
     assert [x["id"] for x in ws.list_drafts(conn)] == [other, d["id"] + 1, d["id"]]      # newest first
@@ -225,7 +226,7 @@ def test_drag_a_into_b_then_b_into_c(world):
     assert info["empty_dirs_left"] == 2 and info["dedupes"] == 0 and info["conflicts"] == []
     assert all(f"draft #{d}" in o.reason for o in ops)
     assert ws.get_draft(conn, d)["summary"] == {"moved_files": 2, "moved_bytes": 7, "cross_remote_bytes": 0,
-                                                "remotes_touched": ["gdrive"]}
+                                                "remotes_touched": ["gdrive"], "stale_actions": 0}
     assert sim(conn, ops).ok
 
 
@@ -266,7 +267,7 @@ def test_dragging_away_and_back_is_a_net_noop(world):
     mv(conn, d, "gdrive:A/zz.txt", "gdrive:B", new_name="z.txt")
     ops, info = ws.build_ops(conn, d)
     assert ops == [] and info["changes"] == [] and info["empty_dirs_left"] == 0
-    assert ws.preview(conn, d) == {"plan_id": None, "message": "nothing to do"}
+    assert ws.preview(conn, d) == {"plan_id": None, "message": "nothing to do", "stale_actions": []}
     assert ws.get_draft(conn, d)["summary"]["moved_files"] == 0
     for p, items in before.items():
         after = ls(conn, p, d)
@@ -649,6 +650,94 @@ def test_warnings(world):
     assert not ws.preview(conn, d)["simulation"]["ok"]
 
 
+# ------------------------------------------------------------------ quarantine
+
+Q = ".drive-merge-quarantine"
+
+
+def test_nothing_is_staged_out_of_into_or_around_the_quarantine_folder(world):
+    conn, cat, g, x = world
+    put(cat, g, "A/f.txt", group=1)
+    put(cat, g, "A/g.txt", group=2)
+    put(cat, g, f"{Q}/7/A/old.txt", group=3)
+    put(cat, x, f"{Q}/7/B/old2.txt", group=4)
+    cat.dir(g, "B")
+    d = new_draft(conn)
+
+    refuse(conn, d, "QUARANTINE", f"gdrive:{Q}/7/A/old.txt", "gdrive:B")          # out of it: a file
+    refuse(conn, d, "QUARANTINE", f"gdrive:{Q}/7", "gdrive:B")                    # a folder inside
+    refuse(conn, d, "QUARANTINE", f"gdrive:{Q}", "gdrive:B")                      # the folder itself
+    refuse(conn, d, "QUARANTINE", f"gdrive:{Q}/7/A/old.txt", f"gdrive:{Q}/7/A", new_name="renamed.txt")
+    refuse(conn, d, "QUARANTINE", ["gdrive:A/f.txt", f"gdrive:{Q}/7/A/old.txt"], "gdrive:B")   # one bad item spoils all
+    refuse(conn, d, "QUARANTINE", "gdrive:A/f.txt", f"gdrive:{Q}")                # into it
+    refuse(conn, d, "QUARANTINE", "gdrive:A", f"gdrive:{Q}/7/A")
+    refuse(conn, d, "QUARANTINE", "gdrive:A/g.txt", "gdrive:", new_name=Q)        # renamed to its name: it would land there
+    refuse(conn, d, "QUARANTINE", "gdrive:A/f.txt", f"dropbox:{Q}/7")             # another cloud's quarantine as well
+    refuse(conn, d, "QUARANTINE", f"dropbox:{Q}/7/B/old2.txt", "gdrive:B")
+    with pytest.raises(WorkspaceError) as e:
+        mkdir(conn, d, "gdrive:", Q)
+    assert e.value.code == "QUARANTINE"
+    with pytest.raises(WorkspaceError) as e:
+        mkdir(conn, d, f"gdrive:{Q}/7", "mine")
+    assert e.value.code == "QUARANTINE"
+    assert "restore" in str(e.value) and "command line" in str(e.value)
+    assert ws.get_draft(conn, d)["actions"] == []
+
+    # everything else still works, including names that merely start like the quarantine folder
+    mv(conn, d, "gdrive:A/f.txt", "gdrive:B")
+    mv(conn, d, "gdrive:A/g.txt", "gdrive:", new_name=Q + "-not")
+    mkdir(conn, d, "gdrive:", Q[1:])
+    assert [o.dst_path for o in ws.build_ops(conn, d)[0]] == ["B/f.txt", Q + "-not"]
+
+
+def test_a_case_insensitive_remote_knows_the_quarantine_folder_by_any_casing(world):
+    conn, cat, g, x = world
+    put(cat, x, "A/f.txt", group=1)
+    d = new_draft(conn)
+    refuse(conn, d, "QUARANTINE", "dropbox:A/f.txt", "dropbox:" + Q.upper())
+    refuse(conn, d, "QUARANTINE", "dropbox:A/f.txt", "dropbox:", new_name=Q.title())
+    put(cat, g, "A/f.txt", group=2)                         # gdrive is case sensitive: another folder
+    mv(conn, d, "gdrive:A/f.txt", "gdrive:", new_name=Q.upper())
+
+
+def test_the_quarantine_folder_follows_the_configured_name_and_a_nested_one_pins_its_parents(world):
+    conn, cat, g, _ = world
+    put(cat, g, "A/f.txt", group=1)
+    put(cat, g, "keep/trash/3/x.txt", group=2)
+    put(cat, g, f"{Q}/9/y.txt", group=3)
+    cat.dir(g, "B")
+    db.set_quarantine_dir(conn, "keep/trash")
+    d = new_draft(conn)
+    refuse(conn, d, "QUARANTINE", "gdrive:keep/trash/3/x.txt", "gdrive:B")
+    refuse(conn, d, "QUARANTINE", "gdrive:A/f.txt", "gdrive:keep/trash")
+    refuse(conn, d, "QUARANTINE", "gdrive:keep", "gdrive:B")                        # it would carry the quarantine along
+    mv(conn, d, f"gdrive:{Q}/9/y.txt", "gdrive:B")                                  # not the quarantine folder any more
+    mv(conn, d, "gdrive:A/f.txt", "gdrive:keep")
+    db.set_quarantine_dir(conn, "")                                                  # no quarantine at all
+    mv(conn, d, "gdrive:keep/trash/3/x.txt", "gdrive:B")
+
+
+def test_listings_flag_the_quarantine_folder_and_everything_in_it(world):
+    conn, cat, g, x = world
+    put(cat, g, "A/f.txt", group=1)
+    put(cat, g, f"{Q}/7/A/old.txt", group=2)
+    put(cat, x, "A/f.txt", group=3)
+    refresh_stats(conn)
+    d = new_draft(conn)
+    for draft in (None, d):
+        top = ls(conn, "gdrive:", draft)
+        assert (top[Q]["quarantine"], top[Q]["quarantine_root"]) == (True, True)
+        assert (top["A"]["quarantine"], top["A"]["quarantine_root"]) == (False, False)
+        inside = ls(conn, f"gdrive:{Q}", draft)["7"]
+        assert (inside["quarantine"], inside["quarantine_root"]) == (True, False)
+        assert ls(conn, f"gdrive:{Q}/7/A", draft)["old.txt"]["quarantine"] is True
+        assert ls(conn, "dropbox:", draft)["A"]["quarantine"] is False
+    assert ls(conn, "gdrive:", d, view="before")[Q]["quarantine_root"] is True
+    assert all(not n["quarantine"] and not n["quarantine_root"] for n in ws.roots(conn, draft_id=d))
+    mv(conn, d, "gdrive:A", "dropbox:")
+    assert not ls(conn, "dropbox:", d)["A"]["quarantine"]
+
+
 # ----------------------------------------------------------------------- mkdir
 
 
@@ -748,7 +837,7 @@ def test_cross_remote_move_is_copy_then_delete_with_the_copy_as_witness(world):
     assert [o.depends_on for o in ops] == [None, None, None, 1, 2, 3]
     assert [(c["kind"], c["files"], c["bytes"]) for c in info["changes"]] == [("copy+delete", 3, 60)]
     assert ws.get_draft(conn, d)["summary"] == {"moved_files": 3, "moved_bytes": 60, "cross_remote_bytes": 60,
-                                                "remotes_touched": ["dropbox", "gdrive"]}
+                                                "remotes_touched": ["dropbox", "gdrive"], "stale_actions": 0}
     out = ws.preview(conn, d)
     assert out["simulation"]["ok"] and out["simulation"]["bytes_cross_remote"] == 60
     assert out["simulation"]["op_counts"] == {"copy": 3, "move": 0, "delete": 3}
@@ -1018,6 +1107,162 @@ def test_redo_undoes_later_actions_that_a_rescan_made_invalid(world):
     assert [(o.src_path, o.dst_path) for o in ws.build_ops(conn, d)[0]] == [("A/f.txt", "B/f.txt")]
 
 
+# ---------------------------------------------------------------- stale actions
+
+
+def stale_of(conn, d) -> dict[int, dict | None]:
+    return {a["id"]: a["stale_reason"] for a in ws.get_draft(conn, d)["actions"] if a["stale"]}
+
+
+def test_a_rescan_that_removes_a_source_makes_its_action_stale_not_silent(world):
+    conn, cat, g, _ = world
+    put(cat, g, "A/f.txt", size=3, group=1)
+    put(cat, g, "A/g.txt", size=4, group=2)
+    cat.dir(g, "B")
+    cat.dir(g, "C")
+    d = new_draft(conn)
+    a1 = mv(conn, d, "gdrive:A/f.txt", "gdrive:B")["action"]
+    a2 = mv(conn, d, "gdrive:A/g.txt", "gdrive:C")["action"]
+    assert not a1["stale"] and a1["stale_reason"] is None           # nothing is wrong at staging time
+    assert stale_of(conn, d) == {} and ws.get_draft(conn, d)["summary"]["stale_actions"] == 0
+
+    conn.execute("UPDATE entries SET present = 0 WHERE path = 'A/f.txt'")           # a rescan: f.txt is gone
+    st = ws.get_draft(conn, d)
+    assert [a["stale"] for a in st["actions"]] == [True, False]
+    why = st["actions"][0]["stale_reason"]
+    assert why["code"] == "SRC_NOT_FOUND" and why["items"] == [{"remote": "gdrive", "path": "A/f.txt"}]
+    assert "gdrive:A/f.txt" in why["message"]
+    assert st["actions"][1]["stale_reason"] is None
+    assert st["summary"]["stale_actions"] == 1 and st["summary"]["moved_files"] == 1   # g.txt still counts
+
+    out = ws.preview(conn, d)
+    assert [(a["id"], a["seq"], a["stale"]) for a in out["stale_actions"]] == [(a1["id"], 1, True)]
+    assert out["stale_actions"][0]["stale_reason"]["code"] == "SRC_NOT_FOUND"
+    assert out["stale_actions"][0]["items"] == [{"remote": "gdrive", "path": "A/f.txt"}]       # self-contained
+    assert out["summary"]["stale_actions"] == 1
+    assert out["ok"] is True and out["summary"]["ops"] == {"move": 1, "copy": 0, "delete": 0}
+    assert [(c["from"]["path"], c["to"]["path"]) for c in out["changes"]] == [("A/g.txt", "C/g.txt")]
+    assert a2["id"] not in {a["id"] for a in out["stale_actions"]}
+
+    conn.execute("UPDATE entries SET present = 1 WHERE path = 'A/f.txt'")           # the file is back: not stale
+    assert stale_of(conn, d) == {}
+
+
+def test_only_the_vanished_items_of_a_multi_item_action_are_named(world):
+    conn, cat, g, _ = world
+    for i, n in enumerate("abc"):
+        put(cat, g, f"A/{n}.txt", group=i + 1)
+    cat.dir(g, "B")
+    d = new_draft(conn)
+    mv(conn, d, ["gdrive:A/a.txt", "gdrive:A/b.txt", "gdrive:A/c.txt"], "gdrive:B")
+    conn.execute("UPDATE entries SET present = 0 WHERE path IN ('A/a.txt', 'A/c.txt')")
+    (why,) = stale_of(conn, d).values()
+    assert why["items"] == [{"remote": "gdrive", "path": "A/a.txt"}, {"remote": "gdrive", "path": "A/c.txt"}]
+    assert why["message"].count("gdrive:A/") == 2 and "b.txt" not in why["message"]
+    assert [(o.src_path, o.dst_path) for o in ws.build_ops(conn, d)[0]] == [("A/b.txt", "B/b.txt")]
+
+
+def test_an_action_that_built_on_a_stale_one_is_stale_too(world):
+    conn, cat, g, _ = world
+    put(cat, g, "X/z.txt", group=1)
+    put(cat, g, "Keep/k.txt", group=2)
+    cat.dir(g, "Y")
+    cat.dir(g, "W")
+    d = new_draft(conn)
+    mv(conn, d, "gdrive:X", "gdrive:Y")
+    mv(conn, d, "gdrive:Y/X/z.txt", "gdrive:W")           # lives in the folder the first step brought
+    mv(conn, d, "gdrive:Keep/k.txt", "gdrive:W")
+    conn.execute("UPDATE entries SET present = 0 WHERE path LIKE 'X%'")             # the whole folder vanished
+    st = ws.get_draft(conn, d)
+    assert [a["stale"] for a in st["actions"]] == [True, True, False]
+    assert st["actions"][1]["stale_reason"]["items"] == [{"remote": "gdrive", "path": "Y/X/z.txt"}]
+    assert [(o.src_path, o.dst_path) for o in ws.build_ops(conn, d)[0]] == [("Keep/k.txt", "W/k.txt")]
+
+
+def test_a_destination_that_is_no_longer_a_folder_makes_move_and_mkdir_stale(world):
+    conn, cat, g, _ = world
+    put(cat, g, "A/f.txt", group=1)
+    cat.dir(g, "B")
+    cat.dir(g, "C")
+    d = new_draft(conn)
+    mv(conn, d, "gdrive:A/f.txt", "gdrive:B")
+    mkdir(conn, d, "gdrive:C", "new")
+    conn.execute("UPDATE entries SET present = 0 WHERE path IN ('B', 'C')")        # both folders were deleted in the cloud
+    st = ws.get_draft(conn, d)
+    assert [a["stale_reason"]["code"] for a in st["actions"]] == ["DST_NOT_DIR", "DST_NOT_DIR"]
+    assert st["actions"][0]["stale_reason"]["items"] == [{"remote": "gdrive", "path": "B"}]
+    assert st["summary"]["stale_actions"] == 2
+
+
+def test_a_new_folder_made_in_the_draft_is_a_valid_destination_and_remote_roots_always_are(world):
+    conn, cat, g, x = world
+    put(cat, g, "A/f.txt", group=1)
+    put(cat, g, "A/g.txt", group=2)
+    d = new_draft(conn)
+    mkdir(conn, d, "gdrive:", "Fresh")
+    mv(conn, d, "gdrive:A/f.txt", "gdrive:Fresh")
+    mv(conn, d, "gdrive:A/g.txt", "dropbox:")
+    assert stale_of(conn, d) == {}
+
+
+def test_undone_actions_are_never_stale_and_dropping_the_stale_one_clears_the_flag(world):
+    conn, cat, g, _ = world
+    put(cat, g, "A/f.txt", group=1)
+    cat.dir(g, "B")
+    d = new_draft(conn)
+    a1 = mv(conn, d, "gdrive:A/f.txt", "gdrive:B")["action"]["id"]
+    conn.execute("UPDATE entries SET present = 0 WHERE path = 'A/f.txt'")
+    assert list(stale_of(conn, d)) == [a1]
+    ws.undo(conn, d)
+    st = ws.get_draft(conn, d)
+    assert [(a["state"], a["stale"]) for a in st["actions"]] == [("undone", False)]
+    assert st["summary"]["stale_actions"] == 0
+
+
+def test_a_draft_of_only_stale_steps_previews_as_nothing_to_do_but_says_why(world):
+    conn, cat, g, _ = world
+    put(cat, g, "A/f.txt", group=1)
+    cat.dir(g, "B")
+    d = new_draft(conn)
+    a1 = mv(conn, d, "gdrive:A/f.txt", "gdrive:B")["action"]["id"]
+    assert ws.preview(conn, d)["stale_actions"] == []
+    conn.execute("UPDATE entries SET present = 0 WHERE path = 'A/f.txt'")
+    out = ws.preview(conn, d)
+    assert out["plan_id"] is None and out["message"] == "nothing to do"
+    assert [a["id"] for a in out["stale_actions"]] == [a1]
+
+
+def test_stale_steps_do_not_block_a_clean_preview_of_the_rest(world):
+    conn, cat, g, _ = world
+    put(cat, g, "A/f.txt", size=3, md5="aa", group=1)
+    put(cat, g, "A/g.txt", size=4, md5="bb", group=2)
+    cat.dir(g, "B")
+    d = new_draft(conn)
+    mv(conn, d, "gdrive:A/f.txt", "gdrive:B")
+    mv(conn, d, "gdrive:A/g.txt", "gdrive:B")
+    conn.execute("UPDATE entries SET present = 0 WHERE path = 'A/f.txt'")
+    out = ws.preview(conn, d)
+    assert out["ok"] and out["simulation"]["ok"] and len(out["stale_actions"]) == 1
+    assert not ws.is_stale_preview(conn, out["plan_id"])        # a different notion: the draft itself did not change
+
+
+def test_staleness_is_cheap_enough_to_ask_on_every_poll(world):
+    """get_draft runs after every gesture and every 3 seconds per open page, with up to hundreds of steps."""
+    import time
+    conn, cat, g, _ = world
+    for i in range(60):
+        put(cat, g, f"src/d{i}/f.txt", group=i + 1)
+        cat.dir(g, f"dst/e{i}")
+    d = new_draft(conn)
+    for i in range(60):
+        mv(conn, d, f"gdrive:src/d{i}/f.txt", f"gdrive:dst/e{i}")
+        mv(conn, d, f"gdrive:src/d{i}", f"gdrive:dst/e{i}")
+    t0 = time.perf_counter()
+    st = ws.get_draft(conn, d)
+    assert time.perf_counter() - t0 < 3.0 and len(st["actions"]) == 120
+    assert st["summary"]["stale_actions"] == 0
+
+
 # ------------------------------------------------------------- listing details
 
 
@@ -1039,7 +1284,7 @@ def test_listing_order_pagination_and_flags(world):
     item = ws.list_dir(conn, "gdrive", "d")["items"][-1]
     assert set(item) == {"name", "path", "remote", "is_dir", "size", "mtime", "category", "files", "dirs", "bytes",
                          "dup_files", "entry_id", "origins", "moved_here", "merged", "conflict", "dedupe",
-                         "virtual"}
+                         "virtual", "quarantine", "quarantine_root"}
     assert item["entry_id"] is not None and item["remote"] == "gdrive" and item["path"] == "d/file10.txt"
 
 
@@ -1151,7 +1396,7 @@ def test_preview_binds_the_plan_to_the_draft_version(world):
     dr = ws.get_draft(conn, d)
     assert (dr["preview_plan_id"], dr["preview_version"]) == (plan.id, 1)
     assert set(out) == {"plan_id", "draft_version", "ok", "simulation", "summary", "changes", "conflicts",
-                        "empty_dirs_left"}
+                        "empty_dirs_left", "stale_actions"}
     assert out["ok"] is True
     assert out["changes"] == [{"from": {"remote": "gdrive", "path": "A"}, "to": {"remote": "gdrive", "path": "B/A"},
                                "files": 1, "bytes": 3, "kind": "move", "is_dir": True}]
@@ -1593,6 +1838,7 @@ def test_random_drafts_match_a_naive_model(conn, catalog, seed, tame):
             assert out["draft_version"] == version + 1
             accepted += 1
         after = model_of(conn, d, base)
+        assert not any(a["stale"] for a in ws.get_draft(conn, d)["actions"]), "an untouched catalog has no stale steps"
         if steps % 9 == 0 or accepted <= 10:                 # small drafts first: they are the ones that stay clean
             check_views(conn, d, after, names)
             check_ops(conn, d, after, names, seen)

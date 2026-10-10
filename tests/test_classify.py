@@ -485,6 +485,218 @@ def test_target_root_and_path_prefix(conn, archive):
         plan_layout(conn, rs, target_root="../up")
 
 
+# --------------------------------------------------------------------------- idempotent placement
+
+KEEP_PATH = load_rules("")                      # no rules: everything takes Unsorted/{remote}/{path}
+
+
+def _targets(conn, ruleset, **kw):
+    return {p.src_path: p.target_path for p in plan_layout(conn, ruleset, **kw)}
+
+
+def _apply(conn, catalog, placements):
+    """Move every file to its target the way the executor leaves the catalog, folders rebuilt to match."""
+    for p in placements:
+        base = p.target_path.rpartition("/")[2]
+        conn.execute("UPDATE entries SET path = ?, parent = ?, name = ?, name_norm = ? WHERE id = ?",
+                     (p.target_path, p.target_path.rpartition("/")[0], base,
+                      unicodedata.normalize("NFC", base).casefold(), p.entry_id))
+    conn.execute("DELETE FROM entries WHERE is_dir = 1")
+    folders = set()
+    for rid, parent in conn.execute("SELECT remote_id, parent FROM entries WHERE is_dir = 0 AND present = 1"):
+        parts = parent.split("/") if parent else []
+        folders.update((rid, "/".join(parts[:i])) for i in range(1, len(parts) + 1))
+    for rid, folder in sorted(folders):
+        catalog.dir(rid, folder)
+
+
+def test_path_keeping_fallback_leaves_a_placed_file_alone(conn, catalog):
+    g = catalog.remote("gdrive", "drive")
+    catalog.file(g, "Scratch/x.bin")
+    catalog.file(g, "Unsorted/gdrive/Scratch/y.bin")             # what the fallback made of Scratch/y.bin
+    catalog.file(g, "Unsorted/gdrive/z.bin")
+    assert _targets(conn, KEEP_PATH) == {
+        "Scratch/x.bin": "Unsorted/gdrive/Scratch/x.bin",
+        "Unsorted/gdrive/Scratch/y.bin": "Unsorted/gdrive/Scratch/y.bin",
+        "Unsorted/gdrive/z.bin": "Unsorted/gdrive/z.bin"}
+
+
+def test_a_look_alike_that_no_earlier_run_produced_is_still_moved(conn, catalog):
+    g = catalog.remote("gdrive", "drive")
+    catalog.file(g, "Unsorted/other/x.bin")                      # starts like the fallback's output, but is not any
+    catalog.file(g, "Unsorted/gdrive.bin")                       # file's rendering
+    catalog.file(g, "Unsorted/f")
+    got = _targets(conn, KEEP_PATH)
+    assert got["Unsorted/other/x.bin"] == "Unsorted/gdrive/Unsorted/other/x.bin"
+    assert got["Unsorted/gdrive.bin"] == "Unsorted/gdrive/Unsorted/gdrive.bin"
+    assert got["Unsorted/f"] == "Unsorted/gdrive/Unsorted/f"
+
+
+def test_files_below_target_root_are_laid_out_relative_to_it(conn, catalog):
+    g = catalog.remote("gdrive", "drive")
+    catalog.file(g, "Archive/Unsorted/gdrive/Scratch/y.bin")     # placed by an earlier run
+    catalog.file(g, "Archive/Stuff/v.bin")                       # the user's own folder inside the root
+    catalog.file(g, "Scratch/x.bin")                             # outside the root
+    catalog.file(g, "Unsorted/gdrive/Old/w.bin")                 # outside, but already in the fallback's shape
+    catalog.file(g, "Archive.bin")                               # a file named like the root is not inside it
+    assert _targets(conn, KEEP_PATH, target_root="Archive") == {
+        "Archive/Unsorted/gdrive/Scratch/y.bin": "Archive/Unsorted/gdrive/Scratch/y.bin",
+        "Archive/Stuff/v.bin": "Archive/Unsorted/gdrive/Stuff/v.bin",
+        "Scratch/x.bin": "Archive/Unsorted/gdrive/Scratch/x.bin",
+        "Unsorted/gdrive/Old/w.bin": "Archive/Unsorted/gdrive/Old/w.bin",
+        "Archive.bin": "Archive/Unsorted/gdrive/Archive.bin"}
+
+
+def test_target_root_nests_and_ignores_slashes_and_the_rules_see_the_inside_path(conn, catalog):
+    g = catalog.remote("gdrive", "drive")
+    catalog.file(g, "Out/Deep/Misc/a.bin")
+    catalog.file(g, "Misc/b.bin")
+    rs = load_rules('[[rule]]\nname = "misc"\npath_glob = "misc/*"\ntarget = "Sorted/{path}"\n')
+    # anchored at the root's inside: Out/Deep/Misc/a.bin is Misc/a.bin there, so the rule claims it
+    got = {p.src_path: (p.rule, p.target_path) for p in plan_layout(conn, rs, target_root="/Out//Deep/")}
+    assert got["Out/Deep/Misc/a.bin"] == ("misc", "Out/Deep/Sorted/Misc/a.bin")
+    assert got["Misc/b.bin"] == ("misc", "Out/Deep/Sorted/Misc/b.bin")
+
+
+def test_root_remote_ids_limits_which_remotes_hold_the_root(conn, catalog):
+    g = catalog.remote("gdrive", "drive")
+    d = catalog.remote("dropbox", "dropbox")
+    catalog.file(g, "Archive/Stuff/v.bin")
+    catalog.file(d, "Archive/Stuff/u.bin")
+    both = {(p.remote_id, p.src_path): p.target_path for p in plan_layout(conn, KEEP_PATH, target_root="Archive")}
+    assert both == {(g, "Archive/Stuff/v.bin"): "Archive/Unsorted/gdrive/Stuff/v.bin",
+                    (d, "Archive/Stuff/u.bin"): "Archive/Unsorted/dropbox/Stuff/u.bin"}
+    only_g = {(p.remote_id, p.src_path): p.target_path
+              for p in plan_layout(conn, KEEP_PATH, target_root="Archive", root_remote_ids=[g])}
+    assert only_g == {(g, "Archive/Stuff/v.bin"): "Archive/Unsorted/gdrive/Stuff/v.bin",
+                      (d, "Archive/Stuff/u.bin"): "Archive/Unsorted/dropbox/Archive/Stuff/u.bin"}
+    none = plan_layout(conn, KEEP_PATH, target_root="Archive", root_remote_ids=[])
+    assert [p.target_path for p in none] == ["Archive/Unsorted/gdrive/Archive/Stuff/v.bin",
+                                             "Archive/Unsorted/dropbox/Archive/Stuff/u.bin"]
+
+
+def test_a_copy_keeps_the_remote_it_came_from(conn, catalog):
+    g = catalog.remote("gdrive", "drive")
+    catalog.remote("dropbox", "dropbox")                          # another cloud of the catalog, not laid out here
+    catalog.file(g, "Archive/Unsorted/dropbox/Misc/w.bin")       # consolidated from dropbox:Misc/w.bin
+    catalog.file(g, "Archive/Unsorted/nowhere/Misc/v.bin")       # no cloud of that name: just a folder
+    got = _targets(conn, KEEP_PATH, target_root="Archive", remote_ids=[g], root_remote_ids=[g])
+    assert got["Archive/Unsorted/dropbox/Misc/w.bin"] == "Archive/Unsorted/dropbox/Misc/w.bin"
+    assert got["Archive/Unsorted/nowhere/Misc/v.bin"] == "Archive/Unsorted/gdrive/Unsorted/nowhere/Misc/v.bin"
+
+
+def test_case_insensitive_remote_recognises_a_placed_file_and_the_root_in_any_case(conn, catalog):
+    d = catalog.remote("dropbox", "dropbox")
+    catalog.file(d, "archive/UNSORTED/Dropbox/Scratch/x.bin")
+    catalog.file(d, "ARCHIVE/Other/y.bin")
+    got = _targets(conn, KEEP_PATH, target_root="Archive")
+    assert got["archive/UNSORTED/Dropbox/Scratch/x.bin"].casefold() == "archive/UNSORTED/Dropbox/Scratch/x.bin".casefold()
+    assert got["ARCHIVE/Other/y.bin"] == "Archive/Unsorted/dropbox/Other/y.bin"
+
+
+def test_case_sensitive_remote_does_not_fold_the_root_or_the_template(conn, catalog):
+    g = catalog.remote("gdrive", "drive")
+    catalog.file(g, "archive/Unsorted/gdrive/Scratch/x.bin")     # a different folder than 'Archive' on Drive
+    assert _targets(conn, KEEP_PATH, target_root="Archive") == {
+        "archive/Unsorted/gdrive/Scratch/x.bin": "Archive/Unsorted/gdrive/archive/Unsorted/gdrive/Scratch/x.bin"}
+
+
+@pytest.mark.parametrize("template, source, placed", [
+    ("Sorted/{dir}/{name}", "a/b/x.bin", "Sorted/a/b/x.bin"),
+    ("Sorted/{dir}/{name}", "x.bin", "Sorted/_/x.bin"),
+    ("Sorted/{relpath}", "a/b/x.bin", "Sorted/a/b/x.bin"),
+    ("Sorted/{parent}/{dir}/{name}", "a/b/x.bin", "Sorted/b/a/b/x.bin"),
+    ("{remote}/{path}", "a/b/x.bin", "gdrive/a/b/x.bin"),
+    ("By {category}/{path}", "a/x.bin", "By other/a/x.bin"),
+    ("Music/{parent}/{name}", "Pink Floyd/The Wall/x.mp3", "Music/The Wall/x.mp3"),
+    ("Photos/{year}/{name}", "a/IMG_20190304_101010.jpg", "Photos/2019/IMG_20190304_101010.jpg"),
+])
+def test_templates_reach_a_fixed_point(conn, catalog, template, source, placed):
+    g = catalog.remote("gdrive", "drive")
+    catalog.file(g, source)
+    rs = load_rules(f'[layout]\nfallback = "{template}"\n')
+    assert _targets(conn, rs) == {source: placed}
+    _apply(conn, catalog, plan_layout(conn, rs))
+    assert _targets(conn, rs) == {placed: placed}
+
+
+def test_unit_files_keep_a_path_keeping_unit_rule_idempotent(conn, catalog):
+    g = catalog.remote("gdrive", "drive")
+    catalog.file(g, "Code/repo/.git/HEAD")
+    catalog.file(g, "Code/repo/src/main.py")
+    rs = load_rules('[[rule]]\nname = "p"\nunit = true\ntarget = "Projects/{dir}/{unit}/{relpath}"\n')
+    first = _targets(conn, rs)
+    assert first == {"Code/repo/.git/HEAD": "Projects/Code/repo/.git/HEAD",
+                     "Code/repo/src/main.py": "Projects/Code/repo/src/main.py"}
+    _apply(conn, catalog, plan_layout(conn, rs))
+    assert _targets(conn, rs) == {dst: dst for dst in first.values()}
+    again = _targets(conn, rs, target_root="Root")                     # a root moves the placed unit in once
+    assert again == {dst: "Root/" + dst for dst in first.values()}
+
+
+def test_unit_files_under_the_fallback_stay_together_and_stay_put(conn, catalog):
+    g = catalog.remote("gdrive", "drive")
+    catalog.file(g, "Unsorted/gdrive/Code/repo/.git/HEAD")
+    catalog.file(g, "Unsorted/gdrive/Code/repo/main.py")
+    catalog.file(g, "Elsewhere/repo/.git/HEAD")
+    got = _targets(conn, KEEP_PATH)
+    assert got["Unsorted/gdrive/Code/repo/.git/HEAD"] == "Unsorted/gdrive/Code/repo/.git/HEAD"
+    assert got["Unsorted/gdrive/Code/repo/main.py"] == "Unsorted/gdrive/Code/repo/main.py"
+    assert got["Elsewhere/repo/.git/HEAD"] == "Unsorted/gdrive/Elsewhere/repo/.git/HEAD"
+
+
+def test_unit_inside_the_root_is_judged_by_its_path_inside_the_root(conn, catalog):
+    g = catalog.remote("gdrive", "drive")
+    catalog.file(g, "Root/Code/repo/.git/HEAD")
+    rs = load_rules('[[rule]]\nname = "p"\nunit = true\npath_glob = "code/*"\n'
+                    'target = "Projects/{parent}/{unit}/{relpath}"\n')
+    got = {p.src_path: (p.rule, p.target_path) for p in plan_layout(conn, rs, target_root="Root")}
+    assert got["Root/Code/repo/.git/HEAD"] == ("p", "Root/Projects/Code/repo/.git/HEAD")    # parent is Code, not Root
+
+
+_LAYOUT_DIRS = ["", "a", "b/c", "Photos/2020", "Docs", "Code/repo", "Code/repo/pkg", "Misc/old", "Unsorted/gdrive/a",
+                "Archive/Stuff", "Archive/Unsorted/gdrive/b", "Archive/Photos/2019"]
+_LAYOUT_NAMES = ["x.jpg", "IMG_20200101_000000.jpg", "r.pdf", "n.txt", "main.py", "data.bin", "song.mp3", "副本.docx",
+                 "clip.mov", "t.zip", "x.xlsx"]
+_LAYOUT_RULESETS = {
+    "default": default_rules,
+    "keep-path": lambda: load_rules(""),
+    "dirs": lambda: load_rules('[layout]\nfallback = "Misc/{parent}/{dir}/{name}"\n'
+                               '[[rule]]\nname = "p"\ncategory = ["photo"]\ntarget = "Pics/{year}/{path}"\n'
+                               '[[rule]]\nname = "u"\nunit = true\ntarget = "Units/{dir}/{unit}/{relpath}"\n'),
+    "remote-first": lambda: load_rules('[layout]\nfallback = "{remote}/{category}/{relpath}"\n'),
+    "no-units": lambda: load_rules('[layout]\nunit_markers = []\nbundle_patterns = []\n'
+                                   'fallback = "Loose/{remote}/{dir}/{name}"\n'),
+}
+
+
+@pytest.mark.parametrize("name", _LAYOUT_RULESETS)
+@pytest.mark.parametrize("root", ["", "Archive", "Out/Deep"])
+@pytest.mark.parametrize("seed", range(12))
+def test_layout_of_a_laid_out_catalog_is_the_same_layout(conn, catalog, seed, root, name):
+    """Property: apply every placement, plan again, and nothing wants to move."""
+    import random
+    rnd = random.Random(f"{seed}/{root}/{name}")
+    rids = [catalog.remote("gdrive", "drive"), catalog.remote("dropbox", "dropbox"), catalog.remote("local", "local")]
+    seen = set()
+    for _ in range(rnd.randint(10, 45)):
+        rid = rnd.choice(rids)
+        folder = rnd.choice(_LAYOUT_DIRS)
+        if folder.startswith("Code/repo") and rnd.random() < 0.5:
+            path = f"{folder}/{rnd.choice(['.git/HEAD', 'main.py', 'README.md', '__init__.py'])}".replace("//", "/")
+        else:
+            path = f"{folder}/{rnd.choice(_LAYOUT_NAMES)}".lstrip("/")
+        if (rid, path.casefold()) in seen:
+            continue
+        seen.add((rid, path.casefold()))
+        catalog.file(rid, path, mtime=f"20{rnd.randint(10, 23)}-0{rnd.randint(1, 9)}-15T00:00:00Z")
+    rs = _LAYOUT_RULESETS[name]()
+    _apply(conn, catalog, plan_layout(conn, rs, target_root=root))
+    stable = plan_layout(conn, rs, target_root=root)
+    moved = [(p.src_path, p.target_path) for p in stable if p.src_path.casefold() != p.target_path.casefold()]
+    assert moved == [], f"{name} root={root!r} seed={seed}"
+
+
 def test_path_prefix_is_not_a_like_pattern(conn, catalog):
     g = catalog.remote("gdrive", "drive")
     for p in ("A_B/f1.txt", "AxB/f2.txt", "A%B/f3.txt", "A_B2/f4.txt", "A_B.txt", "A_B/sub/f5.txt"):

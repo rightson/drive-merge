@@ -17,6 +17,9 @@ import json
 import os
 import random
 import shutil
+import socket
+import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -526,14 +529,165 @@ def test_move_within_one_remote(env):
     assert env.spy.count("download") == 0 and env.spy.count("moveto") == 1 and env.spy.count("copyto") == 0
 
 
-def test_move_onto_an_existing_file_is_refused_even_when_identical(env):
+def test_move_onto_identical_content_quarantines_the_source_and_overwrites_nothing(env):
+    """What the simulator models: the destination already holds the content, so the move only removes the source."""
     data = blob(90)
     env.put("gd", "a.bin", data)
     env.put("gd", "b.bin", data)
     env.scan("gd")
     pid = env.plan([env.move("gd", "a.bin", "gd", "b.bin")])
+    assert env.run(pid) == ExecResult(pid, "done", done=1)
+    q = env.qpath(pid, "a.bin")
+    assert env.read("gd", "b.bin") == data and not env.exists("gd", "a.bin") and env.read("gd", q) == data
+    assert env.spy.paths("moveto") == [("a.bin", q)], "the only write parks the source; nothing goes onto b.bin"
+    assert env.spy.count("copyto") == 0 and env.spy.count("deletefile") == 0 and env.spy.count("download") == 0
+    assert env.plan_status(pid) == "done" and env.op_states(pid) == [("done", None)]
+    [entry] = env.journal(pid, "quarantine")
+    assert entry["detail"] == {"remote": "gd", "from": "a.bin", "to": q}
+    [intent] = [j for j in env.journal(pid, "intent")]
+    assert intent["detail"]["kind"] == "quarantine" and "identical" in intent["detail"]["why"]
+    assert [j["detail"]["verdict"] for j in env.journal(pid, "verify")] == ["same"]
+
+
+def test_move_onto_a_different_file_of_the_same_size_is_refused(env):
+    env.put("gd", "a.bin", blob(90, 1))
+    env.put("gd", "b.bin", blob(90, 2))
+    env.scan("gd")
+    pid = env.plan([env.move("gd", "a.bin", "gd", "b.bin")])
     res = assert_refused(env, pid, env.tree())
-    assert "already exists" in res.error
+    assert "already exists" in res.error and "not provably identical" in res.error
+    assert env.read("gd", "b.bin") == blob(90, 2) and env.read("gd", "a.bin") == blob(90, 1)
+
+
+def test_move_onto_a_file_of_another_size_is_refused_without_reading_either(env):
+    env.put("gd", "a.bin", blob(90, 1))
+    env.put("gd", "b.bin", blob(91, 1))
+    env.scan("gd")
+    pid = env.plan([env.move("gd", "a.bin", "gd", "b.bin")])
+    res = assert_refused(env, pid, env.tree())
+    assert "already exists" in res.error and env.spy.count("download") == 0
+
+
+def test_move_onto_identical_content_in_a_hashless_cloud_is_proven_by_reading_both(env):
+    data = blob(70, 3)
+    env.put("ic", "a.bin", data)
+    env.put("ic", "b.bin", data)
+    env.scan("ic")
+    pid = env.plan([env.move("ic", "a.bin", "ic", "b.bin")])
+    assert env.run(pid) == ExecResult(pid, "done", done=1)
+    assert env.spy.count("download") == 2 and env.read("ic", env.qpath(pid, "a.bin")) == data
+
+
+def test_move_onto_other_bytes_in_a_hashless_cloud_is_refused_after_reading_both(env):
+    env.put("ic", "a.bin", blob(70, 3))
+    env.put("ic", "b.bin", blob(70, 4))
+    env.scan("ic")
+    pid = env.plan([env.move("ic", "a.bin", "ic", "b.bin")])
+    assert_refused(env, pid, env.tree())
+    assert env.spy.count("download") == 2
+
+
+def test_move_onto_itself_changes_nothing(env):
+    env.put("gd", "a.bin", blob(40))
+    env.scan("gd")
+    pid = env.plan([env.move("gd", "a.bin", "gd", "a.bin")])
+    before = env.tree()
+    assert env.run(pid) == ExecResult(pid, "done", skipped=1)
+    assert env.tree() == before and env.spy.mutations() == [] and env.exists("gd", "a.bin")
+
+
+def test_move_onto_a_name_that_differs_only_in_case_is_refused(env):
+    """On a real case-insensitive cloud that name is the source itself: quarantining it would lose the file."""
+    data = blob(40)
+    env.put("ci", "a.txt", data)
+    env.put("ci", "A.TXT", data)  # these are two files on the test directory, one file on Dropbox
+    env.scan("ci")
+    pid = env.plan([env.move("ci", "a.txt", "ci", "A.TXT")])
+    res = assert_refused(env, pid, env.tree())
+    assert "only in case" in res.error
+
+
+def test_move_onto_identical_content_inside_the_quarantine_is_refused(env):
+    """A file in quarantine is not a live copy; moving the source away because of it would lose the content."""
+    data = blob(40)
+    env.put("gd", "a.bin", data)
+    env.put("gd", f"{QDIR}/9/a.bin", data)
+    env.scan("gd")
+    pid = env.plan([env.move("gd", "a.bin", "gd", f"{QDIR}/9/a.bin")])
+    res = assert_refused(env, pid, env.tree())
+    assert "quarantine directory" in res.error and env.read("gd", "a.bin") == data
+
+
+def test_move_onto_a_directory_is_refused(env):
+    env.put("gd", "a.bin", blob(10))
+    env.put("gd", "dir/inner.bin", blob(10))
+    env.scan("gd")
+    pid = env.plan([env.move("gd", "a.bin", "gd", "dir")])
+    res = assert_refused(env, pid, env.tree())
+    assert "directory" in res.error
+
+
+def test_move_onto_identical_content_stops_when_the_quarantine_slot_is_taken(env):
+    data = blob(40)
+    env.put("gd", "a.bin", data)
+    env.put("gd", "b.bin", data)
+    env.scan("gd")
+    pid = env.plan([env.move("gd", "a.bin", "gd", "b.bin")])
+    env.put("gd", env.qpath(pid, "a.bin"), b"someone else's file")
+    res = assert_refused(env, pid, env.tree())
+    assert "occupied" in res.error
+
+
+def test_a_move_onto_identical_content_satisfies_its_dependents(env):
+    data = blob(40, 1)
+    env.put("gd", "a.bin", data)
+    env.put("gd", "b.bin", data)
+    env.put("gd", "c.bin", data)
+    env.scan("gd")
+    pid = env.plan([env.move("gd", "a.bin", "gd", "b.bin"),
+                    env.delete("gd", "c.bin", witness=("gd", "b.bin"), depends_on=1)])
+    assert env.run(pid) == ExecResult(pid, "done", done=2)
+    assert env.read("gd", env.qpath(pid, "c.bin")) == data and env.read("gd", "b.bin") == data
+
+
+def _move_onto_identical_plan(env):
+    """a.bin quarantined because b.bin has its content; p.bin moved to q.bin for real."""
+    data = blob(60, 7)
+    env.put("gd", "a.bin", data)
+    env.put("gd", "b.bin", data)
+    env.put("gd", "p.bin", blob(50, 8))
+    env.scan("gd")
+    pid = env.plan([env.move("gd", "a.bin", "gd", "b.bin"), env.move("gd", "p.bin", "gd", "q.bin")])
+    assert env.run(pid) == ExecResult(pid, "done", done=2)
+    return pid, data
+
+
+def test_restore_brings_back_a_source_that_a_move_quarantined_and_leaves_real_moves_alone(env):
+    pid, data = _move_onto_identical_plan(env)
+    res = env.restore(pid)
+    assert res == ExecResult(pid, "done", done=1)
+    assert env.read("gd", "a.bin") == data and env.read("gd", "b.bin") == data
+    assert env.exists("gd", "q.bin") and not env.exists("gd", "p.bin"), "a plain move is not undone"
+    assert env.files(quarantine=True) == {}
+    assert [s for s, _ in env.op_states(pid)] == ["skipped", "done"]
+    assert env.restore(pid) == ExecResult(pid, "done"), "a second restore has nothing left"
+
+
+def test_purge_removes_the_source_a_move_quarantined_and_only_that(env):
+    pid, data = _move_onto_identical_plan(env)
+    before = env.files()
+    env.spy.calls.clear()
+    assert env.purge(pid, older_than_days=0) == ExecResult(pid, "done", done=1)
+    assert env.spy.paths("deletefile") == [(env.qpath(pid, "a.bin"),)]
+    assert env.files() == before and env.files(quarantine=True) == {}
+
+
+def test_purge_keeps_the_source_a_move_quarantined_when_its_destination_is_gone(env):
+    pid, data = _move_onto_identical_plan(env)
+    env.roots["gd"].joinpath("b.bin").unlink()
+    res = env.purge(pid, older_than_days=0)
+    assert (res.status, res.done, res.failed) == ("partial", 0, 1) and "b.bin" in res.error
+    assert env.read("gd", env.qpath(pid, "a.bin")) == data and env.spy.count("deletefile") == 0
 
 
 def test_move_between_remotes_is_refused(env):
@@ -1006,9 +1160,9 @@ def test_a_failed_plan_still_needs_a_current_digest_to_resume(env):
     pid = env.plan([env.copy("gd", "ghost.bin", "gd", "g.bin")])
     assert env.run(pid).status == "failed"
     env.scan("gd")
-    with pytest.raises(plans.StaleSimulation):
+    with pytest.raises(plans.StaleSimulation, match="propose a new plan"):  # simulating a failed plan is impossible
         env.run(pid)
-    assert env.plan_status(pid) == "failed"
+    assert env.plan_status(pid) == "failed" and env.spy.mutations() == []
 
 
 # --------------------------------------------------------------------------- #
@@ -1251,6 +1405,245 @@ def test_purge_of_a_plan_that_deleted_nothing_does_nothing(env):
     env.spy.calls.clear()
     assert env.purge(pid, older_than_days=0) == ExecResult(pid, "done")
     assert env.spy.calls == []
+
+
+def _quarantined_pair(env, *, source="gd", witness="gd", seed=21):
+    """One delete executed: its file waits in quarantine, `witness` holds the identical live copy."""
+    data = blob(130, seed)
+    env.put(source, "docs/a.bin", data)
+    env.put(witness, "keep/a.bin", data)
+    env.scan(source, witness)
+    pid = env.plan([env.delete(source, "docs/a.bin", witness=(witness, "keep/a.bin"))])
+    assert env.run(pid).status == "done"
+    env.spy.calls.clear()
+    return pid, data
+
+
+def _kept(env, pid, source="gd", data=None):
+    """The purge failed for the file, said so in the journal, and left the quarantined copy where it was."""
+    res = env.purge(pid, older_than_days=0)
+    assert (res.status, res.done, res.failed) == ("partial", 0, 1) and "is kept" in res.error, res
+    assert env.spy.count("deletefile") == 0
+    if data is not None:
+        assert env.read(source, env.qpath(pid, "docs/a.bin")) == data
+    [entry] = env.journal(pid, "purge")
+    assert entry["detail"]["status"] == "failed" and "is kept" in entry["detail"]["error"]
+    return res
+
+
+def test_purge_checks_the_witness_and_then_deletes(env):
+    pid, data = _quarantined_pair(env)
+    assert env.purge(pid, older_than_days=0) == ExecResult(pid, "done", done=1)
+    assert env.spy.paths("deletefile") == [(env.qpath(pid, "docs/a.bin"),)]
+    assert env.read("gd", "keep/a.bin") == data and env.files(quarantine=True) == {}
+    assert [j["detail"]["what"] for j in env.journal(pid, "verify")][-1] == "witness re-check before purge"
+
+
+def test_purge_keeps_a_file_whose_witness_has_been_deleted(env):
+    """The quarantined copy may now be the only one left."""
+    pid, data = _quarantined_pair(env)
+    env.roots["gd"].joinpath("keep/a.bin").unlink()
+    res = _kept(env, pid, data=data)
+    assert "does not exist" in res.error
+
+
+def test_purge_keeps_a_file_whose_witness_was_moved_away(env):
+    pid, data = _quarantined_pair(env)
+    shutil.move(env.roots["gd"] / "keep/a.bin", env.roots["gd"] / "elsewhere.bin")
+    _kept(env, pid, data=data)
+
+
+def test_purge_keeps_a_file_whose_witness_now_holds_other_bytes(env):
+    pid, data = _quarantined_pair(env)
+    env.put("gd", "keep/a.bin", blob(len(data), 99))  # same size, same name, other content
+    res = _kept(env, pid, data=data)
+    assert "not provably identical" in res.error
+
+
+def test_purge_keeps_a_file_whose_witness_changed_size(env):
+    pid, data = _quarantined_pair(env)
+    env.put("gd", "keep/a.bin", data + b"!")
+    _kept(env, pid, data=data)
+
+
+def test_purge_keeps_a_file_whose_witness_became_a_directory(env):
+    pid, data = _quarantined_pair(env)
+    (env.roots["gd"] / "keep/a.bin").unlink()
+    env.put("gd", "keep/a.bin/inner", data)
+    res = _kept(env, pid, data=data)
+    assert "directory" in res.error
+
+
+def test_purge_keeps_a_file_when_the_witness_cannot_be_read(env):
+    pid, data = _quarantined_pair(env, source="gd", witness="dbx")
+    env.conn.execute("DELETE FROM hash_bridges")       # no bridge: proving the pair needs a download
+    env.spy.download_error = RcloneError("network down")
+    res = _kept(env, pid, data=data)
+    assert "cannot download" in res.error
+
+
+def test_purge_takes_only_what_still_has_a_witness(env):
+    pid, files = _three_deletes(env)
+    env.run(pid)
+    env.roots["gd"].joinpath("keep/two.bin").unlink()       # the witness of the dbx file
+    res = env.purge(pid, older_than_days=0)
+    assert (res.status, res.done, res.failed) == ("partial", 2, 1) and "two.bin" in res.error
+    assert env.read("dbx", env.qpath(pid, "b/two.bin")) == files[("dbx", "b/two.bin")], "that one stays"
+    assert not env.exists("gd", env.qpath(pid, "a/one.bin")) and not env.exists("ic", env.qpath(pid, "c/three.bin"))
+    assert [j["detail"]["status"] for j in env.journal(pid, "purge") if j["action"] == "purge"].count("failed") == 1
+
+
+def test_purge_proves_a_witness_in_another_hash_domain_from_the_recorded_bridge(env):
+    pid, data = _quarantined_pair(env, source="gd", witness="dbx")
+    assert env.bridges(), "the delete had to download once to prove its witness"
+    assert env.purge(pid, older_than_days=0) == ExecResult(pid, "done", done=1)
+    assert env.spy.count("download") == 0
+
+
+def test_purge_downloads_when_no_bridge_links_the_two_hash_domains(env):
+    pid, data = _quarantined_pair(env, source="gd", witness="dbx")
+    env.conn.execute("DELETE FROM hash_bridges")
+    assert env.purge(pid, older_than_days=0) == ExecResult(pid, "done", done=1)
+    assert env.spy.count("download") == 1, "one read of the witness proves it against the quarantined copy's hashes"
+    assert env.files(quarantine=True) == {} and env.read("dbx", "keep/a.bin") == data
+
+
+def test_purge_reads_a_hashless_witness(env):
+    pid, data = _quarantined_pair(env, source="gd", witness="ic")
+    env.conn.execute("DELETE FROM hash_bridges")
+    assert env.purge(pid, older_than_days=0).status == "done"
+    assert env.spy.paths("download") == [("keep/a.bin",)]
+
+
+def test_purge_leaves_scratch_files_behind_nowhere(env, tmp_path, monkeypatch):
+    pid, data = _quarantined_pair(env, source="gd", witness="dbx")
+    env.conn.execute("DELETE FROM hash_bridges")
+    scratch = tmp_path / "purge-scratch"
+    assert env.purge(pid, older_than_days=0, tmpdir=scratch).status == "done"
+    assert list(scratch.iterdir()) == []
+
+
+def test_purge_refuses_a_witness_that_would_not_survive_a_purge(env):
+    """Forged rows (the database is not trusted): a witness inside the quarantine is no live copy."""
+    pid, data = _quarantined_pair(env)
+    env.put("gd", f"{QDIR}/9/x.bin", data)
+    env.conn.execute("UPDATE plan_ops SET witness_path = ? WHERE plan_id = ?", (f"{QDIR}/9/x.bin", pid))
+    res = _kept(env, pid, data=data)
+    assert "quarantine directory" in res.error
+
+
+@pytest.mark.parametrize("witness_path", ["../victim.txt", "a//b", "/abs", ""])
+def test_purge_refuses_a_witness_path_that_could_leave_the_remote(env, witness_path):
+    pid, data = _quarantined_pair(env)
+    env.conn.execute("UPDATE plan_ops SET witness_path = ? WHERE plan_id = ?", (witness_path, pid))
+    _kept(env, pid, data=data)
+
+
+def test_purge_refuses_a_delete_that_names_no_witness(env):
+    pid, data = _quarantined_pair(env)
+    env.conn.execute("UPDATE plan_ops SET witness_remote_id = NULL, witness_path = NULL WHERE plan_id = ?", (pid,))
+    res = _kept(env, pid, data=data)
+    assert "no surviving copy" in res.error
+
+
+def test_purge_does_not_look_for_a_witness_when_the_file_is_already_gone(env):
+    pid, data = _quarantined_pair(env)
+    env.roots["gd"].joinpath(env.qpath(pid, "docs/a.bin")).unlink()
+    env.roots["gd"].joinpath("keep/a.bin").unlink()
+    assert env.purge(pid, older_than_days=0) == ExecResult(pid, "done", skipped=1)
+
+
+# --------------------------------------------------------------------------- #
+# Who is executing
+# --------------------------------------------------------------------------- #
+
+def _lock_row(env, pid):
+    row = env.conn.execute("SELECT value FROM meta WHERE key = ?", (f"executing:{pid}",)).fetchone()
+    return None if row is None else json.loads(row[0])
+
+
+def test_execution_holds_a_lock_with_pid_host_and_start_time_and_releases_it(env):
+    env.put("gd", "a.bin", blob(20))
+    env.scan("gd")
+    pid = env.plan([env.copy("gd", "a.bin", "gd", "a2.bin"), env.copy("gd", "a.bin", "gd", "a3.bin")])
+    assert _lock_row(env, pid) is None
+    seen = []
+    env.run(pid, progress=lambda done, total, op: seen.append((env.plan_status(pid), _lock_row(env, pid))))
+    assert [status for status, _ in seen] == ["executing", "executing"]
+    lock = seen[0][1]
+    assert lock["pid"] == os.getpid() and lock["host"] == socket.gethostname() and lock["started_at"].endswith("Z")
+    assert env.plan_status(pid) == "done" and _lock_row(env, pid) is None
+
+
+def test_the_lock_is_released_when_an_op_fails(env):
+    env.put("gd", "a.bin", blob(20))
+    env.scan("gd")
+    pid = env.plan([env.copy("gd", "ghost.bin", "gd", "g.bin")])
+    assert env.run(pid).status == "failed" and _lock_row(env, pid) is None
+
+
+def test_the_lock_is_released_when_the_run_is_interrupted(env):
+    env.put("gd", "a.bin", blob(20))
+    env.scan("gd")
+    pid = env.plan([env.copy("gd", "a.bin", "gd", "a2.bin"), env.copy("gd", "a.bin", "gd", "a3.bin")])
+
+    def interrupt(done, total, op):
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        env.run(pid, progress=interrupt)
+    assert env.plan_status(pid) == "failed" and _lock_row(env, pid) is None
+
+
+def test_a_plan_is_not_left_executing_when_the_run_cannot_even_start(env, monkeypatch):
+    env.put("gd", "a.bin", blob(20))
+    env.scan("gd")
+    pid = env.plan([env.copy("gd", "a.bin", "gd", "a2.bin")])
+
+    def no_space(*a, **kw):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(executor.tempfile, "TemporaryDirectory", no_space)
+    with pytest.raises(OSError):
+        env.run(pid)
+    assert env.plan_status(pid) == "failed" and _lock_row(env, pid) is None
+    monkeypatch.undo()
+    assert env.run(pid).status == "done"
+
+
+def test_a_stale_lock_does_not_stop_a_failed_plan_from_running_again(env):
+    env.put("gd", "a.bin", blob(20))
+    env.scan("gd")
+    pid = env.plan([env.copy("gd", "a.bin", "gd", "a2.bin")])
+    plans.set_status(env.conn, pid, "failed")
+    env.conn.execute("INSERT INTO meta(key, value) VALUES (?, ?)", (
+        f"executing:{pid}", json.dumps({"pid": 1, "host": "gone", "started_at": "2001-01-01T00:00:00.000000Z"})))
+    assert env.run(pid).status == "done" and _lock_row(env, pid) is None
+
+
+def test_a_plan_left_executing_by_a_dead_process_is_reset_and_resumes_where_it_stopped(env):
+    for name in ("a", "b", "c"):
+        env.put("gd", f"{name}.bin", blob(30, ord(name)))
+    env.scan("gd")
+    pid = env.plan([env.copy("gd", f"{n}.bin", "gd", f"{n}2.bin") for n in "abc"])
+    assert env.run(pid).status == "done"
+    # as if the process had been killed during op 3: executing, op 3 unfinished, a lock nobody holds
+    (env.roots["gd"] / "c2.bin").unlink()
+    env.conn.execute("UPDATE plan_ops SET status = 'pending', error = NULL, executed_at = NULL "
+                     "WHERE plan_id = ? AND seq = 3", (pid,))
+    plans.set_status(env.conn, pid, "executing")
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait()
+    env.conn.execute("INSERT INTO meta(key, value) VALUES (?, ?)", (
+        f"executing:{pid}", json.dumps({"pid": child.pid, "host": socket.gethostname(),
+                                         "started_at": "2024-05-01T10:00:00.000000Z"})))
+    with pytest.raises(ExecutionError):
+        env.run(pid)                       # still 'executing': it must be reset first
+    plans.reset_stuck(env.conn, pid)
+    env.spy.calls.clear()
+    assert env.run(pid) == ExecResult(pid, "done", done=3)
+    assert env.spy.count("copyto") == 1 and env.read("gd", "c2.bin") == blob(30, ord("c"))
+    assert _lock_row(env, pid) is None
 
 
 # --------------------------------------------------------------------------- #

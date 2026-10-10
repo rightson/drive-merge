@@ -9,7 +9,7 @@ import pytest
 
 from drivemerge import db, plans
 from drivemerge.models import Op
-from drivemerge.simulate import SafetyPolicy, simulate_ops, simulate_plan
+from drivemerge.simulate import MAX_REPORTED, SafetyPolicy, simulate_ops, simulate_plan
 
 
 # --------------------------------------------------------------------- helpers
@@ -170,7 +170,7 @@ def test_probable_witness_must_survive_and_content_is_then_lost(conn, world):
     ops = [
         rm(i, "v.mov", g, "v.mov"),                           # 1: probable
         cp(g, "v.mov", g, "backup/v.mov"),                    # 2: virtual copy (inherits the witness's key)
-        rm(g, "v.mov", g, "backup/v.mov"),                    # 3: deletes op 1's witness
+        rm(g, "v.mov", g, "backup/v.mov", depends_on=2),      # 3: deletes op 1's witness
     ]
     rep = sim(conn, ops, allow_probable_delete=True)
     assert not rep.ok
@@ -268,6 +268,92 @@ def test_consolidation_copy_then_delete_with_new_copy_as_witness(conn, world):
     assert (delta(rep, "dropbox").files_before, delta(rep, "dropbox").files_after) == (1, 0)
     assert (delta(rep, "gdrive").files_before, delta(rep, "gdrive").files_after, delta(rep, "gdrive").bytes_in) == (0, 1, 100)
     assert (rep.contents_before, rep.contents_after, rep.contents_lost) == (1, 1, 0)
+
+
+def test_a_witness_created_by_the_plan_needs_a_declared_dependency(conn, world):
+    cat, g, d, i = world
+    put(cat, d, "photos/a.jpg", size=100, group=1, dropbox="dd")
+    copy_first = [cp(d, "photos/a.jpg", g, "photos/a.jpg")]
+    for ops in (copy_first + [rm(d, "photos/a.jpg", g, "photos/a.jpg")],
+                copy_first + [rm(d, "photos/a.jpg", g, "photos/a.jpg", depends_on=None)]):
+        rep = sim(conn, ops)
+        assert not rep.ok and [(v.code, v.seq) for v in rep.violations] == [("DEPENDENCY", 2)]
+        assert "op 1" in rep.violations[0].message and "depends_on" in rep.violations[0].message
+        assert delta(rep, "dropbox").files_after == 1, "a violating delete is not applied"
+
+
+def test_a_dependency_on_some_other_op_does_not_cover_the_witness(conn, world):
+    cat, g, d, i = world
+    put(cat, d, "photos/a.jpg", size=100, group=1, dropbox="dd")
+    put(cat, d, "other.txt", size=5, group=2, dropbox="oo")
+    ops = [cp(d, "other.txt", g, "other.txt"),                                  # 1
+           cp(d, "photos/a.jpg", g, "photos/a.jpg"),                            # 2 creates the witness
+           rm(d, "photos/a.jpg", g, "photos/a.jpg", depends_on=1)]              # 3 waits for the wrong op
+    assert [(v.code, v.seq) for v in sim(conn, ops).violations] == [("DEPENDENCY", 3)]
+    ops[2] = rm(d, "photos/a.jpg", g, "photos/a.jpg", depends_on=2)
+    assert sim(conn, ops).ok
+
+
+def test_a_dependency_chain_covers_the_witness(conn, world):
+    """depends_on names one op, so 'transitively' is how a delete reaches the copy that made its witness."""
+    cat, g, d, i = world
+    put(cat, d, "a.jpg", size=100, group=1, dropbox="dd")
+    put(cat, d, "z.jpg", size=7, group=2, dropbox="zz")
+    ops = [cp(d, "a.jpg", g, "a.jpg"),                                          # 1 creates the witness
+           cp(d, "z.jpg", g, "z.jpg", depends_on=1),                            # 2
+           cp(d, "z.jpg", g, "z2.jpg", depends_on=2),                           # 3
+           rm(d, "a.jpg", g, "a.jpg", depends_on=3)]                            # 4 reaches op 1 through 3 and 2
+    rep = sim(conn, ops)
+    assert rep.ok, rep.violations
+    ops[2] = cp(d, "z.jpg", g, "z2.jpg")                                        # break the chain in the middle
+    assert [(v.code, v.seq) for v in sim(conn, ops).violations] == [("DEPENDENCY", 4)]
+
+
+def test_a_chain_through_a_bad_link_does_not_count(conn, world):
+    cat, g, d, i = world
+    put(cat, d, "a.jpg", size=100, group=1, dropbox="dd")
+    put(cat, d, "z.jpg", size=7, group=2, dropbox="zz")
+    ops = [cp(d, "a.jpg", g, "a.jpg"),
+           cp(d, "z.jpg", g, "z.jpg", depends_on=3),                            # forward link: malformed
+           rm(d, "a.jpg", g, "a.jpg", depends_on=2)]
+    assert [(v.code, v.seq) for v in sim(conn, ops).violations] == [("DEPENDENCY", 2), ("DEPENDENCY", 3)]
+    loop = [cp(d, "z.jpg", g, "z.jpg", depends_on=2), cp(d, "a.jpg", g, "a.jpg", depends_on=1),
+            rm(d, "a.jpg", g, "a.jpg", depends_on=2)]
+    assert not sim(conn, loop).ok                                               # terminates, and still refuses
+
+
+def test_a_moved_witness_needs_the_move_as_dependency(conn, world):
+    cat, g, d, i = world
+    put(cat, g, "old/a.bin", size=5, group=1)
+    put(cat, g, "dup/a.bin", size=5, group=1)
+    rep = sim(conn, [mv(g, "old/a.bin", "new/a.bin"), rm(g, "dup/a.bin", g, "new/a.bin")])
+    assert [(v.code, v.seq) for v in rep.violations] == [("DEPENDENCY", 2)]
+    assert sim(conn, [mv(g, "old/a.bin", "new/a.bin"), rm(g, "dup/a.bin", g, "new/a.bin", depends_on=1)]).ok
+
+
+def test_the_witness_is_tied_to_the_op_that_made_it_last(conn, world):
+    """A path that is emptied and filled again belongs to the later op."""
+    cat, g, d, i = world
+    put(cat, g, "a", size=5, group=1)
+    put(cat, g, "dup", size=5, group=1)
+    ops = [cp(g, "a", g, "w"),                                                  # 1 makes w
+           rm(g, "w", g, "a", depends_on=1),                                    # 2 quarantines it
+           cp(g, "a", g, "w", depends_on=2),                                    # 3 makes w again
+           rm(g, "dup", g, "w", depends_on=2)]                                  # 4 follows op 2, which is not op 3
+    assert [(v.code, v.seq) for v in sim(conn, ops).violations] == [("DEPENDENCY", 4)]
+    ops[3] = rm(g, "dup", g, "w", depends_on=3)
+    assert sim(conn, ops).ok
+
+
+def test_a_witness_that_already_existed_needs_no_dependency(conn, world):
+    """A copy onto identical content creates nothing; the witness is the file that was already there."""
+    cat, g, d, i = world
+    put(cat, g, "a", size=5, group=1, md5="aa")
+    put(cat, d, "a", size=5, group=1, dropbox="dd")
+    put(cat, g, "dup", size=5, group=1, md5="aa")
+    rep = sim(conn, [cp(g, "a", d, "a"), rm(g, "dup", d, "a")])
+    assert rep.ok, rep.violations
+    assert [w.code for w in rep.warnings] == ["NOOP"]
 
 
 def test_consolidation_of_an_unhashed_icloud_file(conn, world):
@@ -799,7 +885,7 @@ def test_report_numbers(conn, world):
     ops = [
         cp(g, "p/a.jpg", d, "q/a.jpg", reason="spread"),                   # 10 bytes cross-remote
         mv(g, "p/b.jpg", "p/renamed.jpg"),
-        rm(g, "p/dup.jpg", g, "p/renamed.jpg"),                            # witness is the moved file
+        rm(g, "p/dup.jpg", g, "p/renamed.jpg", depends_on=2),              # witness is the moved file
         rm(d, "q/c-copy.jpg", d, "q/c.jpg"),
         cp(i, "r/x.txt", g, "r/x.txt"),                                    # 7 bytes cross-remote, iCloud
     ]
@@ -872,6 +958,57 @@ def test_contents_after_counts_new_content_in_touched_remotes(conn, world):
     put(cat, g, "z2", size=5, group=7)
     rep = sim(conn, [rm(d, "z", g, "z2")])
     assert (rep.contents_before, rep.contents_after, rep.contents_lost) == (2, 2, 0)
+
+
+def test_a_report_with_few_findings_is_not_capped(conn, world):
+    cat, g, d, i = world
+    put(cat, g, "a", size=5, group=1)
+    rep = sim(conn, [cp(g, "nope", g, "x"), mv(g, "a", "a"), cp(g, "nope2", g, "y")])
+    assert (len(rep.violations), rep.violations_total, rep.violations_by_code) == (2, 2, {"SRC_MISSING": 2})
+    assert (len(rep.warnings), rep.warnings_total, rep.warnings_by_code) == (1, 1, {"NOOP": 1})
+    clean = sim(conn, [cp(g, "a", g, "b")])
+    assert clean.ok and (clean.violations_total, clean.warnings_total) == (0, 0)
+    assert clean.violations_by_code == {} and clean.warnings_by_code == {}
+
+
+def test_a_huge_failing_plan_keeps_the_first_thousand_and_counts_the_rest(conn, world):
+    cat, g, d, i = world
+    n = MAX_REPORTED + 100
+    _bulk(conn, g, [(f"f{k}", 1, k + 1) for k in range(n)])
+    ops = ([cp(g, f"missing{k}", g, f"x{k}") for k in range(n)]                  # n violations, seq 1..n
+           + [mv(g, f"f{k}", f"f{k}") for k in range(n)]                         # n warnings (move onto itself)
+           + [rm(g, "f0", g, "nowhere")])                                        # one rare violation, last
+    rep = sim(conn, ops)
+    assert not rep.ok, "ok is decided on everything found, not on what is listed"
+    assert len(rep.violations) == MAX_REPORTED and len(rep.warnings) == MAX_REPORTED
+    assert [v.seq for v in rep.violations] == list(range(1, MAX_REPORTED + 1)), "the first ones, in op order"
+    assert rep.warnings[0].seq == n + 1
+    assert (rep.violations_total, rep.warnings_total) == (n + 1, n)
+    assert rep.violations_by_code == {"SRC_MISSING": n, "NO_WITNESS": 1}, "a code the cap cut off is still counted"
+    assert rep.warnings_by_code == {"NOOP": n}
+    assert rep.op_counts == {"copy": n, "move": n, "delete": 1} and delta(rep, "gdrive").files_before == n
+
+
+def test_the_cap_applies_to_a_stored_report_and_survives_json(conn, world):
+    cat, g, d, i = world
+    n = MAX_REPORTED + 50
+    ops = [cp(g, f"missing{k}", g, f"x{k}") for k in range(n)]
+    pid = plans.create_plan(conn, "t", "manual", ops, created_by="test")
+    rep = simulate_plan(conn, pid)
+    assert not rep.ok and len(rep.violations) == MAX_REPORTED and rep.violations_total == n
+    stored = plans.latest_simulation(conn, pid)
+    assert stored == rep
+    assert (stored.violations_total, stored.violations_by_code) == (n, {"SRC_MISSING": n})
+    assert len(stored.to_json()) < 400_000, "the point of the cap: a bounded report"
+    assert plans.get_plan(conn, pid, with_ops=False).status == "draft"
+
+
+def test_a_capped_failure_cannot_look_like_success(conn, world, monkeypatch):
+    """Whatever is listed, ok is False as soon as anything was found, even if the cap were tiny."""
+    cat, g, d, i = world
+    monkeypatch.setattr("drivemerge.simulate.MAX_REPORTED", 1)
+    rep = sim(conn, [cp(g, "x", g, "y"), cp(g, "z", g, "w")])
+    assert not rep.ok and len(rep.violations) == 1 and rep.violations_total == 2
 
 
 # --------------------------------------------------------- simulate_plan / DB
@@ -1085,7 +1222,7 @@ def _random_ops(rng, rids, files) -> list[Op]:
         if witness is not None and rng.random() < 0.6:     # the dangerous follow-up: remove what a delete relied on
             (sr, sp), kind, witness = witness, rng.choice(["move", "delete"]), None
         elif created and rng.random() < 0.3:
-            sr, sp = rng.choice(created)
+            sr, sp, _ = rng.choice(created)
         elif keys and rng.random() < 0.85:
             sr, sp = rng.choice(keys)
         else:
@@ -1095,8 +1232,12 @@ def _random_ops(rng, rids, files) -> list[Op]:
             exp = (None if files[(sr, sp)][1] else _SIZE[files[(sr, sp)][0]]) if rng.random() < 0.7 else rng.choice([10, 30, 5])
         if kind == "delete":
             same = [k for k in keys if k != (sr, sp) and files.get(k, (0,))[0] == files.get((sr, sp), (-1,))[0]]
+            dep = None
             if rng.random() < 0.93:
-                if same and rng.random() < 0.75:
+                if created and rng.random() < 0.2:                # a witness the plan itself made, sometimes declared
+                    wr, wp, made_by = rng.choice(created)
+                    dep = made_by if rng.random() < 0.5 else None
+                elif same and rng.random() < 0.75:
                     wr, wp = rng.choice(same)
                 elif keys and rng.random() < 0.7:
                     wr, wp = rng.choice(keys)
@@ -1104,13 +1245,13 @@ def _random_ops(rng, rids, files) -> list[Op]:
                     wr, wp = rng.choice(rids), _rand_path(rng)
             else:
                 wr = wp = None
-            ops.append(rm(sr, sp, wr, wp, expect_size=exp))
+            ops.append(rm(sr, sp, wr, wp, expect_size=exp, depends_on=dep))
             witness = (wr, wp) if wr is not None else None
         else:
             dr = rng.choice(rids) if kind == "copy" or rng.random() > 0.9 else sr
             dp = _rand_path(rng)
             ops.append(Op(kind, sr, sp, dst_remote_id=dr, dst_path=dp, expect_size=exp))
-            created.append((dr, dp))
+            created.append((dr, dp, len(ops)))
     return ops
 
 
@@ -1142,7 +1283,16 @@ def _replay_is_safe(ops, files, dirs, dups, ci, writable, min_copies) -> None:
     for content, _ in files.values():
         before[content] = before.get(content, 0) + 1
     witnesses = []
-    for op in ops:
+    made: dict = {}                                         # location -> seq of the op that created the file there
+
+    def covers(seq, target):
+        while (nxt := ops[seq - 1].depends_on) is not None and nxt < seq:
+            if nxt == target:
+                return True
+            seq = nxt
+        return False
+
+    for seq, op in enumerate(ops, start=1):
         k = (op.src_remote_id, op.src_path)
         assert k not in dups, "ambiguous source"
         assert k in cur, "source missing"
@@ -1153,21 +1303,26 @@ def _replay_is_safe(ops, files, dirs, dups, ci, writable, min_copies) -> None:
             assert not (native and op.dst_remote_id != op.src_remote_id), "native doc copied across remotes"
             if check_dst(op.dst_remote_id, op.dst_path, content) == "add":
                 put_file(op.dst_remote_id, op.dst_path, (content, native))
+                made[(op.dst_remote_id, op.dst_path)] = seq
         elif op.op == "move":
             assert op.dst_remote_id == op.src_remote_id and writable[op.src_remote_id], "bad move"
             if (op.dst_remote_id, op.dst_path) == k:
                 continue
             res = check_dst(op.dst_remote_id, op.dst_path, content, self_src=k)
             del cur[k]
+            made.pop(k, None)
             if res == "add":
                 put_file(op.dst_remote_id, op.dst_path, (content, native))
+                made[(op.dst_remote_id, op.dst_path)] = seq
             else:
                 witnesses.append(((op.dst_remote_id, op.dst_path), content))
         else:
             assert writable[op.src_remote_id] and not native, "delete on read-only remote or of a native doc"
             wk = (op.witness_remote_id, op.witness_path)
             assert wk not in dups and wk != k and wk in cur and cur[wk][0] == content, "witness is not an identical copy"
+            assert wk not in made or covers(seq, made[wk]), "witness created by an op this delete does not depend on"
             del cur[k]
+            made.pop(k, None)
             witnesses.append((wk, content))
     for wk, content in witnesses:
         assert cur.get(wk, (None,))[0] == content, "witness gone at the end of the plan"

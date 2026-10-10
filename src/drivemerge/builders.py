@@ -150,6 +150,12 @@ _COPY_NAME = re.compile(
 )
 _MISSING = object()
 
+# Which provider's copy to keep when nothing above it decides, best first. A copy on a provider with native
+# hashes and server-side moves is cheap to verify and to keep tidy; iCloud has neither (its content is only
+# "proved" through a bridge) and is the last resort. Unlisted providers rank like "other".
+KEEPER_PROVIDER_ORDER: tuple[str, ...] = ("drive", "onedrive", "dropbox", "local", "other", "iclouddrive")
+_KEEPER_RANK = {**{p: i for i, p in enumerate(KEEPER_PROVIDER_ORDER)}, "memory": KEEPER_PROVIDER_ORDER.index("local")}
+
 
 def looks_like_copy(path: str) -> bool:
     """True when a path reads like a duplicate: 'Copy of x', 'x (1)', 'x - Copy', 'x_copy', '副本', ..."""
@@ -185,30 +191,42 @@ def _mtime_key(mtime: str | None) -> tuple[int, str, str]:
     return (0, base, frac.ljust(9, "0"))
 
 
-def _keeper_key(copy: Any, prefer: Sequence, target: Any) -> tuple:
+def _provider_rank(copy: Any, providers: Mapping | None) -> int:
+    """Position of the copy's provider in KEEPER_PROVIDER_ORDER; a copy of unknown provider ranks as "other"."""
+    key = _field(copy, "provider")
+    if key is None and providers:
+        key = providers.get(_field(copy, "remote"), providers.get(_field(copy, "remote_id")))
+    return _KEEPER_RANK.get(key, _KEEPER_RANK["other"])
+
+
+def _keeper_key(copy: Any, prefer: Sequence, target: Any, providers: Mapping | None = None) -> tuple:
     rid, name = _field(copy, "remote_id"), _field(copy, "remote")
     on_target = target is not None and (name == target or rid == target)
     rank = next((i for i, p in enumerate(prefer) if p == name or p == rid), len(prefer))
     path = _field(copy, "path") or ""
     entry_id = _field(copy, "entry_id", "id")
-    return (not on_target, rank, looks_like_copy(path), path.count("/"), _mtime_key(_field(copy, "mtime")),
-            entry_id if entry_id is not None else 1 << 62)
+    return (not on_target, rank, looks_like_copy(path), _provider_rank(copy, providers), path.count("/"),
+            _mtime_key(_field(copy, "mtime")), entry_id if entry_id is not None else 1 << 62)
 
 
-def choose_keeper(copies: Iterable, *, prefer_remotes: Sequence = (), target: Any = None):
+def choose_keeper(copies: Iterable, *, prefer_remotes: Sequence = (), target: Any = None,
+                  providers: Mapping | None = None):
     """The copy to keep out of several identical ones. Deterministic; the first difference decides:
 
     on the target remote > earlier in prefer_remotes > a path that does not look like a copy
-    > shallower path > older mtime > smaller entry id.
+    > provider (drive > onedrive > dropbox > local > other > iclouddrive) > shallower path
+    > older mtime > smaller entry id.
 
     `copies` are identity.Copy objects, catalog rows or dicts (remote name or id, path, mtime,
-    entry id); `target` and `prefer_remotes` take remote names or ids.
+    entry id); `target` and `prefer_remotes` take remote names or ids. A copy's provider is its
+    own `provider` field when it has one, else looked up in `providers` ({remote name or id:
+    provider key}); without either it ranks as "other", so the criterion changes nothing.
     """
     pool = list(copies)
     if not pool:
         raise ValueError("choose_keeper needs at least one copy")
     prefer = tuple(prefer_remotes)
-    return min(pool, key=lambda c: _keeper_key(c, prefer, target))
+    return min(pool, key=lambda c: _keeper_key(c, prefer, target, providers))
 
 
 # --------------------------------------------------------------------------- shared helpers
@@ -255,6 +273,11 @@ def _remote_map(conn: sqlite3.Connection) -> dict[int, _Remote]:
         "SELECT id, name, provider, write_remote, case_insensitive FROM remotes ORDER BY id")}
 
 
+def _provider_map(remotes: Mapping[int, _Remote]) -> dict[str | int, str]:
+    """{remote name or id: provider key}, for choose_keeper."""
+    return {**{r.name: r.provider for r in remotes.values()}, **{r.id: r.provider for r in remotes.values()}}
+
+
 def _named(remotes: Mapping[int, _Remote], name: str) -> _Remote:
     for r in remotes.values():
         if r.name == name:
@@ -292,17 +315,6 @@ def _ancestors(path: str):
     while i != -1:
         yield path[:i]
         i = path.find("/", i + 1)
-
-
-def _renests(path: str, target: str, fold: Callable[[str], str] | None = None) -> bool:
-    """True when `target` is `path` wrapped in a folder prefix that `path` already starts with.
-
-    A path-keeping fallback such as 'Unsorted/{remote}/{path}' pushes an already sorted file one level
-    deeper on every run; such a placement means the file has been sorted before, so it counts as in place.
-    """
-    if fold is not None:
-        path, target = fold(path), fold(target)
-    return target.endswith("/" + path) and path.startswith(target[:-len(path)])
 
 
 def _suffixed(path: str, n: int) -> str:
@@ -465,6 +477,7 @@ def build_dedupe(conn: sqlite3.Connection, *, remote: str | None = None, cross_r
     prefix = _clean_prefix(path_prefix)
     min_size = 1 if min_size is None else min_size
     in_quarantine = _quarantine_test(quarantine_dir)
+    providers = _provider_map(remotes)
     result = BuildResult()
     ambiguous: dict[int, set[str]] = {}
     examined = made = reclaimed = 0
@@ -492,7 +505,7 @@ def build_dedupe(conn: sqlite3.Connection, *, remote: str | None = None, cross_r
                 pools = [by_remote[rid] for rid in sorted(by_remote)]
             before = len(result.ops)
             for pool in pools:
-                for victim, keeper in _dedupe_pool(conn, pool, prefer, prefix, remotes, ambiguous, result):
+                for victim, keeper in _dedupe_pool(conn, pool, prefer, providers, prefix, remotes, ambiguous, result):
                     row = rows[victim.entry_id]
                     result.ops.append(op_from_entry(
                         row, "delete", witness_remote_id=keeper.remote_id, witness_path=keeper.path,
@@ -504,9 +517,9 @@ def build_dedupe(conn: sqlite3.Connection, *, remote: str | None = None, cross_r
     return result
 
 
-def _dedupe_pool(conn: sqlite3.Connection, pool: list[identity.Copy], prefer: list[str], prefix: str,
-                 remotes: Mapping[int, _Remote], ambiguous: dict[int, set[str]],
-                 result: BuildResult) -> list[tuple[identity.Copy, identity.Copy]]:
+def _dedupe_pool(conn: sqlite3.Connection, pool: list[identity.Copy], prefer: list[str],
+                 providers: Mapping[str | int, str], prefix: str, remotes: Mapping[int, _Remote],
+                 ambiguous: dict[int, set[str]], result: BuildResult) -> list[tuple[identity.Copy, identity.Copy]]:
     """(victim, keeper) pairs for one set of identical copies; records what it will not touch."""
     if len(pool) < 2:
         return []
@@ -522,7 +535,7 @@ def _dedupe_pool(conn: sqlite3.Connection, pool: list[identity.Copy], prefer: li
                                    "reason": "ambiguous path"})
     if len(usable) < 2:
         return []
-    keeper = choose_keeper(usable, prefer_remotes=prefer)
+    keeper = choose_keeper(usable, prefer_remotes=prefer, providers=providers)
     pairs = []
     for c in usable:
         if c is keeper or not _in_prefix(c.path, prefix):
@@ -538,7 +551,8 @@ def _dedupe_pool(conn: sqlite3.Connection, pool: list[identity.Copy], prefer: li
 # --------------------------------------------------------------------------- consolidate
 
 _NEEDS_BRIDGING = "needs bridging: run drivemerge bridge"
-# Which source to read the bytes from: hashed copies first (the executor can verify them), then by provider.
+# Which source to read the bytes from: hashed copies first (the executor can verify them), then by provider
+# (cheapest to read; not the keeper order, which is about which copy to keep).
 _PROVIDER_RANK = {"drive": 0, "dropbox": 1, "onedrive": 2, "local": 3, "memory": 4, "other": 5, "iclouddrive": 6}
 
 
@@ -574,6 +588,7 @@ class _Consolidation:
         self.conn, self.remotes, self.tgt = conn, remotes, target
         self.delete_sources, self.reorganize_target = delete_sources, reorganize_target
         self.include_probable, self.prefer, self.prefix = include_probable, prefer, prefix
+        self.providers = _provider_map(remotes)
         self.result = BuildResult()
         self.moves: list[Op] = []
         self.copies: list[Op] = []
@@ -594,9 +609,12 @@ class _Consolidation:
             self.sfiles.extend(_load_files(conn, r, prefix=prefix, in_quarantine=in_quarantine))
             self.s_amb[r.id] = _ambiguous_paths(conn, r.id)
         # The target takes part in the layout only when its own files may move or be judged against units.
+        # target_root is a folder of the target: its files below it are laid out as they stand inside it,
+        # while a source's folder of the same name is only a folder.
         ids = [r.id for r in sources] + ([target.id] if reorganize_target or delete_sources else [])
         self.pl = {p.entry_id: p for p in classify.plan_layout(
-            conn, ruleset, remote_ids=ids, target_root=target_root, path_prefix=prefix or None)}
+            conn, ruleset, remote_ids=ids, target_root=target_root, path_prefix=prefix or None,
+            root_remote_ids=[target.id])}
 
     # ------------------------------------------------------------ small helpers
 
@@ -616,7 +634,7 @@ class _Consolidation:
     def _best_source(self, files: list[_File]) -> _File:
         return min(files, key=lambda f: (
             not f.hashed, _PROVIDER_RANK.get(self.remotes[f.remote_id].provider, 5),
-            *_keeper_key(f, self.prefer, self.tgt.name)))
+            *_keeper_key(f, self.prefer, self.tgt.name, self.providers)))
 
     def _probable_hits(self, f: _File) -> list[_File]:
         """Target files with the same size and normalised name as `f`: maybe the same content."""
@@ -693,7 +711,7 @@ class _Consolidation:
         if not c.t:
             return
         pool = [f for f in c.t if not self._pinned(f)] or c.t
-        keeper = choose_keeper(pool, prefer_remotes=self.prefer, target=self.tgt.name)
+        keeper = choose_keeper(pool, prefer_remotes=self.prefer, target=self.tgt.name, providers=self.providers)
         primary = keeper.path
         if self.reorganize_target:
             if self._movable(keeper) and not self._pinned(keeper):
@@ -703,13 +721,10 @@ class _Consolidation:
                     self._relocate_unit_file(f)
         c.primary = self.final.get(keeper.entry_id, primary)
 
-    def _in_layout(self, f: _File, target_path: str) -> bool:
-        return self.ns.same_path(f.path, target_path) or _renests(f.path, target_path, self.ns.fold)
-
     def _relocate_keeper(self, keeper: _File, pool: list[_File]) -> str:
         place = self.pl[keeper.entry_id]
         for f in pool:                       # a copy already in the layout makes moving unnecessary
-            if self._in_layout(f, place.target_path):
+            if self.ns.same_path(f.path, place.target_path):
                 return f.path
         status, final = self.ns.resolve(place.target_path, keeper.key, own=keeper.path, same_ok=True)
         if status == "free":
@@ -721,7 +736,7 @@ class _Consolidation:
 
     def _relocate_unit_file(self, f: _File) -> None:
         place = self.pl[f.entry_id]
-        if self._in_layout(f, place.target_path):
+        if self.ns.same_path(f.path, place.target_path):
             return
         status, final = self.ns.resolve(place.target_path, f.key, own=f.path)
         if status == "free":
@@ -740,7 +755,8 @@ class _Consolidation:
                 # and the simulator accepts a probable witness only under the same normalised name, so a
                 # twin that this plan renames can no longer vouch for the file.
                 free = [t for t in hits if t.entry_id not in self._claimed]
-                match = choose_keeper(free, prefer_remotes=self.prefer, target=self.tgt.name) if free else None
+                match = choose_keeper(free, prefer_remotes=self.prefer, target=self.tgt.name,
+                                      providers=self.providers) if free else None
                 where = self.final.get(match.entry_id, match.path) if match else None
                 if match is None or not self.include_probable or _fold(posixpath.basename(where)) != first.name_norm:
                     self._skip(first, _NEEDS_BRIDGING)
@@ -772,7 +788,7 @@ class _Consolidation:
                 c.primary = final
         loose = [f for f in c.s if not self._pinned(f)]
         if loose and c.primary is None:
-            keeper = choose_keeper(loose, prefer_remotes=self.prefer, target=self.tgt.name)
+            keeper = choose_keeper(loose, prefer_remotes=self.prefer, target=self.tgt.name, providers=self.providers)
             place = self.pl[keeper.entry_id]
             status, final = self.ns.resolve(place.target_path, c.key, same_ok=True)
             if status in ("blocked", "full"):
@@ -895,7 +911,7 @@ def build_reorganize(conn: sqlite3.Connection, *, remote: str, ruleset: classify
         if f.path in ambiguous:
             _skip(result, f, "ambiguous path")
             continue
-        if ns.same_path(f.path, p.target_path) or _renests(f.path, p.target_path, ns.fold):
+        if ns.same_path(f.path, p.target_path):
             in_place += 1
             continue
         status, final = ns.resolve(p.target_path, f.key, own=f.path)

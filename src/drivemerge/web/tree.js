@@ -313,7 +313,7 @@ export function Pane({ side, draft, tick, handle }) {
   }
 
   function cutSelection() {
-    const items = st.current.sel.map((k) => byKey.get(k)).filter((r) => r && r.node.path)
+    const items = st.current.sel.map((k) => byKey.get(k)).filter((r) => r && r.node.path && !r.node.quarantine)
       .map((r) => ({ remote: r.node.remote, path: r.node.path, is_dir: r.node.is_dir }));
     if (!items.length || !editable) return;
     cutBuffer = { items };
@@ -324,6 +324,7 @@ export function Pane({ side, draft, tick, handle }) {
     if (!cutBuffer) { ctx.toast('info', t('pane.nothingCut')); return; }
     const dst = destinationFolder();
     const target = dst && { ...dst, is_dir: true };
+    if (target && target.quarantine) { ctx.toast('warn', t('quarantine.cannotHere')); return; }
     if (!target || !canDrop(cutBuffer, target)) { ctx.toast('error', t('pane.cannotPaste')); return; }
     const { items } = cutBuffer;
     cutBuffer = null;
@@ -371,7 +372,7 @@ export function Pane({ side, draft, tick, handle }) {
         if (row) { e.preventDefault(); onRowClick({ ctrlKey: true }, row); }
         break;
       case 'F2':
-        if (row && row.node.path && editable) { e.preventDefault(); dispatch({ type: 'set', patch: { renaming: row.key } }); }
+        if (row && row.node.path && editable && !row.node.quarantine) { e.preventDefault(); dispatch({ type: 'set', patch: { renaming: row.key } }); }
         break;
       default:
     }
@@ -379,7 +380,7 @@ export function Pane({ side, draft, tick, handle }) {
 
   // ---------------------------------------------------------------- drag and drop
   function canDrop(drag, node) {
-    if (!drag || !editable || !node.is_dir) return false;
+    if (!drag || !editable || !node.is_dir || node.quarantine) return false;
     for (const it of drag.items) {
       if (it.is_dir && it.remote === node.remote && isUnder(node.path, it.path)) return false;
     }
@@ -387,11 +388,12 @@ export function Pane({ side, draft, tick, handle }) {
   }
 
   function onDragStart(e, row) {
-    if (!editable || !row.node.path) { e.preventDefault(); return; }
+    if (!editable || !row.node.path || row.node.quarantine) { e.preventDefault(); return; }
     let keys = st.current.sel;
     if (!keys.includes(row.key)) { keys = [row.key]; selectKeys(keys, row.key, row.key); }
-    const items = keys.map((k) => byKey.get(k)).filter((r) => r && r.node.path)
+    const items = keys.map((k) => byKey.get(k)).filter((r) => r && r.node.path && !r.node.quarantine)
       .map((r) => ({ remote: r.node.remote, path: r.node.path, is_dir: r.node.is_dir }));
+    if (!items.length) { e.preventDefault(); return; }
     currentDrag = { items, side };
     e.dataTransfer.effectAllowed = 'move';
     e.dataTransfer.setData('text/plain', items.map(fmtLoc).join('\n'));
@@ -462,8 +464,8 @@ export function Pane({ side, draft, tick, handle }) {
     const cur = st.current;
     const row = byKey.get(cur.focus) || byKey.get(cur.sel[0]);
     if (row) {
-      return row.node.is_dir ? { remote: row.node.remote, path: row.node.path }
-        : { remote: row.node.remote, path: parentOf(row.node.path) };
+      return row.node.is_dir ? { remote: row.node.remote, path: row.node.path, quarantine: !!row.node.quarantine }
+        : { remote: row.node.remote, path: parentOf(row.node.path), quarantine: !!row.node.quarantine };
     }
     return cur.root !== 'all' ? { remote: cur.root, path: '' } : null;
   }
@@ -471,6 +473,7 @@ export function Pane({ side, draft, tick, handle }) {
   async function newFolder() {
     const dst = destinationFolder();
     if (!dst) { ctx.toast('info', t('pane.pickFolderFirst')); return; }
+    if (dst.quarantine) { ctx.toast('warn', t('quarantine.cannotHere')); return; }
     const name = await ctx.prompt({
       title: t('mkdir.title'), message: t('mkdir.where', { dst: fmtLoc(dst) }),
       label: t('mkdir.label'), value: t('mkdir.default'), okLabel: t('mkdir.ok'),
@@ -532,6 +535,7 @@ export function Pane({ side, draft, tick, handle }) {
     ancestorsOf(n.path).forEach((p) => crumbs.push({ label: baseName(p), remote: n.remote, path: p }));
   }
 
+  const crumbNode = (c) => ({ remote: c.remote, path: c.path, is_dir: true, quarantine: !!(byKey.get(keyOf(c.remote, c.path)) || { node: {} }).node.quarantine });
   const sideLabel = side === 'left' ? t('pane.left') : t('pane.right');
   return html`<section class=${'pane' + (s.view === 'before' ? ' pane-before' : '')} data-testid=${'pane-' + side}
     aria-label=${sideLabel}>
@@ -584,12 +588,12 @@ export function Pane({ side, draft, tick, handle }) {
             <button class=${'crumb' + (s.dropKey === 'crumb:' + key ? ' drop' : '')} data-testid=${'crumb-' + key}
               onClick=${() => reveal({ remote: c.remote, path: c.path })}
               onDragOver=${(e) => {
-                if (currentDrag && canDrop(currentDrag, { remote: c.remote, path: c.path, is_dir: true })) {
+                if (currentDrag && canDrop(currentDrag, crumbNode(c))) {
                   e.preventDefault(); e.dataTransfer.dropEffect = 'move'; dispatch({ type: 'set', patch: { dropKey: 'crumb:' + key } });
                 }
               }}
               onDragLeave=${() => dispatch({ type: 'set', patch: { dropKey: null } })}
-              onDrop=${(e) => onDrop(e, { remote: c.remote, path: c.path, is_dir: true })}>${c.label}</button>
+              onDrop=${(e) => onDrop(e, crumbNode(c))}>${c.label}</button>
           </span>`;
         })}
       </nav>
@@ -655,24 +659,28 @@ function Row({ row, s, tabbable, editable, onClick, onFocus, onToggle, dispatch,
   if (n.conflict) cls.push('is-conflict');
   if (n.virtual) cls.push('is-virtual');
   if (n.dedupe) cls.push('is-dedupe');
+  if (n.quarantine) cls.push('is-quarantine');
+  if (n.quarantine_root) cls.push('is-quarantine-root');
   if (isDir && s.dropKey === key) cls.push('drop');
   if (s.flash === key) cls.push('flash');
   if (!n.path) cls.push('is-root');
-  const category = isDir ? (n.path ? 'folder' : 'cloud') : n.category || 'other';
+  const category = n.quarantine_root ? 'quarantine' : isDir ? (n.path ? 'folder' : 'cloud') : n.category || 'other';
   const renaming = s.renaming === key;
+  const locked = !!n.quarantine;
+  const tip = n.quarantine_root ? t('quarantine.tip', { dir: n.name }) : locked ? t('quarantine.inside') : undefined;
 
   return html`<div class=${cls.join(' ')} style=${indent} role="treeitem" aria-level=${row.level + 1}
     aria-selected=${selected} aria-expanded=${isDir ? open : undefined} tabindex=${tabbable ? 0 : -1}
     data-testid=${'node-' + key} data-key=${key} data-remote=${n.remote} data-path=${n.path} data-kind=${isDir ? 'dir' : 'file'}
-    data-droptarget=${isDir ? key : undefined}
-    draggable=${editable && !!n.path && !renaming}
+    data-droptarget=${isDir && !locked ? key : undefined} data-quarantine=${n.quarantine_root ? 'root' : locked ? 'inside' : undefined}
+    title=${tip} draggable=${editable && !!n.path && !renaming && !locked}
     onClick=${(e) => onClick(e, row)} onFocus=${() => onFocus(key)} onDragStart=${(e) => onDragStart(e, row)}
     onDragOver=${(e) => onDragOver(e, row)} onDrop=${(e) => onDrop(e, n)}>
     ${isDir
     ? html`<button class=${'twisty' + (open ? ' open' : '')} tabindex="-1" aria-hidden="true" data-testid=${'toggle-' + key}
         onClick=${(e) => { e.stopPropagation(); onToggle(key); }}><${Icon} name="chevron" size=${12} /></button>`
     : html`<span class="twisty-space"></span>`}
-    <${Icon} name=${iconFor(n)} size=${16} class=${'cat-' + category} />
+    <${Icon} name=${n.quarantine_root ? 'lock' : iconFor(n)} size=${16} class=${'cat-' + category} />
     ${renaming
     ? html`<input class="rename" data-testid="rename-input" defaultValue=${n.name} ref=${(el) => {
       if (el && !el.dataset.ready) {
@@ -689,9 +697,10 @@ function Row({ row, s, tabbable, editable, onClick, onFocus, onToggle, dispatch,
           else if (e.key === 'Escape') dispatch({ type: 'set', patch: { renaming: null } });
         }}
         onBlur=${() => dispatch({ type: 'set', patch: { renaming: null } })} />`
-    : html`<span class="name" title=${n.name} onDblClick=${(e) => {
-      if (editable && n.path) { e.stopPropagation(); dispatch({ type: 'set', patch: { renaming: key } }); }
-    }}>${n.name}</span>`}
+    : html`<span class="name" title=${tip || n.name} data-testid=${n.quarantine_root ? 'quarantine-label' : undefined} onDblClick=${(e) => {
+      if (editable && n.path && !locked) { e.stopPropagation(); dispatch({ type: 'set', patch: { renaming: key } }); }
+    }}>${n.quarantine_root ? t('quarantine.label') : n.name}</span>
+    ${n.quarantine_root && html`<span class="q-dir" title=${tip}>${n.name}</span>`}`}
     <${Badges} node=${n} />
     <span class="meta">
       ${isDir

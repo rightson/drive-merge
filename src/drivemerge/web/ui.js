@@ -1,5 +1,5 @@
 // Small shared widgets: modal shell, confirm/prompt dialogs, toast stack.
-import { html, useEffect, useRef, useState } from './vendor/htm-preact-standalone.mjs';
+import { html, useEffect, useLayoutEffect, useRef, useState } from './vendor/htm-preact-standalone.mjs';
 import { t } from './i18n.js';
 import { Icon } from './icons.js';
 
@@ -63,15 +63,44 @@ export function DialogHost({ request }) {
 
 const TOAST_ICON = { info: 'info', success: 'check', warn: 'alert', error: 'alert', claude: 'claude' };
 
+/** One toast. Its timer (`ttl` ms, 0 = stays until closed) stands still while the pointer or keyboard focus is on it. */
+function Toast({ x, dismiss }) {
+  const [held, setHeld] = useState(false);
+  useEffect(() => {
+    if (!x.ttl || held) return undefined;
+    const timer = setTimeout(() => dismiss(x.id), x.ttl);
+    return () => clearTimeout(timer);
+  }, [held, x.id, x.ttl]);
+  return html`<div class=${'toast toast-' + x.kind} data-testid="toast" data-kind=${x.kind}
+    role=${x.kind === 'error' ? 'alert' : 'status'} onMouseEnter=${() => setHeld(true)} onMouseLeave=${() => setHeld(false)}
+    onFocusCapture=${() => setHeld(true)} onBlurCapture=${() => setHeld(false)}>
+    <${Icon} name=${TOAST_ICON[x.kind] || 'info'} size=${16} />
+    <span class="toast-text">${x.text}</span>
+    ${x.action && html`<button class="btn btn-small" data-testid="toast-action"
+      onClick=${() => { dismiss(x.id); x.action.run(); }}>${x.action.label}</button>`}
+    <button class="icon-btn" aria-label=${t('common.close')} data-testid="toast-close" onClick=${() => dismiss(x.id)}>
+      <${Icon} name="x" size=${14} /></button>
+  </div>`;
+}
+
+/**
+ * The toast stack, bottom right. Its height is published as --toast-reserve, which the modal backdrop
+ * leaves free below the dialog: a toast must never sit on a dialog's footer buttons.
+ */
 export function Toasts({ toasts, dismiss }) {
-  return html`<div class="toasts" data-testid="toasts" aria-live="polite" aria-atomic="false">
-    ${toasts.map((x) => html`<div key=${x.id} class=${'toast toast-' + x.kind} data-testid="toast" data-kind=${x.kind}
-      role=${x.kind === 'error' ? 'alert' : 'status'}>
-      <${Icon} name=${TOAST_ICON[x.kind] || 'info'} size=${16} />
-      <span class="toast-text">${x.text}</span>
-      ${x.action && html`<button class="btn btn-small" data-testid="toast-action"
-        onClick=${() => { dismiss(x.id); x.action.run(); }}>${x.action.label}</button>`}
-      <button class="icon-btn" aria-label=${t('common.close')} onClick=${() => dismiss(x.id)}><${Icon} name="x" size=${14} /></button>
-    </div>`)}
+  const box = useRef(null);
+  useLayoutEffect(() => {
+    const el = box.current;
+    const root = document.documentElement.style;
+    if (!el || !toasts.length) { root.removeProperty('--toast-reserve'); return undefined; }
+    const publish = () => root.setProperty('--toast-reserve', `${el.offsetHeight + 16}px`);
+    publish();
+    if (typeof ResizeObserver === 'undefined') return () => root.removeProperty('--toast-reserve');
+    const watcher = new ResizeObserver(publish);
+    watcher.observe(el);
+    return () => { watcher.disconnect(); root.removeProperty('--toast-reserve'); };
+  }, [toasts.length > 0]);
+  return html`<div class="toasts" ref=${box} data-testid="toasts" aria-live="polite" aria-atomic="false">
+    ${toasts.map((x) => html`<${Toast} key=${x.id} x=${x} dismiss=${dismiss} />`)}
   </div>`;
 }

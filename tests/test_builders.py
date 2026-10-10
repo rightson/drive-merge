@@ -8,6 +8,8 @@ trust the component that is supposed to catch the builders' mistakes.
 from __future__ import annotations
 
 import itertools
+import posixpath
+import unicodedata
 from collections import namedtuple
 
 import pytest
@@ -85,6 +87,32 @@ class World:
 
     def key(self, remote: str, path: str) -> str:
         return self.live()[(remote, path)]
+
+    def apply(self, ops) -> None:
+        """Leave the catalog as the executor would after the ops: moves rename the row, copies add one, deletes hide it."""
+        labels = {group: label for label, group in self.groups.items()}
+        names = self.names()
+        for op in ops:
+            row = self.conn.execute("SELECT * FROM entries WHERE id = ?", (op.src_entry_id,)).fetchone()
+            if op.op == "delete":
+                self.conn.execute("UPDATE entries SET present = 0 WHERE id = ?", (row["id"],))
+            elif op.op == "move":
+                base = posixpath.basename(op.dst_path)
+                key = f"p:{op.dst_path}" if row["entry_key"].startswith("p:") else row["entry_key"]
+                self.conn.execute(
+                    "UPDATE entries SET path = ?, parent = ?, name = ?, name_norm = ?, entry_key = ? WHERE id = ?",
+                    (op.dst_path, posixpath.dirname(op.dst_path), base,
+                     unicodedata.normalize("NFC", base).casefold(), key, row["id"]))
+            else:
+                self.put(names[op.dst_remote_id], op.dst_path, labels.get(row["content_group"]),
+                         size=row["size"], mtime=row["mtime"])
+        self.conn.execute("DELETE FROM entries WHERE is_dir = 1")                   # folders follow the files
+        folders = set()
+        for rid, parent in self.conn.execute("SELECT remote_id, parent FROM entries WHERE is_dir = 0 AND present = 1"):
+            parts = parent.split("/") if parent else []
+            folders.update((rid, "/".join(parts[:i])) for i in range(1, len(parts) + 1))
+        for rid, folder in sorted(folders):
+            self.cat.dir(rid, folder)
 
 
 @pytest.fixture
@@ -189,6 +217,55 @@ def test_keeper_is_deterministic_under_any_order():
     assert winners == {3}
 
 
+PROVIDERS = {"gd": "drive", "od": "onedrive", "dbx": "dropbox", "loc": "local", "oth": "other", "ic": "iclouddrive"}
+
+
+def provider_pool(**override):
+    """One identical-looking copy per provider (same depth, mtime), entry ids in the *opposite* order of the policy."""
+    names = list(PROVIDERS)
+    return [cp(10 - i, "x.txt", name, rid=i + 1) for i, name in enumerate(names)], {**PROVIDERS, **override}
+
+
+def test_keeper_provider_order_drive_onedrive_dropbox_local_other_icloud():
+    pool, providers = provider_pool()
+    left = list(pool)
+    order = []
+    while left:
+        best = choose_keeper(left, providers=providers)
+        order.append(best.remote)
+        left.remove(best)
+    assert order == ["gd", "od", "dbx", "loc", "oth", "ic"]
+    assert builders.KEEPER_PROVIDER_ORDER == ("drive", "onedrive", "dropbox", "local", "other", "iclouddrive")
+
+
+def test_keeper_provider_comes_after_target_prefer_and_copy_pattern_but_before_depth_mtime_id():
+    gd, ic = cp(5, "a/b/c/x.txt", "gd", 1, "2030-01-01T00:00:00Z"), cp(1, "x.txt", "ic", 2, "2000-01-01T00:00:00Z")
+    providers = {"gd": "drive", "ic": "iclouddrive"}
+    assert choose_keeper([ic, gd], providers=providers) is gd                    # beats shallower, older, smaller id
+    assert choose_keeper([ic, gd]) is ic                                         # without provider info, as before
+    assert choose_keeper([gd, ic], providers=providers, target="ic") is ic       # the target comes first
+    assert choose_keeper([gd, ic], providers=providers, prefer_remotes=["ic"]) is ic
+    ic_clean, gd_copy = cp(1, "x.txt", "ic", 2), cp(2, "x (1).txt", "gd", 1)
+    assert choose_keeper([gd_copy, ic_clean], providers=providers) is ic_clean   # a copy-style name loses first
+
+
+def test_keeper_provider_lookup_by_name_id_or_own_field_and_unknown_is_other():
+    a, b, c = cp(1, "x.txt", "ic", 7), cp(2, "x.txt", "oth", 8), cp(3, "x.txt", "dbx", 9)
+    assert choose_keeper([a, b, c], providers={7: "iclouddrive", 8: "other", 9: "dropbox"}) is c   # by remote id
+    assert choose_keeper([a, b], providers={"ic": "iclouddrive"}) is b           # "oth" is unknown: ranks as other
+    assert choose_keeper([a, b], providers={"ic": "iclouddrive", "oth": "somethingnew"}) is b
+    as_dicts = [{"id": 1, "remote_id": 1, "path": "x", "provider": "iclouddrive"},
+                {"id": 2, "remote_id": 2, "path": "x", "provider": "drive"}]
+    assert choose_keeper(as_dicts)["id"] == 2                                    # a copy's own provider field counts
+    assert choose_keeper([cp(2, "x", "m", 1), cp(1, "x", "l", 2)], providers={"m": "memory", "l": "local"}).entry_id == 1
+
+
+def test_keeper_with_providers_is_deterministic_under_any_order():
+    pool, providers = provider_pool()
+    winners = {choose_keeper(list(p), providers=providers).remote for p in itertools.permutations(pool)}
+    assert winners == {"gd"}
+
+
 def test_keeper_accepts_copies_rows_and_dicts(w):
     w.put("gdrive", "a/x.txt", "X", mtime="2020-01-01T00:00:00Z")
     w.put("gdrive", "x (1).txt", "X")
@@ -266,6 +343,28 @@ def test_cross_remote_keeper_may_live_on_a_read_only_remote(w):
     w.put("gdrive", "copy/p.jpg", "P")
     r = build_dedupe(w.conn, cross_remote=True, prefer_remotes=["archive"])
     assert [(o.src_path, o.witness_path) for o in r.ops] == [("copy/p.jpg", "p.jpg")]
+    run(w, r)
+
+
+def test_cross_remote_dedupe_does_not_keep_the_bridged_icloud_copy(w):
+    w.put("icloud", "x.pdf", "X", mtime="2001-01-01T00:00:00Z")                 # shallowest, oldest, lowest id
+    w.put("dropbox", "deep/er/x.pdf", "X")
+    w.put("onedrive", "deeper/still/x.pdf", "X")
+    r = build_dedupe(w.conn, cross_remote=True)
+    assert sorted((w.names()[o.src_remote_id], o.witness_path) for o in r.ops) == [
+        ("dropbox", "deeper/still/x.pdf"), ("icloud", "deeper/still/x.pdf")]     # the onedrive copy outranks dropbox
+    assert all(o.witness_remote_id == w.rid["onedrive"] for o in r.ops)
+    run(w, r)
+    kept = build_dedupe(w.conn, cross_remote=True, prefer_remotes=["icloud"])    # the owner can still choose it
+    assert {o.witness_remote_id for o in kept.ops} == {w.rid["icloud"]}
+
+
+def test_cross_remote_dedupe_prefers_drive_then_onedrive_then_dropbox(w):
+    for name in ("icloud", "dropbox", "onedrive", "gdrive"):
+        w.put(name, f"{name}/x.bin", "X")
+    r = build_dedupe(w.conn, cross_remote=True)
+    assert {(o.witness_remote_id, o.witness_path) for o in r.ops} == {(w.rid["gdrive"], "gdrive/x.bin")}
+    assert sorted(w.names()[o.src_remote_id] for o in r.ops) == ["dropbox", "icloud", "onedrive"]
     run(w, r)
 
 
@@ -699,6 +798,16 @@ def test_consolidate_sources_option_and_prefer_remotes(w):
     assert "Documents/2024/x.pdf" in dsts(r)
 
 
+def test_consolidate_layout_follows_the_provider_preferred_keeper(w):
+    w.put("icloud", "x.pdf", "X", mtime="2020-02-02T00:00:00Z")                  # the shallow bridged copy
+    w.put("dropbox", "deep/er/report.pdf", "X", mtime="2020-02-02T00:00:00Z")
+    r = build_consolidate(w.conn, target="gdrive")
+    assert dsts(r) == ["Documents/2020/report.pdf"]                              # named after the dropbox copy
+    run(w, r)
+    r = build_consolidate(w.conn, target="gdrive", prefer_remotes=["icloud"])
+    assert dsts(r) == ["Documents/2020/x.pdf"]
+
+
 def test_consolidate_rejects_bad_arguments(w):
     w.remote("ro", "drive", writable=False)
     with pytest.raises(BuildError, match="read-only"):
@@ -869,12 +978,42 @@ def test_path_keeping_fallback_does_not_nest_on_a_second_run(w):
     w.conn.execute("UPDATE entries SET path = ?, parent = ? WHERE name = 'notes.bin'",
                    ("Unsorted/gdrive/Scratch/notes.bin", "Unsorted/gdrive/Scratch"))
     assert build_reorganize(w.conn, remote="gdrive").ops == []
-    rooted = build_reorganize(w.conn, remote="gdrive", target_root="Sorted")
-    assert [o.dst_path for o in rooted.ops] == ["Sorted/Unsorted/gdrive/Unsorted/gdrive/Scratch/notes.bin"]
+    rooted = build_reorganize(w.conn, remote="gdrive", target_root="Sorted")      # moves in under the root, once
+    assert [o.dst_path for o in rooted.ops] == ["Sorted/Unsorted/gdrive/Scratch/notes.bin"]
     w.conn.execute("UPDATE entries SET path = ?, parent = ? WHERE name = 'notes.bin'",
                    ("Sorted/Unsorted/gdrive/Scratch/notes.bin", "Sorted/Unsorted/gdrive/Scratch"))
     assert build_reorganize(w.conn, remote="gdrive", target_root="Sorted").ops == []
     assert build_consolidate(w.conn, target="gdrive", target_root="Sorted", reorganize_target=True).ops == []
+
+
+def test_files_below_the_root_are_laid_out_relative_to_it(w):
+    w.put("gdrive", "Archive/Unsorted/gdrive/Scratch/placed.bin", "P")        # an earlier run's result
+    w.put("gdrive", "Archive/Mine/own.bin", "O")                              # the user's own folder in the root
+    w.put("gdrive", "Elsewhere/x.bin", "X")
+    r = build_reorganize(w.conn, remote="gdrive", target_root="Archive")
+    assert sorted((o.src_path, o.dst_path) for o in r.ops) == [
+        ("Archive/Mine/own.bin", "Archive/Unsorted/gdrive/Mine/own.bin"),
+        ("Elsewhere/x.bin", "Archive/Unsorted/gdrive/Elsewhere/x.bin")]
+    assert r.stats["in_place"] == 1
+    run(w, r)
+
+
+def test_consolidated_copy_on_the_target_is_not_moved_by_a_second_run(w):
+    w.put("dropbox", "Misc/w.bin", "W")
+    first = build_consolidate(w.conn, target="gdrive", target_root="Archive", reorganize_target=True)
+    assert dsts(first) == ["Archive/Unsorted/dropbox/Misc/w.bin"]               # the layout of the dropbox file
+    w.apply(first.ops)
+    again = build_consolidate(w.conn, target="gdrive", target_root="Archive", reorganize_target=True)
+    assert again.ops == []                                                       # not Unsorted/gdrive/Unsorted/dropbox/...
+    assert build_consolidate(w.conn, target="gdrive", target_root="Archive", reorganize_target=True,
+                             delete_sources=True).ops[0].op == "delete"          # only the source copy goes
+
+
+def test_a_source_folder_named_like_the_root_is_just_a_folder(w):
+    w.put("dropbox", "Archive/Old/a.bin", "A")
+    r = build_consolidate(w.conn, target="gdrive", target_root="Archive")
+    assert dsts(r) == ["Archive/Unsorted/dropbox/Archive/Old/a.bin"]
+    run(w, r)
 
 
 def test_reorganize_target_moves_a_whole_unit_on_the_target(w):
@@ -925,13 +1064,21 @@ def _mtime(rnd) -> str:
     return f"20{rnd.randint(18, 23)}-0{rnd.randint(1, 9)}-15T00:00:00Z"
 
 
-def random_world(w: World, rnd) -> None:
+def random_world(w: World, rnd, *, bridged: bool = False) -> None:
+    """A random catalog. With `bridged` the iCloud files are proven copies (hashed) instead of unhashed, every
+    copy of a content has the same mtime (as it would after a copy: a layout dated by mtime must not depend on
+    which copy it was read from), and gdrive, the consolidate target of the tests, holds each content once."""
     w.remote("ro", "dropbox", writable=False)
     remotes = list(w.rid)
     sizes = {f"C{i}": 20 + 7 * i for i in range(8)}
     used: set[tuple[str, str]] = set()
+    on_gdrive: set[str] = set()
+
+    def stamp(label: str) -> str:
+        return f"20{10 + int(label[1:])}-0{1 + int(label[1:])}-15T00:00:00Z" if bridged else _mtime(rnd)
+
     if rnd.random() < 0.7:
-        w.put("dropbox", "Code/repo/.git/HEAD", "C0", size=sizes["C0"])
+        w.put("dropbox", "Code/repo/.git/HEAD", "C0", size=sizes["C0"], **({"mtime": stamp("C0")} if bridged else {}))
         used.add(("dropbox", "code/repo/.git/head"))
     for _ in range(rnd.randint(8, 40)):
         remote = rnd.choice(remotes)
@@ -943,13 +1090,17 @@ def random_world(w: World, rnd) -> None:
             continue
         used.add(folded)
         label = rnd.choice(list(sizes))
+        if bridged and remote == "gdrive":
+            if label in on_gdrive:
+                continue
+            on_gdrive.add(label)
         if remote == "icloud":
-            w.put(remote, path, None, size=sizes[label], mtime=_mtime(rnd))
+            w.put(remote, path, label if bridged else None, size=sizes[label], mtime=stamp(label))
         elif rnd.random() < 0.08 and remote == "gdrive":
             w.put(remote, path, label, size=sizes[label], provider_id=f"id{len(used)}")
             w.put(remote, path, rnd.choice(list(sizes)), size=999, provider_id=f"idb{len(used)}")  # an ambiguous path
         else:
-            w.put(remote, path, label, size=sizes[label], mtime=_mtime(rnd))
+            w.put(remote, path, label, size=sizes[label], mtime=stamp(label))
 
 
 def assert_units_arrived(w, after, skipped, target, root) -> None:
@@ -1001,3 +1152,78 @@ def test_random_catalogs_produce_clean_plans(w, seed):
                 assert (rem, path) not in after, f"{rem}:{path} survived delete_sources"
         assert survivors <= set(after.values())
         assert_units_arrived(w, after, skipped, target, flags["target_root"])
+
+
+# =============================================================================
+# idempotence: a plan, once applied, leaves nothing to do
+# =============================================================================
+
+_RULESETS = {
+    "default": None,
+    "keep-path": '',
+    "dir-keeping": '[layout]\nfallback = "Misc/{parent}/{dir}/{name}"\n'
+                   '[[rule]]\nname = "p"\ncategory = ["photo"]\ntarget = "Pics/{year}/{path}"\n'
+                   '[[rule]]\nname = "u"\nunit = true\ntarget = "Units/{dir}/{unit}/{relpath}"\n',
+    "remote-first": '[layout]\nfallback = "{remote}/{category}/{relpath}"\n',
+}
+
+
+def _ruleset(name):
+    text = _RULESETS[name]
+    return None if text is None else _rules(text)
+
+
+def put_some_under_root(w, rnd, root: str) -> None:
+    """Move a share of the files below the root, as if an earlier (partial) run or the user had put them there."""
+    if not root:
+        return
+    chosen = {(rid, path) for rid, path, in w.conn.execute(
+        "SELECT remote_id, path FROM entries WHERE is_dir = 0 AND present = 1") if rnd.random() < 0.4}
+    for rid, path in sorted(chosen):
+        new = f"{root}/{path}"
+        w.conn.execute("UPDATE entries SET path = ?, parent = ?, entry_key = CASE WHEN entry_key LIKE 'p:%' "
+                       "THEN ? ELSE entry_key END WHERE remote_id = ? AND path = ? AND is_dir = 0",
+                       (new, posixpath.dirname(new), f"p:{new}", rid, path))
+    w.apply([])
+
+
+@pytest.mark.parametrize("seed", range(20))
+@pytest.mark.parametrize("root", ["", "Sorted", "Archive/2024"])
+@pytest.mark.parametrize("rules", list(_RULESETS))
+def test_applied_reorganize_leaves_nothing_to_do(w, seed, root, rules):
+    """Property: apply a reorganize plan's moves to the catalog, build again, and there are no ops."""
+    import random
+    rnd = random.Random(f"{seed}/{root}/{rules}")
+    random_world(w, rnd)
+    put_some_under_root(w, rnd, root)
+    ruleset = _ruleset(rules)
+    writable = [name for name in w.rid if name != "ro"]
+    for remote in writable:
+        r = build_reorganize(w.conn, remote=remote, ruleset=ruleset, target_root=root)
+        run(w, r)
+        w.apply(r.ops)
+    for remote in writable:
+        again = build_reorganize(w.conn, remote=remote, ruleset=ruleset, target_root=root)
+        assert [(o.src_path, o.dst_path) for o in again.ops] == [], f"{remote} {rules} root={root!r} seed={seed}"
+
+
+@pytest.mark.parametrize("seed", range(20))
+@pytest.mark.parametrize("root", ["", "Archive"])
+@pytest.mark.parametrize("flags", [
+    dict(), dict(reorganize_target=True), dict(delete_sources=True), dict(reorganize_target=True, delete_sources=True)],
+    ids=["copy", "reorganize-target", "delete-sources", "reorganize-and-delete"])
+def test_applied_consolidate_leaves_nothing_to_do(w, seed, root, flags):
+    """Property: run a consolidate, apply its moves, copies and deletes, build again: no ops (proven content only).
+
+    The target holds one copy of each content (see random_world): which of several copies is the keeper depends
+    on how deep each lies, so moving one into the layout can hand the role to another. Dedupe the target first.
+    """
+    import random
+    rnd = random.Random(f"{seed}/{root}/{sorted(flags)}")
+    random_world(w, rnd, bridged=True)
+    put_some_under_root(w, rnd, root if flags.get("reorganize_target") else "")
+    r = build_consolidate(w.conn, target="gdrive", target_root=root, **flags)
+    run(w, r)
+    w.apply(r.ops)
+    again = build_consolidate(w.conn, target="gdrive", target_root=root, **flags)
+    assert [(o.op, o.src_path, o.dst_path or o.witness_path) for o in again.ops] == [], f"seed={seed} {flags}"

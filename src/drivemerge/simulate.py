@@ -12,6 +12,13 @@ copy/move inherits its source's key.
 
 Files under the quarantine directory are never "live content": a purge would
 destroy them, so they must not serve as witnesses or count as surviving copies.
+
+A delete whose witness is a file created earlier in the same plan must say so
+with depends_on (directly or through other ops): an executor may then run it
+only after the copy that made the witness has been verified.
+
+The report lists at most MAX_REPORTED violations and warnings so a huge failing
+plan stays readable and storable; `ok` and the totals always use the full count.
 """
 
 from __future__ import annotations
@@ -22,10 +29,11 @@ from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 
 from . import db, plans
-from .models import Op, RemoteDelta, SimulationReport, Violation
+from .models import Op, RemoteDelta, SimulationReport, Violation, count_codes
 
 _NODE_COLS = "id, path, is_dir, size, name_norm, content_group, is_native_doc, md5, sha1, sha256, dropbox, quickxor"
 _CHUNK = 500  # bound parameters per IN (...) query
+MAX_REPORTED = 1000  # violations and warnings kept in a report (the first ones, in op order)
 
 
 @dataclass
@@ -70,10 +78,10 @@ def _path_problem(path: object) -> str | None:
 class _Node:
     """A live catalog entry or a virtual file created by the plan."""
 
-    __slots__ = ("id", "path", "is_dir", "size", "name_norm", "key", "native", "hashes", "virtual")
+    __slots__ = ("id", "path", "is_dir", "size", "name_norm", "key", "native", "hashes", "virtual", "made_by")
 
     def __init__(self, id: int | None, path: str, is_dir: bool, size: int | None, name_norm: str,
-                 key: str, native: bool, hashes: tuple, virtual: bool):
+                 key: str, native: bool, hashes: tuple, virtual: bool, made_by: int | None = None):
         self.id = id
         self.path = path
         self.is_dir = is_dir
@@ -83,6 +91,7 @@ class _Node:
         self.native = native
         self.hashes = hashes
         self.virtual = virtual
+        self.made_by = made_by  # seq of the op that created a virtual file
 
 
 def _node(r: Sequence) -> _Node:
@@ -139,6 +148,7 @@ class _Engine:
         self._qsql = " AND NOT (path = ? OR substr(path, 1, ?) = ?)" if q else ""
         self._qargs: tuple = (q, len(q) + 1, q + "/") if q else ()
         self.seqs: set[int] = set()
+        self.dep_of: dict[int, int | None] = {}              # seq -> its depends_on, for every op of the plan
         # Catalog reads are immutable during a run, so they are cached; the overlay is not.
         self._base_cache: dict[tuple[int, str], list[_Node]] = {}
         self._ci_cache: dict[tuple[int, str], list[tuple[str, _Node]]] = {}
@@ -223,10 +233,10 @@ class _Engine:
         """Remote:path for messages. repr() because file names are untrusted text."""
         return repr(self.label(rid, path))
 
-    def _add(self, rid: int, path: str, tpl: _Node, entry_id: int | None) -> None:
-        """Create a virtual file that inherits tpl's identity (key, size, hashes) and its parents."""
+    def _add(self, rid: int, path: str, tpl: _Node, entry_id: int | None, seq: int) -> None:
+        """Create a virtual file (made by op `seq`) that inherits tpl's identity (key, size, hashes) and its parents."""
         node = _Node(entry_id, path, False, tpl.size, _fold(path.rsplit("/", 1)[-1]),
-                     tpl.key, tpl.native, tpl.hashes, True)
+                     tpl.key, tpl.native, tpl.hashes, True, seq)
         self.vfiles[(rid, path)] = node
         ci = self.remotes[rid].ci
         if ci:
@@ -417,6 +427,20 @@ class _Engine:
             bad("CASE_COLLISION", f"{self._w(drid, dpath)} collides with {self._w(drid, p)} (case-insensitive)")
             return
 
+    def _depends_on(self, seq: int, target: int | None) -> bool:
+        """True when op `seq` depends on op `target`, directly or along a chain of depends_on.
+
+        Only links that point strictly backwards are followed, so a malformed chain ends instead of looping.
+        """
+        cur = seq
+        while True:
+            nxt = self.dep_of.get(cur)
+            if not isinstance(nxt, int) or nxt >= cur or nxt not in self.dep_of:
+                return False
+            if nxt == target:
+                return True
+            cur = nxt
+
     def _check_witness(self, op: Op, seq: int, src: _Node, given: bool, addr_ok: bool, bad, warn) -> _Witness | None:
         wrid, wpath = op.witness_remote_id, op.witness_path
         if not given:
@@ -437,6 +461,9 @@ class _Engine:
         if w is None:
             bad("NO_WITNESS", f"no live file at the witness {ww}: {self._why_missing(wrid, wpath)}")
             return None
+        if w.virtual and not self._depends_on(seq, w.made_by):
+            bad("DEPENDENCY", f"the witness {ww} is created by op {w.made_by}; this delete must declare "
+                              f"depends_on that op (directly or through other ops)")
         verdict = _compare(src, w)
         if verdict == "same":
             return _Witness(seq, wrid, wpath, w.key, src.key, False)
@@ -463,7 +490,7 @@ class _Engine:
             if action == "same":
                 self.warnings.append(Violation("NOOP", f"{self._w(drid, dpath)} already holds identical content", seq))
                 return
-            self._add(drid, dpath, src, None)
+            self._add(drid, dpath, src, None, seq)
             st = self._stat(drid)
             st[2] += size
             free = (self.policy.free_bytes or {}).get(drid)
@@ -485,7 +512,7 @@ class _Engine:
                 self._quarantine(srid, size)
                 self.witnesses.append(_Witness(seq, drid, dpath, src.key, src.key, False))
             else:
-                self._add(drid, dpath, src, src.id)
+                self._add(drid, dpath, src, src.id, seq)
         else:
             assert witness is not None
             self._touch(src, srid, spath, seq)
@@ -611,6 +638,7 @@ def simulate_ops(conn: sqlite3.Connection, ops: list[Op], *, plan_id: int | None
     eng = _Engine(conn, policy)
     ordered = _ordered(ops)
     eng.seqs = {s for s, _ in ordered}
+    eng.dep_of = {s: o.depends_on for s, o in ordered}
     touched = sorted({rid for _, o in ordered for rid in (o.src_remote_id, o.dst_remote_id, o.witness_remote_id)
                       if rid in eng.remotes})
     counts = {"copy": 0, "move": 0, "delete": 0}
@@ -635,9 +663,11 @@ def simulate_ops(conn: sqlite3.Connection, ops: list[Op], *, plan_id: int | None
     } for seq, op in ordered[:max(0, policy.sample_size)]]
     return SimulationReport(
         plan_id=plan_id, digest=digest, ok=not eng.violations,
-        violations=eng.violations, warnings=eng.warnings, remotes=deltas,
+        violations=eng.violations[:MAX_REPORTED], warnings=eng.warnings[:MAX_REPORTED], remotes=deltas,
         contents_before=contents_before, contents_after=contents_after, contents_lost=lost,
         bytes_cross_remote=eng.bytes_cross, op_counts=counts, sample=sample,
+        violations_total=len(eng.violations), warnings_total=len(eng.warnings),
+        violations_by_code=count_codes(eng.violations), warnings_by_code=count_codes(eng.warnings),
     )
 
 

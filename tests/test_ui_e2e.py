@@ -96,6 +96,29 @@ def _live(root: Path) -> dict[str, bytes]:
             if p.is_file() and not str(p.relative_to(root)).startswith(QUARANTINE)}
 
 
+def _api(world: "World", method: str, path: str, body: dict | None = None) -> tuple[int, dict]:
+    """A call as Claude or a script makes it: the API token, no page."""
+    request = urllib.request.Request(
+        f"{world.url}{path}", method=method, data=None if body is None else json.dumps(body).encode(),
+        headers={"Authorization": f"Bearer {API_TOKEN}", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request) as answer:
+            return answer.status, json.load(answer)
+    except urllib.error.HTTPError as refused:
+        return refused.code, json.load(refused)
+
+
+def _rescan_from_a_terminal(world: "World", cloud: str) -> None:
+    """What `drivemerge scan` does in the person's own terminal: a second Service on the same catalog."""
+    terminal = Service(world.config)
+    try:
+        assert terminal.scan(cloud)["status"] == "complete"
+        terminal.rebuild_identity()
+        terminal.refresh_dir_stats()
+    finally:
+        terminal.conn.close()
+
+
 class World:
     """The three clouds on disk, the service that catalogs them and the web server on top."""
 
@@ -468,6 +491,27 @@ def test_reorganise_school_and_research_folders_from_two_panes(make_world, perso
     expect(me.node("right", "gd:Research/Thesis/refs.bib").locator('[data-badge="dup"]')).to_have_count(0)
     expect(me.node("left", "dbx:")).not_to_contain_text("重複")
     expect(me.node("left", f"dbx:{QUARANTINE}")).to_contain_text("4 個檔案")  # still there, still counted as files
+    # ... but drawn apart: labelled, explained, and neither draggable nor a drop target.
+    parked = me.node("left", f"dbx:{QUARANTINE}")
+    expect(parked).to_have_attribute("data-quarantine", "root")
+    expect(parked.get_by_test_id("quarantine-label")).to_have_text("隔離區")
+    expect(parked).to_have_attribute("draggable", "false")
+    assert "drivemerge plan restore" in parked.get_attribute("title") and "plan purge" in parked.get_attribute("title")
+    me.drag(("left", f"dbx:{QUARANTINE}"), ("right", "gd:Research"))
+    me.drag(("right", "gd:Research/論文資料"), ("left", f"dbx:{QUARANTINE}"))
+    me.staged(0)
+    me.expand("left", f"dbx:{QUARANTINE}")
+    expect(me.node("left", f"dbx:{QUARANTINE}/{plan_id}")).to_have_attribute("data-quarantine", "inside")
+    me.drag(("left", f"dbx:{QUARANTINE}/{plan_id}"), ("right", "gd:Research"))
+    me.staged(0)
+    # The server refuses the same moves for anyone who bypasses the page (the API, Claude through MCP).
+    draft_id = _api(world, "GET", "/v1/drafts")[1]["drafts"][0]["id"]
+    for items, dst in (([{"remote": "dbx", "path": f"{QUARANTINE}/{plan_id}/School"}], {"remote": "gd", "path": ""}),
+                       ([{"remote": "gd", "path": "Photos"}], {"remote": "dbx", "path": f"{QUARANTINE}/{plan_id}"}),
+                       ([{"remote": "dbx", "path": QUARANTINE}], {"remote": "gd", "path": ""})):
+        status, out = _api(world, "POST", f"/v1/drafts/{draft_id}/actions", {"kind": "move", "items": items, "dst": dst})
+        assert (status, out["code"]) == (409, "QUARANTINE"), out
+    assert _api(world, "GET", f"/v1/drafts/{draft_id}")[1]["actions"] == []
     expect(me.node("right", "gd:Research/論文資料")).to_be_visible()
     expect(me.node("right", "gd:Old/論文資料")).to_have_count(1)  # the emptied folder stays behind (v1 limitation)
     expect(me.node("right", "gd:Old/論文資料")).to_contain_text("空")
@@ -510,6 +554,10 @@ def test_a_merge_with_different_content_is_a_conflict_that_cannot_be_approved(ma
     modal = page.get_by_test_id("preview-modal")
     expect(modal.get_by_test_id("sim-status")).to_have_attribute("data-ok", "false")
     expect(modal.get_by_test_id("conflict").first).to_contain_text("refs.bib")
+    first = modal.get_by_test_id("conflict").first
+    expect(first).to_have_attribute("data-code", "DIFFERENT_CONTENT")
+    expect(first).to_contain_text("同名但內容不同的檔案")              # the engine's code, in the person's language ...
+    expect(first.get_by_test_id("problem-raw")).to_contain_text("a different file already has that name")  # ... raw kept
     expect(modal.get_by_test_id("summary-conflicts")).to_contain_text("1")
     expect(modal.get_by_test_id("approval-code")).to_have_count(0)
     expect(modal.get_by_test_id("approval-button")).to_have_count(0)
@@ -524,6 +572,65 @@ def test_a_merge_with_different_content_is_a_conflict_that_cannot_be_approved(ma
         assert conn.execute("SELECT status FROM plans WHERE id = ?", (plan_id,)).fetchone()[0] == "draft"
     finally:
         conn.close()
+    me.finish()
+
+
+def test_a_rescan_that_removes_a_source_marks_the_staged_step_stale_and_the_page_says_so(make_world, person):
+    """A step staged on the page, then the folder disappears from the cloud and a terminal rescan sees it. The step
+    would silently do nothing; instead the open page flags it, the preview names it, and it can be removed."""
+    world = make_world()
+    me = person(world)
+    page = me.page
+    me.open()
+    for key in ("dbx:", "dbx:School", "dbx:School/NTU"):
+        me.expand("left", key)
+    page.get_by_test_id("root-select-right").select_option("gd")
+    expect(me.node("right", "gd:Research")).to_be_visible()
+    me.drag(("left", "dbx:School/NTU/Thesis"), ("right", "gd:Research"))
+    me.drag(("left", "dbx:School/NTU/Courses"), ("right", "gd:Research"))
+    me.staged(2)
+    expect(page.get_by_test_id("staged-stale-count")).to_have_count(0)
+
+    shutil.rmtree(world.roots["dbx"] / "School/NTU/Thesis")           # gone from the cloud behind the page's back
+    _rescan_from_a_terminal(world, "dbx")
+
+    expect(page.get_by_test_id("staged-stale-count")).to_have_text("1", timeout=15_000)  # the page's poll notices
+    expect(page.get_by_test_id("toast").filter(has_text="已失效")).to_be_visible()
+    page.get_by_test_id("staged-toggle").click()
+    stale, fine = page.get_by_test_id("staged-item").first, page.get_by_test_id("staged-item").nth(1)
+    expect(stale).to_have_attribute("data-stale", "true")
+    expect(stale.get_by_test_id("staged-stale")).to_contain_text("來源已不存在：dbx:School/NTU/Thesis")
+    expect(fine).to_have_attribute("data-stale", "false")
+    expect(me.node("right", "gd:Research/Courses")).to_be_visible()      # the other step still shows its effect
+    expect(me.node("right", "gd:Research/Thesis")).to_have_count(0)     # the stale one shows none
+    me.shot("60-stale-step")
+
+    page.get_by_test_id("preview-button").click()
+    modal = page.get_by_test_id("preview-modal")
+    expect(modal.get_by_test_id("sim-status")).to_have_attribute("data-ok", "true")   # the rest is a clean plan
+    box = modal.get_by_test_id("stale-actions")
+    expect(box).to_contain_text("有 1 個暫存的步驟已失效")
+    expect(box.get_by_test_id("stale-action")).to_contain_text("來源已不存在：dbx:School/NTU/Thesis")
+    expect(modal.get_by_test_id("change")).to_have_count(1)             # only Courses is in the plan
+    expect(modal.get_by_test_id("change-list")).not_to_contain_text("Thesis")
+    me.shot("61-stale-preview")
+    modal.get_by_test_id("preview-close").click()
+
+    stale.get_by_test_id("staged-remove").click()                       # tidy up: the warning goes
+    expect(page.get_by_test_id("staged-stale-count")).to_have_count(0)
+    me.staged(1)
+
+    # With nothing left but a stale step the preview says why there is nothing to run.
+    shutil.rmtree(world.roots["dbx"] / "School/NTU/Courses")
+    _rescan_from_a_terminal(world, "dbx")
+    expect(page.get_by_test_id("staged-stale-count")).to_have_text("1", timeout=15_000)
+    page.get_by_test_id("preview-button").click()
+    modal = page.get_by_test_id("preview-modal")
+    expect(modal.get_by_test_id("preview-empty")).to_contain_text("沒有任何可以執行的步驟")
+    expect(modal.get_by_test_id("stale-action")).to_have_count(1)
+    me.shot("62-only-stale-steps")
+    modal.get_by_test_id("preview-close").click()
+    assert not (world.roots["gd"] / "Research/Thesis").exists() and not (world.roots["gd"] / "Research/Courses").exists()
     me.finish()
 
 

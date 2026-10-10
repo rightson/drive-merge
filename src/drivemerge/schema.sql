@@ -113,13 +113,27 @@ CREATE TABLE IF NOT EXISTS hash_bridges (
     sha256          TEXT NOT NULL UNIQUE,
     dropbox         TEXT NOT NULL,
     quickxor        TEXT NOT NULL,
-    -- The entry whose bytes were hashed. For an entry without native hashes
-    -- (iCloud) this link is its only route to an exact identity, valid while
-    -- its size and mtime still equal what was downloaded.
+    -- The first entry whose bytes were hashed, kept for readers that predate
+    -- bridge_sources (the executor looks a file up here). Identity reads
+    -- bridge_sources, which holds every such entry.
     source_entry_id INTEGER REFERENCES entries(id),
     source_mtime    TEXT,
     computed_at     TEXT NOT NULL
 );
+
+-- Every entry whose own bytes were downloaded and hashed into a bridge. For an
+-- entry without native hashes (iCloud) this link is its only route to an exact
+-- identity, and it holds only while the entry is live with the size and mtime
+-- recorded here (identity._valid_links). One content can have many sources:
+-- two hashless copies of the same bytes are each linked by their own download.
+CREATE TABLE IF NOT EXISTS bridge_sources (
+    bridge_id INTEGER NOT NULL REFERENCES hash_bridges(id) ON DELETE CASCADE,
+    entry_id  INTEGER NOT NULL REFERENCES entries(id),
+    size      INTEGER NOT NULL,
+    mtime     TEXT,                             -- NULL = unknown, never valid
+    PRIMARY KEY (bridge_id, entry_id)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS bridge_sources_entry ON bridge_sources(entry_id);
 
 CREATE TABLE IF NOT EXISTS plans (
     id           INTEGER PRIMARY KEY,

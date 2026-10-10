@@ -4,10 +4,11 @@
 from __future__ import annotations
 
 import hashlib
+import random
 import sqlite3
 import time
 import unicodedata
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import pytest
@@ -289,19 +290,235 @@ def test_two_bridges_for_different_contents_stay_apart(conn, catalog, clouds):
     assert g[da] == g[ba] == da and g[dz] == g[bz] == dz and g[da] != g[dz]
 
 
-def test_conflicting_hash_values_in_one_group_are_reported(conn, catalog, clouds):
-    """Same md5+size but different sha1 (a crafted collision?): grouped per contract, flagged loudly."""
+def test_conflicting_hash_values_are_not_joined_and_are_counted(conn, catalog, clouds):
+    """Same md5+size but different sha1 (a crafted collision?): the shared md5 proves nothing, so no group."""
     a = catalog.file(clouds["d1"], "a", size=9, md5="aa", sha1="11")
     b = catalog.file(clouds["d2"], "b", size=9, md5="aa", sha1="22")
     stats = rebuild_groups(conn)
-    assert groups(conn)[a] == groups(conn)[b]
-    assert stats.hash_conflicts == 1
+    assert groups(conn)[a] == a and groups(conn)[b] == b
+    assert stats.hash_conflicts == 1 and stats.duplicate_groups == 0
+    assert not same_content(conn, a, b)
+    assert duplicate_groups(conn) == []
 
 
 def test_consistent_groups_report_no_conflict(conn, catalog, clouds):
     drive(catalog, clouds["d1"], "a", "A")
     drive(catalog, clouds["d2"], "b", "A")
     assert rebuild_groups(conn).hash_conflicts == 0
+
+
+# -- conflict-aware union: a join between components that disagree on a hash type is refused
+
+def test_md5_equal_but_sha256_different_are_different_groups(conn, catalog, clouds):
+    """The delete-safety case: a shared md5 must not make one file the witness for the other."""
+    a = catalog.file(clouds["d1"], "a/report.pdf", size=50, md5="aa", sha256="s1")
+    b = catalog.file(clouds["d2"], "b/report.pdf", size=50, md5="aa", sha256="s2")
+    stats = rebuild_groups(conn)
+    g = groups(conn)
+    assert g[a] == a and g[b] == b
+    assert stats.hash_conflicts == 1 and stats.duplicate_groups == 0 and stats.redundant_files == 0
+    assert not same_content(conn, a, b)
+    assert [c.entry_id for c in locations(conn, a)] == [a]
+    assert duplicate_groups(conn) == []
+    (probable,) = duplicate_groups(conn, confidence="probable")      # same name+size: a candidate, never a proof
+    assert probable.confidence == "probable"
+
+
+def test_every_refused_edge_is_counted(conn, catalog, clouds):
+    """md5 and sha1 both link the pair and both are refused; sha256 is what tells them apart."""
+    catalog.file(clouds["d1"], "a", size=5, md5="aa", sha1="11", sha256="s1")
+    catalog.file(clouds["d2"], "b", size=5, md5="aa", sha1="11", sha256="s2")
+    assert rebuild_groups(conn).hash_conflicts == 2
+
+
+@pytest.mark.parametrize("hash_type", HASH_TYPES)
+def test_a_contradiction_in_any_hash_type_blocks_the_join(conn, catalog, hash_type):
+    r = catalog.remote("loc", "local")
+    other = next(t for t in HASH_TYPES if t != hash_type)
+    a = catalog.file(r, "a", size=5, **{other: "same", hash_type: "x1"})
+    b = catalog.file(r, "b", size=5, **{other: "same", hash_type: "x2"})
+    stats = rebuild_groups(conn)
+    assert groups(conn)[a] == a and groups(conn)[b] == b and stats.hash_conflicts == 1
+
+
+def test_a_hash_the_other_side_does_not_know_is_not_a_contradiction(conn, catalog, clouds):
+    """Drive (md5, sha256) vs a local copy with only md5: nothing disagrees, so they are one content."""
+    a = catalog.file(clouds["d1"], "a", size=5, md5="aa", sha256="s1")
+    b = catalog.file(clouds["d2"], "b", size=5, md5="aa")
+    c = catalog.file(clouds["d2"], "c", size=5, md5="aa", sha256="s1")
+    stats = rebuild_groups(conn)
+    assert groups(conn)[a] == groups(conn)[b] == groups(conn)[c] == a and stats.hash_conflicts == 0
+
+
+def test_contradiction_only_appears_after_several_joins(conn, catalog, clouds):
+    """a~b by md5, b~c by dropbox, c~d by sha1, but a and d disagree on md5: no pair is contradictory
+    on its own (b and c agree), only the components that grew out of them are."""
+    loc = catalog.remote("loc", "local")
+    a = catalog.file(loc, "a", size=7, md5="m1")
+    b = catalog.file(loc, "b", size=7, md5="m1", dropbox="d")
+    c = catalog.file(loc, "c", size=7, dropbox="d", sha1="x")
+    d = catalog.file(loc, "d", size=7, sha1="x", md5="m2")
+    stats = rebuild_groups(conn)
+    g = groups(conn)
+    assert g[a] == g[b] == a and g[c] == g[d] == c and g[a] != g[c]
+    assert stats.hash_conflicts == 1 and stats.duplicate_groups == 2
+
+
+def test_chain_through_all_five_hash_types_is_cut_at_its_last_link(conn, catalog):
+    """Four joins build one component; the fifth file shares only quickxor but contradicts its md5."""
+    loc = catalog.remote("loc", "local")
+    chain = [
+        catalog.file(loc, "f0", size=3, md5="m"),
+        catalog.file(loc, "f1", size=3, md5="m", sha1="s"),
+        catalog.file(loc, "f2", size=3, sha1="s", sha256="t"),
+        catalog.file(loc, "f3", size=3, sha256="t", dropbox="d"),
+        catalog.file(loc, "f4", size=3, dropbox="d", quickxor="q"),
+    ]
+    odd = catalog.file(loc, "f5", size=3, quickxor="q", md5="OTHER")
+    stats = rebuild_groups(conn)
+    g = groups(conn)
+    assert {g[e] for e in chain} == {chain[0]}
+    assert g[odd] == odd
+    assert (stats.hash_conflicts, stats.duplicate_groups, stats.redundant_files) == (1, 1, 4)
+
+
+def test_conflicting_run_does_not_depend_on_row_order_within_a_value(conn, catalog):
+    """Three files share an md5; the lowest id anchors the run, the one that contradicts it is left out."""
+    loc = catalog.remote("loc", "local")
+    a = catalog.file(loc, "a", size=3, md5="m", sha1="1")
+    b = catalog.file(loc, "b", size=3, md5="m", sha1="2")
+    c = catalog.file(loc, "c", size=3, md5="m")
+    rebuild_groups(conn)
+    g = groups(conn)
+    assert g[a] == g[c] == a and g[b] == b
+
+
+def test_bridge_does_not_pull_in_a_file_that_contradicts_it(conn, catalog, clouds):
+    """A Drive file with the bridge's md5 but another sha256 stays out; the Dropbox copy still joins."""
+    good = catalog.file(clouds["d1"], "g", size=10, md5=H("A")["md5"], sha256=H("A")["sha256"])
+    fake = catalog.file(clouds["d2"], "f", size=10, md5=H("A")["md5"], sha256=H("FAKE")["sha256"])
+    dbx = dropbox(catalog, clouds["db"], "g", "A")
+    record_bridge(conn, H("A"))
+    stats = rebuild_groups(conn)
+    g = groups(conn)
+    assert g[good] == g[dbx] == good and g[fake] == fake
+    assert stats.hash_conflicts == 2          # md5 edge good~fake was refused directly, then the bridge's edge to fake
+    assert not same_content(conn, fake, dbx)
+
+
+def test_bridge_that_contradicts_a_native_group_is_refused_whole(conn, catalog, clouds):
+    """Two Drive copies agree with each other; a bridge with their md5 but a different sha1 describes other bytes."""
+    a = catalog.file(clouds["d1"], "a", size=10, md5=H("A")["md5"], sha1="aa")
+    b = catalog.file(clouds["d2"], "b", size=10, md5=H("A")["md5"], sha1="aa")
+    o = dropbox(catalog, clouds["db"], "o", "A")
+    record_bridge(conn, H("A"))                                   # its sha1 is not "aa"
+    stats = rebuild_groups(conn)
+    g = groups(conn)
+    assert g[a] == g[b] == a and g[o] == o
+    assert stats.hash_conflicts >= 1
+
+
+def test_hashless_source_cannot_be_forced_into_a_contradicting_component(conn, catalog, clouds):
+    i = icloud(catalog, clouds["ic"], "a", mtime=T0)
+    d = drive(catalog, clouds["d1"], "a", "A", mtime=T0)
+    record_bridge(conn, H("A"), source_entry_id=i, source_mtime=T0)
+    stats = rebuild_groups(conn)
+    assert groups(conn)[i] == groups(conn)[d] == min(i, d) and stats.hash_conflicts == 0
+
+
+def _naive_components(conn, edges_by_value=True):
+    """What the old, unconditional union-find would produce (independent reimplementation)."""
+    live = [r for r in conn.execute(
+        "SELECT * FROM entries WHERE present = 1 AND is_dir = 0 AND is_native_doc = 0 AND size IS NOT NULL")]
+    parent = {r["id"]: r["id"] for r in live}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        parent[find(a)] = find(b)
+
+    seen: dict = {}
+    for r in live:
+        for t in HASH_TYPES:
+            if r[t]:
+                union(r["id"], seen.setdefault((t, r[t], r["size"]), r["id"]))
+    for b in conn.execute("SELECT * FROM hash_bridges"):
+        members = [r["id"] for r in live if r["size"] == b["size"] and any(r[t] == b[t] for t in HASH_TYPES)]
+        members += [x["entry_id"] for x in conn.execute(
+            "SELECT s.entry_id FROM bridge_sources s JOIN entries e ON e.id = s.entry_id "
+            "WHERE s.bridge_id = ? AND e.size = s.size AND e.mtime = s.mtime AND e.present = 1", (b["id"],))]
+        for m in members[1:]:
+            union(members[0], m)
+    return {r["id"]: find(r["id"]) for r in live}
+
+
+@pytest.mark.parametrize("seed", range(60))
+def test_random_catalogs_never_hold_two_values_of_a_hash_type_in_one_group(conn, catalog, seed):
+    """Adversarial fuzz: tiny hash alphabets force collisions, partial hashes and contradicting bridges."""
+    rng = random.Random(seed)
+    remote = catalog.remote("loc", "local")
+    vals = {t: [f"{t[:2]}{i}" for i in range(3)] for t in HASH_TYPES}
+    for i in range(rng.randint(8, 40)):
+        hashes = {t: rng.choice(vals[t]) for t in HASH_TYPES if rng.random() < 0.45}
+        catalog.file(remote, f"f{i}", size=rng.choice((4, 5)), mtime=T0, **hashes)
+    used = set()
+    for _ in range(rng.randint(0, 6)):
+        sig = {t: rng.choice(vals[t]) for t in HASH_TYPES}
+        if sig["sha256"] in used:
+            continue
+        used.add(sig["sha256"])
+        bid = conn.execute(
+            "INSERT INTO hash_bridges(size, md5, sha1, sha256, dropbox, quickxor, computed_at) "
+            "VALUES (?,?,?,?,?,?,?) RETURNING id",
+            (rng.choice((4, 5)), *(sig[t] for t in HASH_TYPES), db.utcnow())).fetchone()[0]
+        size = conn.execute("SELECT size FROM hash_bridges WHERE id = ?", (bid,)).fetchone()[0]
+        same_size = [r[0] for r in conn.execute("SELECT id FROM entries WHERE is_dir = 0 AND size = ?", (size,))]
+        for eid in rng.sample(same_size, min(2, len(same_size))):
+            if rng.random() < 0.5:
+                conn.execute("INSERT OR IGNORE INTO bridge_sources VALUES (?,?,?,?)", (bid, eid, size, T0))
+
+    stats = rebuild_groups(conn)
+
+    members: dict[int, list] = defaultdict(list)
+    for r in conn.execute("SELECT * FROM entries WHERE content_group IS NOT NULL"):
+        members[r["content_group"]].append(r)
+    for g, rows in members.items():
+        assert g == min(r["id"] for r in rows)
+        assert len({r["size"] for r in rows}) == 1
+        for t in HASH_TYPES:
+            assert len({r[t] for r in rows if r[t]}) <= 1, (seed, g, t)
+    coarse = _naive_components(conn)
+    for rows in members.values():
+        assert len({coarse[r["id"]] for r in rows}) == 1             # groups only ever split the old components
+    assert rebuild_groups(conn).changed == 0
+    assert stats.hash_conflicts == rebuild_groups(conn).hash_conflicts           # deterministic
+
+
+@pytest.mark.parametrize("seed", range(30))
+def test_consistent_random_catalogs_group_exactly_as_before(conn, catalog, seed):
+    """No contradictions to refuse: every real content comes out as the full component, nothing is lost."""
+    rng = random.Random(1000 + seed)
+    remote = catalog.remote("loc", "local")
+    contents = {c: H(f"content-{seed}-{c}", size=3 + c % 3) for c in range(rng.randint(2, 8))}
+    for i in range(rng.randint(10, 40)):
+        c = rng.randrange(len(contents))
+        shown = {t: contents[c][t] for t in HASH_TYPES if rng.random() < 0.5}
+        catalog.file(remote, f"f{i}", size=contents[c]["size"], mtime=T0, **shown)
+    for c in contents:
+        if rng.random() < 0.5:
+            record_bridge(conn, contents[c])
+    stats = rebuild_groups(conn)
+    assert stats.hash_conflicts == 0
+    want = _naive_components(conn)
+    got = groups(conn)
+    ids = [i for i in want if got[i] is not None]
+    for x in ids:
+        for y in ids:
+            assert (got[x] == got[y]) == (want[x] == want[y]), (seed, x, y)
 
 
 # -- change feed
@@ -555,6 +772,54 @@ def test_pagination_is_stable_and_complete(conn, catalog, clouds):
     assert [g.redundant_bytes for g in everything] == sorted((g.redundant_bytes for g in everything), reverse=True)
     assert duplicate_groups(conn, limit=3, offset=7) == []
     assert duplicate_groups(conn, limit=0) == []
+
+
+def _bulk_pairs(conn, catalog, clouds, n, *, hashed=True):
+    """n two-copy groups inserted in bulk (sizes 1..n so every group has its own rank)."""
+    rv = db.next_row_version(conn)
+    rows = []
+    for g in range(n):
+        h = H(f"bulk-{g}")
+        for k, remote in enumerate(("d1", "d2")):
+            rows.append((clouds[remote], f"p:g{g}/{k}", f"g{g}/{k}", f"g{g}", "f.bin", "f.bin", "bin", "other", 0, g + 1,
+                         T0, h["md5"] if hashed else None, h["sha1"] if hashed else None,
+                         h["sha256"] if hashed else None, 0, 1, catalog._scan[clouds[remote]],
+                         catalog._scan[clouds[remote]], rv))
+    conn.executemany(
+        """INSERT INTO entries(remote_id, entry_key, path, parent, name, name_norm, ext, category, is_dir, size,
+             mtime, md5, sha1, sha256, is_native_doc, present, first_seen_scan, last_seen_scan, row_version)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", rows)
+
+
+@pytest.mark.parametrize("confidence", ["exact", "probable"])
+def test_a_page_of_groups_is_fetched_with_a_single_query(conn, catalog, clouds, confidence):
+    """One query for the whole page, however many groups it holds (it used to be one per group)."""
+    _bulk_pairs(conn, catalog, clouds, 1500, hashed=confidence == "exact")
+    rebuild_groups(conn)
+    statements: list[str] = []
+    conn.set_trace_callback(statements.append)
+    try:
+        got = duplicate_groups(conn, confidence=confidence, limit=1500)
+        few = duplicate_groups(conn, confidence=confidence, limit=5)
+    finally:
+        conn.set_trace_callback(None)
+    assert len(got) == 1500 and len(few) == 5
+    scans = [q for q in statements if "FROM entries" in q]
+    assert len(scans) == 2                                # one per call, not one per group
+    assert [g.redundant_bytes for g in got] == sorted((g.redundant_bytes for g in got), reverse=True)
+    assert [g.key for g in few] == [g.key for g in got[:5]]
+    assert all(len(g.copies) == 2 and g.remotes == ["d1", "d2"] for g in got)
+    assert [c.path for c in got[0].copies] == ["g1499/0", "g1499/1"]
+
+
+def test_pages_cover_every_group_exactly_once_across_offsets(conn, catalog, clouds):
+    _bulk_pairs(conn, catalog, clouds, 130)
+    rebuild_groups(conn)
+    keys = []
+    for off in range(0, 140, 25):
+        keys += [g.key for g in duplicate_groups(conn, limit=25, offset=off)]
+    assert len(keys) == len(set(keys)) == 130
+    assert keys == [g.key for g in duplicate_groups(conn, limit=500)]
 
 
 def test_invalid_confidence(conn):
@@ -1020,6 +1285,17 @@ def test_bridge_entry_native_hash_comparison_ignores_case(conn, catalog, clouds,
     assert bridge_entry(conn, FakeRclone({("d1:", "a"): data}), d, tmp_path)["bridge_id"]
 
 
+def test_upper_case_native_hash_is_no_contradiction_for_its_own_bridge(conn, catalog, clouds, fake_hash, tmp_path):
+    """A source whose stored hash differs from the bridge only in case is still the same bytes, not a conflict."""
+    data = b"payload"
+    fh = fake_hashes(data)
+    d = catalog.file(clouds["d1"], "a", size=len(data), mtime=T0, md5=fh["md5"].upper(), sha1=fh["sha1"].upper())
+    b = catalog.file(clouds["db"], "a", size=len(data), dropbox=fh["dropbox"])
+    assert bridge_entry(conn, FakeRclone({("d1:", "a"): data}), d, tmp_path)["linked"]
+    stats = rebuild_groups(conn)
+    assert groups(conn)[d] == groups(conn)[b] == d and stats.hash_conflicts == 0
+
+
 def test_bridge_entry_size_mismatch_raises(conn, catalog, clouds, fake_hash, tmp_path):
     data = b"twelve bytes"
     fh = fake_hashes(data)
@@ -1189,8 +1465,8 @@ def test_lone_linked_source_is_a_singleton_group(conn, catalog, clouds):
     assert duplicate_groups(conn) == []
 
 
-def test_two_hashless_copies_with_the_same_bytes_cannot_both_be_linked_yet(conn, catalog, clouds, fake_hash, tmp_path):
-    """Known limit: hash_bridges has one source slot per sha256, so the second copy stays unlinked."""
+def test_two_hashless_copies_with_the_same_bytes_are_both_linked(conn, catalog, clouds, fake_hash, tmp_path):
+    """bridge_sources holds one row per downloaded copy, so a bridge is not limited to one hashless source."""
     data = b"same bytes twice"
     a = catalog.file(clouds["ic"], "a/x.bin", size=len(data), mtime=T0)
     b = catalog.file(clouds["ic"], "b/x.bin", size=len(data), mtime=T0)
@@ -1198,9 +1474,142 @@ def test_two_hashless_copies_with_the_same_bytes_cannot_both_be_linked_yet(conn,
     first = bridge_entry(conn, rc, a, tmp_path)
     second = bridge_entry(conn, rc, b, tmp_path)
     assert first["bridge_id"] == second["bridge_id"]
-    assert first["linked"] is True and second["linked"] is False
+    assert first["linked"] is True and second["linked"] is True
+    stats = rebuild_groups(conn)
+    assert groups(conn)[a] == groups(conn)[b] == a
+    assert (stats.duplicate_groups, stats.redundant_files, stats.redundant_bytes) == (1, 1, len(data))
+    assert same_content(conn, a, b)
+    (grp,) = duplicate_groups(conn)
+    assert [c.entry_id for c in grp.copies] == [a, b]
+    assert duplicate_groups(conn, confidence="probable") == []
+
+
+def test_second_hashless_copy_stops_being_a_candidate_once_downloaded(conn, catalog, clouds, fake_hash, tmp_path):
+    """It used to reappear forever: the bridge had one source slot and the first copy held it."""
+    data = b"candidates until each is linked"
+    a = catalog.file(clouds["ic"], "a/x.bin", size=len(data), mtime=T0)
+    b = catalog.file(clouds["ic"], "b/x.bin", size=len(data), mtime=T0)
+    rc = FakeRclone({("ic:", "a/x.bin"): data, ("ic:", "b/x.bin"): data})
+    assert sorted(c.entry_id for c in bridge_candidates(conn)) == [a, b]
+    bridge_entry(conn, rc, a, tmp_path)
     rebuild_groups(conn)
-    assert groups(conn)[a] == a and groups(conn)[b] is None
+    assert [c.entry_id for c in bridge_candidates(conn)] == [b]      # its own bytes are still unproven
+    bridge_entry(conn, rc, b, tmp_path)
+    rebuild_groups(conn)
+    assert bridge_candidates(conn) == []
+
+
+def test_every_linked_copy_joins_the_cross_cloud_group(conn, catalog, clouds, fake_hash, tmp_path):
+    data = b"three hashless copies and a drive copy"
+    fh = fake_hashes(data)
+    d = catalog.file(clouds["d1"], "z.bin", size=len(data), md5=fh["md5"], sha1=fh["sha1"], sha256=fh["sha256"])
+    copies = [catalog.file(clouds["ic"], f"{n}/x.bin", size=len(data), mtime=T0) for n in "abc"]
+    rc = FakeRclone({("ic:", f"{n}/x.bin"): data for n in "abc"})
+    for e in copies:
+        assert bridge_entry(conn, rc, e, tmp_path)["linked"]
+    stats = rebuild_groups(conn)
+    assert {groups(conn)[e] for e in copies + [d]} == {d}
+    assert (stats.duplicate_groups, stats.redundant_files) == (1, 3)
+
+
+def test_each_source_is_validated_on_its_own(conn, catalog, clouds, fake_hash, tmp_path):
+    """One copy being rescanned breaks only its own link."""
+    data = b"validity is per source"
+    a = catalog.file(clouds["ic"], "a/x.bin", size=len(data), mtime=T0)
+    b = catalog.file(clouds["ic"], "b/x.bin", size=len(data), mtime=T0)
+    rc = FakeRclone({("ic:", "a/x.bin"): data, ("ic:", "b/x.bin"): data})
+    bridge_entry(conn, rc, a, tmp_path)
+    bridge_entry(conn, rc, b, tmp_path)
+    rebuild_groups(conn)
+    assert groups(conn)[a] == groups(conn)[b] == a
+    conn.execute("UPDATE entries SET mtime = '2025-05-05T00:00:00Z' WHERE id = ?", (a,))       # a changed
+    rebuild_groups(conn)
+    assert groups(conn)[a] is None and groups(conn)[b] == b
+    assert [c.entry_id for c in bridge_candidates(conn)] == [a]
+    conn.execute("UPDATE entries SET present = 0 WHERE id = ?", (b,))                           # b is gone
+    rebuild_groups(conn)
+    assert groups(conn)[b] is None
+
+
+def test_record_bridge_adds_a_source_row_per_entry_and_refreshes_repeats(conn, catalog, clouds):
+    a = icloud(catalog, clouds["ic"], "a", mtime=T0)
+    b = icloud(catalog, clouds["ic"], "b", mtime=T0)
+    bid = record_bridge(conn, H("A"), source_entry_id=a, source_mtime=T0)
+    assert record_bridge(conn, H("A"), source_entry_id=b, source_mtime=T0) == bid
+
+    def sources():
+        return [tuple(r) for r in conn.execute(
+            "SELECT bridge_id, entry_id, size, mtime FROM bridge_sources ORDER BY entry_id")]
+
+    assert sources() == [(bid, a, 10, T0), (bid, b, 10, T0)]
+    record_bridge(conn, H("A"), source_entry_id=a, source_mtime="2025-01-01T00:00:00Z")      # a downloaded again
+    assert sources()[0] == (bid, a, 10, "2025-01-01T00:00:00Z") and len(sources()) == 2
+    record_bridge(conn, H("A"))                                                               # no source: no row
+    assert len(sources()) == 2
+    assert conn.execute("SELECT COUNT(*) FROM hash_bridges").fetchone()[0] == 1
+
+
+def test_record_bridge_keeps_the_first_source_in_the_legacy_columns(conn, catalog, clouds):
+    """hash_bridges.source_* still names a source for readers that predate bridge_sources (the executor)."""
+    a = icloud(catalog, clouds["ic"], "a", mtime=T0)
+    b = icloud(catalog, clouds["ic"], "b", mtime=T0)
+    bid = record_bridge(conn, H("A"), source_entry_id=a, source_mtime=T0)
+    record_bridge(conn, H("A"), source_entry_id=b, source_mtime=T0)
+    assert _source(conn, bid) == (a, T0)
+    record_bridge(conn, H("A"), source_entry_id=a, source_mtime="2025-01-01T00:00:00Z")
+    assert _source(conn, bid) == (a, "2025-01-01T00:00:00Z")         # its own refresh is mirrored
+
+
+def test_record_bridge_with_an_unknown_source_leaves_nothing_behind(conn):
+    with pytest.raises(sqlite3.IntegrityError):
+        record_bridge(conn, H("A"), source_entry_id=424242, source_mtime=T0)
+    assert conn.execute("SELECT COUNT(*) FROM hash_bridges").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM bridge_sources").fetchone()[0] == 0
+    assert not conn.in_transaction
+
+
+def test_record_bridge_works_inside_a_transaction_and_rolls_back_with_it(conn, catalog, clouds):
+    a = icloud(catalog, clouds["ic"], "a", mtime=T0)
+    with pytest.raises(RuntimeError):
+        with db.transaction(conn):
+            record_bridge(conn, H("A"), source_entry_id=a, source_mtime=T0)
+            raise RuntimeError("abort")
+    assert conn.execute("SELECT COUNT(*) FROM bridge_sources").fetchone()[0] == 0
+    with db.transaction(conn):
+        record_bridge(conn, H("A"), source_entry_id=a, source_mtime=T0)
+    assert conn.execute("SELECT COUNT(*) FROM bridge_sources").fetchone()[0] == 1
+
+
+def test_an_entry_sourcing_two_different_bridges_is_linked_to_neither(conn, catalog, clouds, fake_hash, tmp_path):
+    """Same size and mtime but different bytes were hashed at different times: which one is true is unknowable."""
+    i = icloud(catalog, clouds["ic"], "a", mtime=T0)
+    d = drive(catalog, clouds["d1"], "a", "A")
+    o = drive(catalog, clouds["d2"], "b", "B")
+    record_bridge(conn, H("A"), source_entry_id=i, source_mtime=T0)
+    record_bridge(conn, H("B"), source_entry_id=i, source_mtime=T0)
+    stats = rebuild_groups(conn)
+    g = groups(conn)
+    assert g[i] is None and g[d] == d and g[o] == o
+    assert stats.hash_conflicts == 1
+    assert [c.entry_id for c in bridge_candidates(conn)] == [i]      # needs a fresh look, not trusted as resolved
+
+
+def test_ambiguous_source_is_reported_unlinked_by_bridge_entry(conn, catalog, clouds, fake_hash, tmp_path):
+    i = catalog.file(clouds["ic"], "a", size=3, mtime=T0)
+    record_bridge(conn, H("OLD", 3), source_entry_id=i, source_mtime=T0)        # stale record of other bytes
+    out = bridge_entry(conn, FakeRclone({("ic:", "a"): b"new"}), i, tmp_path)
+    assert out["linked"] is False
+
+
+def test_hashed_source_contradicting_the_bridge_is_not_linked_even_with_many_sources(conn, catalog, clouds):
+    good = icloud(catalog, clouds["ic"], "a", mtime=T0)
+    liar = catalog.file(clouds["d2"], "b", size=10, mtime=T0, md5=H("OTHER")["md5"])
+    bid = record_bridge(conn, H("A"), source_entry_id=good, source_mtime=T0)
+    record_bridge(conn, H("A"), source_entry_id=liar, source_mtime=T0)
+    rebuild_groups(conn)
+    g = groups(conn)
+    assert g[good] == good and g[liar] == liar
+    assert conn.execute("SELECT COUNT(*) FROM bridge_sources WHERE bridge_id = ?", (bid,)).fetchone()[0] == 2
 
 
 def test_bridge_entry_reports_linked_for_hashed_entries(conn, catalog, clouds, fake_hash, tmp_path):

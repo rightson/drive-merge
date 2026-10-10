@@ -16,10 +16,13 @@ import {
 } from './util.js';
 
 const POLL_MS = 3000;
+const TOAST_MS = 6000;
+const TOAST_ACTION_MS = 12000;
 const SPLIT_KEY = 'dm-split';
 const DRAFT_KEY = 'dm-draft';
 
 const defaultTitle = () => t('draft.defaultTitle', { date: todayStamp() });
+const staleCount = (d) => (d.summary && d.summary.stale_actions) || 0;
 
 function Splitter({ frac, setFrac, boxRef }) {
   const onPointerDown = (e) => { e.preventDefault(); e.currentTarget.setPointerCapture(e.pointerId); };
@@ -69,11 +72,13 @@ function App() {
 
   // ---------------------------------------------------------------- toasts and dialogs
   const dismiss = (id) => setToasts((xs) => xs.filter((x) => x.id !== id));
+  /** Errors stay until closed; everything else leaves by itself (longer when it carries a button). */
   function toast(kind, text, action) {
     toastId.current += 1;
     const id = toastId.current;
-    setToasts((xs) => [...xs.slice(-4), { id, kind, text, action }]);
-    setTimeout(() => dismiss(id), action ? 12000 : kind === 'error' ? 9000 : 5500);
+    const ttl = kind === 'error' ? 0 : action ? TOAST_ACTION_MS : TOAST_MS;
+    // The same message again replaces its earlier copy instead of piling up under it.
+    setToasts((xs) => [...xs.filter((x) => x.kind !== kind || x.text !== text).slice(-3), { id, kind, text, action, ttl }]);
     return id;
   }
   const ask = (type, opts) => new Promise((resolve) => {
@@ -351,7 +356,15 @@ function App() {
           if (!modalOpen.current) replaceDraft(t('draft.closed'));
           return;
         }
-        if (d.version === mine.version) return;
+        const stale = staleCount(d);
+        if (d.version === mine.version) {
+          if (stale === staleCount(mine)) return;
+          // Only the catalog moved under the draft (a rescan): the trees are refreshed and the steps it broke are named.
+          adopt(d);
+          setTick((x) => x + 1);
+          if (stale > staleCount(mine)) toast('warn', t('staged.staleTip', { n: stale }));
+          return;
+        }
         const known = new Set(mine.actions.map((a) => a.id));
         const fresh = d.actions.filter((a) => a.state === 'active' && !known.has(a.id));
         adopt(d);
@@ -403,7 +416,7 @@ function App() {
   const toggleDrawer = (name) => setDrawer((d) => (d === name ? null : name));
 
   return html`<${AppCtx.Provider} value=${ctx}>
-    <div class="app" data-lang=${lang}>
+    <div class="app" data-lang=${lang} data-drawer=${drawer || undefined}>
       ${config.approvals_enabled === false && html`<div class="banner banner-info" role="note" data-testid="approvals-banner">
         <${Icon} name="info" size=${17} />
         <span><strong>${t('banner.title')}</strong> ${t('banner.text')}
@@ -432,7 +445,9 @@ function App() {
           <button class=${'btn' + (drawer === 'staged' ? ' on' : '')} data-testid="staged-toggle" aria-pressed=${drawer === 'staged'}
             title=${t('staged.button')} onClick=${() => toggleDrawer('staged')}><${Icon} name="list" size=${16} />
             <span class="btn-text">${t('staged.button')}</span>
-            <span class="count-pill" data-testid="staged-count">${active.length}</span></button>
+            <span class="count-pill" data-testid="staged-count">${active.length}</span>
+            ${sum.stale_actions > 0 && html`<span class="count-pill count-pill-warn" data-testid="staged-stale-count"
+              title=${t('staged.staleTip', { n: sum.stale_actions })}><${Icon} name="alert" size=${11} />${sum.stale_actions}</span>`}</button>
           <button class=${'btn' + (drawer === 'suggestions' ? ' on' : '')} data-testid="suggestions-toggle" aria-pressed=${drawer === 'suggestions'}
             title=${t('sug.button')} onClick=${() => toggleDrawer('suggestions')}><${Icon} name="sparkle" size=${16} />
             <span class="btn-text">${t('sug.button')}</span></button>

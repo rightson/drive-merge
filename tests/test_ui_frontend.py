@@ -24,6 +24,7 @@ pytest.importorskip("playwright.sync_api")
 from playwright.sync_api import expect, sync_playwright  # noqa: E402
 
 import drivemerge  # noqa: E402
+import drivemerge.workspace  # noqa: E402,F401  (the conflict codes it can raise are checked against the translations)
 
 pytestmark = pytest.mark.ui
 
@@ -120,6 +121,15 @@ REMOTES = [
     {"id": 1, "name": "gdrive", "provider": "drive", "writable": True, "case_insensitive": False},
     {"id": 2, "name": "dropbox", "provider": "dropbox", "writable": True, "case_insensitive": True},
 ]
+QUARANTINE = ".drive-merge-quarantine"
+# The five codes build_ops can give a conflict, with the English sentence it puts in `reason`.
+ENGINE_CONFLICTS = [
+    ("DIFFERENT_CONTENT", "a different file already has that name"),
+    ("DIR_IN_WAY", "a folder with that name is in the way"),
+    ("FILE_IN_WAY", "a file is where this needs a folder"),
+    ("OCCUPIED", "the spot is still occupied until the delete phase"),
+    ("CYCLE", "moves wait on each other (a swap needs a temporary name)"),
+]
 CATEGORY = {"pdf": "pdf", "docx": "document", "txt": "document", "csv": "spreadsheet", "pptx": "presentation",
             "jpg": "photo", "zip": "archive"}
 
@@ -163,10 +173,14 @@ class MockApi:
     CSRF = "csrf-test-token"
     CODE = "a1b2c3d4"
 
-    def __init__(self, *, approvals_enabled: bool = True, execution_enabled: bool = True):
+    def __init__(self, *, approvals_enabled: bool = True, execution_enabled: bool = True, quarantine: bool = False):
         self.approvals_enabled = approvals_enabled
         self.execution_enabled = execution_enabled
         self.fs = copy.deepcopy(SAMPLE)
+        if quarantine:      # what an executed plan leaves behind on gdrive
+            self.fs["gdrive"][QUARANTINE] = {"7": {"學校": {"old-report.pdf": 52_000}, "scan.zip": 1_000_000}}
+        self.force_error: tuple[str, str] | None = None
+        self.stale: dict[int, dict] = {}
         self.calls: list[Call] = []
         self.preview_mode = "ok"
         self.job_polls = 0
@@ -194,17 +208,35 @@ class MockApi:
         """Something other than this page (Claude via MCP) stages a move."""
         self._commit({"kind": "move", "items": items, "dst": dst, "note": "Claude: group the thesis files"}, created_by)
 
+    def vanish(self, remote: str, path: str) -> None:
+        """A rescan finds that something is gone from the cloud."""
+        del _get(self.fs, remote, _parent(path))[_name(path)]
+
     # ------------------------------------------------------------------ namespace
     def replay(self) -> tuple[dict, dict, list]:
+        """Apply the active actions; one whose source or destination is gone is stale and changes nothing."""
         tree, flags, ghosts = copy.deepcopy(self.fs), {}, []
         self.moved = {"files": 0, "bytes": 0, "cross": 0, "remotes": set()}
+        self.stale = {}
         for a in self.draft["actions"]:
-            if a["state"] == "active":
+            if a["state"] != "active":
+                continue
+            try:
                 self._apply(tree, flags, ghosts, a)
+            except Stage as e:
+                if e.code not in ("SRC_NOT_FOUND", "DST_NOT_DIR"):
+                    raise
+                gone = ([it for it in a["items"] if not it["path"] or _get(tree, it["remote"], it["path"]) is None]
+                        if e.code == "SRC_NOT_FOUND" else [a["dst"]])
+                self.stale[a["id"]] = {"code": e.code, "message": str(e),
+                                       "items": [{"remote": it["remote"], "path": it["path"]} for it in gone]}
         return tree, flags, ghosts
 
     def _apply(self, tree: dict, flags: dict, ghosts: list, a: dict) -> list[dict]:
         warnings: list[dict] = []
+        for place in [it["path"] for it in a.get("items", [])] + [_join(a["dst"]["path"], a.get("new_name") or "")]:
+            if place == QUARANTINE or place.startswith(QUARANTINE + "/"):
+                raise Stage("QUARANTINE", "the quarantine folder holds deleted files")
         self.moved["remotes"].add(a["dst"]["remote"])
         dst = a["dst"]
         dnode = _get(tree, dst["remote"], dst["path"])
@@ -271,7 +303,8 @@ class MockApi:
         self.draft["actions"] = [a for a in self.draft["actions"] if a["state"] == "active"]
         act = {"id": self.next_action_id, "seq": len(self.draft["actions"]) + 1, "kind": body["kind"],
                "items": body.get("items", []), "dst": body["dst"], "new_name": body.get("new_name"),
-               "note": body.get("note"), "created_by": created_by, "state": "active", "created_at": "2024-03-01T10:00:00Z"}
+               "note": body.get("note"), "created_by": created_by, "state": "active", "created_at": "2024-03-01T10:00:00Z",
+               "stale": False, "stale_reason": None}
         self.next_action_id += 1
         self.draft["actions"].append(act)
         self.draft["version"] += 1
@@ -283,8 +316,11 @@ class MockApi:
         d["redo_available"] = any(a["state"] == "undone" for a in d["actions"])
         self.replay()
         m = self.moved
+        for a in d["actions"]:
+            a["stale_reason"] = self.stale.get(a["id"])
+            a["stale"] = a["stale_reason"] is not None
         d["summary"] = {"moved_files": m["files"], "moved_bytes": m["bytes"], "cross_remote_bytes": m["cross"],
-                        "remotes_touched": sorted(m["remotes"])}
+                        "remotes_touched": sorted(m["remotes"]), "stale_actions": len(self.stale)}
         return d
 
     def _item(self, remote: str, parent: str, name: str, node: Any, flags: dict) -> dict:
@@ -297,7 +333,8 @@ class MockApi:
                 "files": files, "dirs": dirs, "bytes": size, "dup_files": int(name == "report.pdf"),
                 "entry_id": None if is_dir else abs(hash((remote, path))) % 100000,
                 "origins": fl.get("origins", []), "moved_here": fl.get("moved", False), "merged": fl.get("merged", False),
-                "conflict": False, "dedupe": False, "virtual": fl.get("virtual", False)}
+                "conflict": False, "dedupe": False, "virtual": fl.get("virtual", False),
+                "quarantine": path == QUARANTINE or path.startswith(QUARANTINE + "/"), "quarantine_root": path == QUARANTINE}
 
     def list_dir(self, remote: str, path: str, view: str, ghosts: bool) -> dict:
         if view == "before":
@@ -325,15 +362,17 @@ class MockApi:
             out.append({"name": r["name"], "path": "", "remote": r["name"], "is_dir": True, "size": None, "mtime": None,
                         "category": "other", "files": files, "dirs": dirs, "bytes": size, "dup_files": 0, "entry_id": None,
                         "origins": [], "moved_here": False, "merged": False, "conflict": False, "dedupe": False,
-                        "virtual": False, "remote_id": r["id"], "provider": r["provider"], "writable": r["writable"],
+                        "virtual": False, "quarantine": False, "quarantine_root": False, "remote_id": r["id"], "provider": r["provider"], "writable": r["writable"],
                         "case_insensitive": r["case_insensitive"]})
         return out
 
     # ------------------------------------------------------------------ preview payloads
     def preview(self) -> dict:
         d = self._draft_json()
-        if not d["actions"] or not any(a["state"] == "active" for a in d["actions"]):
-            return {"plan_id": None, "message": "nothing to do"}
+        active = [a for a in d["actions"] if a["state"] == "active"]
+        stale = [a for a in active if a["stale"]]
+        if not active or len(stale) == len(active):
+            return {"plan_id": None, "message": "nothing to do", "stale_actions": stale}
         s = d["summary"]
         remotes = [
             {"remote_id": 1, "remote": "gdrive", "files_before": 6, "bytes_before": 6_603_000, "files_after": 4,
@@ -344,10 +383,11 @@ class MockApi:
         base = {
             "plan_id": 7, "draft_version": d["version"],
             "summary": {**{k: s[k] for k in ("moved_files", "moved_bytes", "cross_remote_bytes", "remotes_touched")},
-                        "dedupes": 1, "conflicts": 0, "ops": {"move": 0, "copy": 2, "delete": 2}, "roots": 1},
+                        "dedupes": 1, "conflicts": 0, "ops": {"move": 0, "copy": 2, "delete": 2}, "roots": 1,
+                        "stale_actions": len(stale)},
             "changes": [{"from": {"remote": "gdrive", "path": "研究/資料"}, "to": {"remote": "dropbox", "path": "學校/資料"},
                          "files": 2, "bytes": 123_000, "kind": "copy+delete", "is_dir": True}],
-            "conflicts": [], "empty_dirs_left": 1,
+            "conflicts": [], "empty_dirs_left": 1, "stale_actions": stale,
             "simulation": {"plan_id": 7, "ok": True, "violations": [], "warnings": [], "remotes": remotes,
                            "contents_before": 9, "contents_after": 9, "contents_lost": 0,
                            "bytes_cross_remote": s["cross_remote_bytes"], "op_counts": {"copy": 2, "delete": 2}, "sample": []},
@@ -360,6 +400,17 @@ class MockApi:
                 {"code": "CASE_COLLISION", "message": "'dropbox:學校/Report.PDF' differs only by case", "seq": 2},
             ]
             base["simulation"]["warnings"] = [{"code": "NOOP", "message": "move of 'gdrive:a' onto itself", "seq": 3}]
+        elif self.preview_mode == "conflicts":
+            base["ok"] = False
+            base["simulation"]["ok"] = False
+            base["simulation"]["violations"] = [
+                {"code": "DST_EXISTS", "message": "'dropbox:學校/資料/survey.csv' already holds different content", "seq": 1}]
+            base["summary"]["conflicts"] = len(ENGINE_CONFLICTS)
+            base["conflicts"] = [
+                {"code": code, "reason": reason, "from": {"remote": "gdrive", "path": f"研究/資料/survey-{i}.csv"},
+                 "to": {"remote": "dropbox", "path": f"學校/資料/survey-{i}.csv"},
+                 "with": None if code in ("OCCUPIED", "CYCLE") else {"remote": "dropbox", "path": f"學校/資料/survey-{i}.csv"}}
+                for i, (code, reason) in enumerate(ENGINE_CONFLICTS)]
         else:
             base["ok"] = True
             if self.approvals_enabled:
@@ -411,6 +462,10 @@ class MockApi:
             if d["status"] != "open":
                 return 409, {"error": "draft is closed", "code": "NOT_OPEN"}
             if method == "POST" and rest == "/actions":
+                if self.force_error:
+                    code, message = self.force_error
+                    self.force_error = None
+                    return 409, {"error": message, "code": code}
                 try:
                     act, warnings = self._commit(body, "ui")
                 except Stage as e:
@@ -535,6 +590,18 @@ class Ui:
         self.settle()
         self.page.drag_and_drop(self.sel(*src), self.sel(*dst))
 
+    def dragover_allowed(self, src: tuple[str, str], dst: tuple[str, str]) -> bool:
+        """Would the browser offer a drop here? Fires dragstart on `src` and dragover on `dst` as the page sees them:
+        a handler that calls preventDefault() on dragover is what makes an element accept a drop."""
+        return self.page.evaluate("""([src, dst]) => {
+            const dt = new DataTransfer();
+            const fire = (el, type) => el.dispatchEvent(new DragEvent(type, { bubbles: true, cancelable: true, dataTransfer: dt }));
+            fire(document.querySelector(src), 'dragstart');
+            const allowed = !fire(document.querySelector(dst), 'dragover');
+            window.dispatchEvent(new Event('dragend'));
+            return allowed;
+        }""", [self.sel(*src), self.sel(*dst)])
+
     def expand_all(self) -> None:
         """Left: gdrive > 研究 > (論文, 資料), 學校. Right: dropbox > 學校."""
         for key in ("gdrive:", "gdrive:研究", "gdrive:學校"):
@@ -551,13 +618,13 @@ def make_ui(browser, site):
     errors: list[str] = []
 
     def factory(*, approvals_enabled: bool = True, execution_enabled: bool = True, width: int = 1440, height: int = 900,
-                color_scheme: str = "light") -> Ui:
+                color_scheme: str = "light", quarantine: bool = False) -> Ui:
         ctx = browser.new_context(viewport={"width": width, "height": height}, locale="zh-TW", color_scheme=color_scheme)
         contexts.append(ctx)
         page = ctx.new_page()
         page.on("pageerror", lambda e: errors.append(str(e)))
         page.on("console", lambda m: errors.append(m.text) if "Content Security Policy" in m.text else None)
-        mock = MockApi(approvals_enabled=approvals_enabled, execution_enabled=execution_enabled)
+        mock = MockApi(approvals_enabled=approvals_enabled, execution_enabled=execution_enabled, quarantine=quarantine)
         page.route("**/v1/**", mock.handle)
         return Ui(page, mock, site)
 
@@ -1039,6 +1106,358 @@ def test_nothing_to_do_after_dragging_back(make_ui):
     expect(ui.page.get_by_test_id("preview-button")).to_be_disabled()
 
 
+# --- conflicts, in the person's language
+
+def _open_conflict_preview(ui: Ui):
+    ui.mock.preview_mode = "conflicts"
+    ui.expand_all()
+    ui.drag(("left", "gdrive:研究/資料"), ("right", "dropbox:學校"))
+    ui.page.get_by_test_id("preview-button").click()
+    modal = ui.page.get_by_test_id("preview-modal")
+    expect(modal.get_by_test_id("conflict")).to_have_count(len(ENGINE_CONFLICTS))
+    return modal
+
+
+def test_every_conflict_code_is_explained_in_chinese_and_the_raw_detail_is_secondary_monospace(make_ui):
+    ui = make_ui().open()
+    modal = _open_conflict_preview(ui)
+    titles = {"DIFFERENT_CONTENT": "同名但內容不同", "DIR_IN_WAY": "同名的資料夾擋住", "FILE_IN_WAY": "同名的檔案擋住",
+              "OCCUPIED": "位置要到最後才會空出來", "CYCLE": "搬移互相等待"}
+    for code, reason in ENGINE_CONFLICTS:
+        item = modal.locator(f'[data-testid="conflict"][data-code="{code}"]')
+        expect(item).to_have_count(1)
+        expect(item.locator(".problem-head strong")).to_contain_text(titles[code])
+        text = item.locator(".problem-text").inner_text()
+        assert re.search(r"[一-鿿]", text) and reason not in text, text          # an explanation, not the engine's sentence
+        raw = item.get_by_test_id("problem-raw")
+        expect(raw).to_contain_text(code)                                          # the raw code and sentence are kept ...
+        expect(raw).to_contain_text(reason)
+        assert "mono" in raw.evaluate("e => getComputedStyle(e).fontFamily").lower()   # ... in monospace ...
+        size = lambda sel: item.locator(sel).evaluate("e => parseFloat(getComputedStyle(e).fontSize)")  # noqa: E731
+        assert size(".problem-detail") < size(".problem-head strong")              # ... and smaller than the headline
+        head = item.locator(".problem-head").inner_text()
+        assert code not in head and reason not in head                             # the headline itself has no English code
+    expect(modal.get_by_test_id("conflict").first.get_by_test_id("conflict-path")).to_contain_text("survey-0.csv")
+    ui.page.keyboard.press("Escape")
+
+    # The same in English once asked for.
+    ui.page.get_by_test_id("lang-toggle").click()
+    ui.page.get_by_test_id("preview-button").click()
+    modal = ui.page.get_by_test_id("preview-modal")
+    expect(modal.locator('[data-testid="conflict"][data-code="DIFFERENT_CONTENT"] .problem-head strong')).to_have_text(
+        "Same name, different content")
+    expect(modal.locator('[data-testid="conflict"][data-code="CYCLE"] .problem-text')).to_contain_text("temporary name")
+
+
+# --- steps that a rescan left with nothing to act on
+
+def test_a_step_that_a_rescan_made_stale_is_struck_through_explained_and_named_in_the_preview(make_ui):
+    ui = make_ui().open()
+    ui.expand_all()
+    ui.drag(("left", "gdrive:研究/資料"), ("right", "dropbox:學校"))
+    ui.drag(("left", "gdrive:學校/課程"), ("right", "dropbox:Archive"))
+    expect(ui.page.get_by_test_id("staged-count")).to_have_text("2")
+    expect(ui.page.get_by_test_id("staged-stale-count")).to_have_count(0)
+
+    ui.mock.vanish("gdrive", "研究/資料")                      # a rescan (elsewhere) notices that the folder is gone
+    pill = ui.page.get_by_test_id("staged-stale-count")
+    expect(pill).to_have_text("1", timeout=8000)               # the page's poll notices on its own
+    assert "不會被執行" in pill.get_attribute("title")
+    expect(ui.page.get_by_test_id("toast").filter(has_text="已失效")).to_be_visible()
+
+    ui.page.get_by_test_id("staged-toggle").click()
+    items = ui.page.get_by_test_id("staged-item")
+    expect(items).to_have_count(2)
+    stale, fine = items.first, items.nth(1)
+    expect(stale).to_have_attribute("data-stale", "true")
+    expect(fine).to_have_attribute("data-stale", "false")
+    why = stale.get_by_test_id("staged-stale")
+    expect(why).to_contain_text("已失效")
+    expect(why).to_contain_text("來源已不存在：gdrive:研究/資料")
+    expect(why).to_contain_text("這一步不會產生任何動作")
+    assert "line-through" in stale.locator(".staged-title").evaluate("e => getComputedStyle(e).textDecorationLine")
+    assert "line-through" not in fine.locator(".staged-title").evaluate("e => getComputedStyle(e).textDecorationLine")
+    expect(fine.get_by_test_id("staged-stale")).to_have_count(0)
+    expect(ui.page.get_by_test_id("staged-stale-summary")).to_contain_text("1 個步驟已失效")
+    expect(ui.node("right", "dropbox:學校/資料")).to_have_count(0)            # the stale step moved nothing
+    expect(ui.node("right", "dropbox:Archive/課程")).to_be_visible()          # the other one did
+
+    ui.page.get_by_test_id("preview-button").click()
+    modal = ui.page.get_by_test_id("preview-modal")
+    box = modal.get_by_test_id("stale-actions")
+    expect(box).to_be_visible()
+    expect(box).to_contain_text("有 1 個暫存的步驟已失效，不會被執行")
+    expect(box.get_by_test_id("stale-action")).to_have_count(1)
+    expect(box.get_by_test_id("stale-action")).to_contain_text("移動 1 項 → dropbox:學校")
+    expect(box.get_by_test_id("stale-action")).to_contain_text("來源已不存在：gdrive:研究/資料")
+    expect(modal.get_by_test_id("approval-button")).to_be_visible()           # the rest can still be approved
+    ui.page.keyboard.press("Escape")
+
+    stale.get_by_test_id("staged-remove").click()                              # tidy up: the warning goes away
+    expect(ui.page.get_by_test_id("staged-stale-count")).to_have_count(0)
+    expect(ui.page.get_by_test_id("staged-stale-summary")).to_have_count(0)
+
+
+def test_a_draft_of_only_stale_steps_says_why_there_is_nothing_to_run(make_ui):
+    ui = make_ui().open()
+    ui.expand_all()
+    ui.drag(("left", "gdrive:研究/資料"), ("right", "dropbox:學校"))
+    ui.mock.vanish("gdrive", "研究/資料")
+    expect(ui.page.get_by_test_id("staged-stale-count")).to_have_text("1", timeout=8000)
+    ui.page.get_by_test_id("preview-button").click()
+    modal = ui.page.get_by_test_id("preview-modal")
+    expect(modal.get_by_test_id("preview-empty")).to_contain_text("沒有任何可以執行的步驟")
+    expect(modal.get_by_test_id("preview-empty")).not_to_contain_text("來回拖放")   # not the "dragged back" message
+    expect(modal.get_by_test_id("stale-action")).to_have_count(1)
+    expect(modal.get_by_test_id("approval-button")).to_have_count(0)
+    ui.page.keyboard.press("Escape")
+    ui.page.get_by_test_id("lang-toggle").click()
+    ui.page.get_by_test_id("staged-toggle").click()
+    expect(ui.page.get_by_test_id("staged-stale")).to_contain_text("The source no longer exists: gdrive:研究/資料")
+
+
+# --- the quarantine folder
+
+def test_the_quarantine_folder_is_drawn_apart_and_is_neither_draggable_nor_a_drop_target(make_ui):
+    ui = make_ui(quarantine=True).open()
+    ui.expand_all()
+    q = ui.node("left", f"gdrive:{QUARANTINE}")
+    expect(q).to_be_visible()
+    expect(q).to_have_attribute("data-quarantine", "root")
+    expect(q.get_by_test_id("quarantine-label")).to_have_text("隔離區")
+    expect(q).to_contain_text(QUARANTINE)                                     # the real folder name stays visible, small
+    expect(q).to_have_attribute("draggable", "false")
+    assert q.get_attribute("data-droptarget") is None
+    tip = q.get_attribute("title")
+    assert "drivemerge plan restore" in tip and "drivemerge plan purge" in tip and QUARANTINE in tip
+    assert q.get_by_test_id("quarantine-label").get_attribute("title") == tip   # the label itself carries it too
+    assert ui.node("left", "gdrive:研究").get_attribute("title") is None        # ordinary folders have no such tooltip
+    posts = len(ui.mock.calls_to("POST", "/v1/drafts/1/actions"))
+
+    ui.drag(("left", f"gdrive:{QUARANTINE}"), ("right", "dropbox:學校"))        # out of the tree
+    ui.drag(("left", "gdrive:研究/資料"), ("left", f"gdrive:{QUARANTINE}"))    # into it
+    assert len(ui.mock.calls_to("POST", "/v1/drafts/1/actions")) == posts
+
+    # Hovering a dragged folder over it offers no drop; an ordinary folder is the control.
+    assert ui.dragover_allowed(("left", "gdrive:研究/資料"), ("right", "dropbox:Archive"))
+    assert not ui.dragover_allowed(("left", "gdrive:研究/資料"), ("left", f"gdrive:{QUARANTINE}"))
+    assert not ui.dragover_allowed(("left", f"gdrive:{QUARANTINE}"), ("right", "dropbox:Archive"))
+    assert len(ui.mock.calls_to("POST", "/v1/drafts/1/actions")) == posts
+
+    # What is inside is locked as well, and says why.
+    ui.expand("left", f"gdrive:{QUARANTINE}")
+    ui.expand("left", f"gdrive:{QUARANTINE}/7")
+    inner = ui.node("left", f"gdrive:{QUARANTINE}/7/學校")
+    expect(inner).to_have_attribute("data-quarantine", "inside")
+    expect(inner).to_have_attribute("draggable", "false")
+    assert "drivemerge plan restore" in inner.get_attribute("title")
+    expect(ui.node("left", f"gdrive:{QUARANTINE}/7/scan.zip")).to_have_attribute("draggable", "false")
+    ui.drag(("left", f"gdrive:{QUARANTINE}/7/scan.zip"), ("right", "dropbox:學校"))
+    ui.drag(("left", "gdrive:研究/資料"), ("left", f"gdrive:{QUARANTINE}/7/學校"))
+    assert len(ui.mock.calls_to("POST", "/v1/drafts/1/actions")) == posts
+    # Dropping on a breadcrumb that lies inside the quarantine folder is no way in either.
+    inner.click()                       # the left pane's breadcrumbs now run through the quarantine folder
+    crumb = ui.page.get_by_test_id(f"crumb-gdrive:{QUARANTINE}")
+    expect(crumb).to_be_visible()
+    assert not ui.dragover_allowed(("right", "dropbox:學校/作業"), ("left", f"gdrive:{QUARANTINE}/7/學校"))
+    ui.page.locator(ui.sel("right", "dropbox:學校/作業")).drag_to(crumb)
+    assert len(ui.mock.calls_to("POST", "/v1/drafts/1/actions")) == posts
+    expect(ui.page.get_by_test_id("staged-count")).to_have_text("0")
+
+
+def test_the_keyboard_has_no_way_into_or_out_of_the_quarantine_folder_either(make_ui):
+    ui = make_ui(quarantine=True).open()
+    ui.expand_all()
+    q = ui.node("left", f"gdrive:{QUARANTINE}")
+    toasts = ui.page.get_by_test_id("toast")
+    q.click()
+    ui.page.keyboard.press("Control+x")                                       # nothing is cut
+    ui.page.keyboard.press("F2")                                              # nothing is renamed
+    q.get_by_test_id("quarantine-label").dblclick()
+    expect(ui.page.get_by_test_id("rename-input")).to_have_count(0)
+    expect(toasts.filter(has_text="已剪下")).to_have_count(0)
+
+    ui.node("left", "gdrive:研究/資料").click()
+    ui.page.keyboard.press("Control+x")
+    expect(toasts.filter(has_text="已剪下 1 項")).to_be_visible()
+    q.click()
+    ui.page.keyboard.press("Control+v")                                       # no paste into it
+    expect(toasts.filter(has_text="隔離區不能")).to_be_visible()
+    ui.page.get_by_test_id("mkdir-left").click()                              # nor a new folder
+    expect(ui.page.get_by_test_id("dialog")).to_have_count(0)
+    expect(toasts.filter(has_text="隔離區不能")).to_have_count(1)             # the same notice, not a pile of them
+    assert not ui.mock.calls_to("POST", "/v1/drafts/1/actions")
+
+    # Cut with the quarantine row in the selection: it is left out, the rest goes.
+    ui.node("left", "gdrive:研究/論文").click()
+    q.click(modifiers=["Control"])
+    ui.page.keyboard.press("Control+x")
+    ui.node("right", "dropbox:學校").click()
+    ui.page.keyboard.press("Control+v")
+    assert ui.mock.last("POST", "/v1/drafts/1/actions").body["items"] == [{"remote": "gdrive", "path": "研究/論文"}]
+
+
+def test_a_refusal_from_the_server_about_the_quarantine_folder_is_explained(make_ui):
+    ui = make_ui().open()
+    ui.expand_all()
+    ui.mock.force_error = ("QUARANTINE", "the quarantine folder holds deleted files")
+    ui.drag(("left", "gdrive:研究/資料"), ("right", "dropbox:學校"))
+    toast = ui.page.get_by_test_id("toast").filter(has_text="隔離區")
+    expect(toast).to_contain_text("drivemerge plan restore")
+    expect(ui.page.get_by_test_id("staged-count")).to_have_text("0")
+
+
+# --- toasts
+
+def _boxes(locator):
+    return [b for b in (locator.nth(i).bounding_box() for i in range(locator.count())) if b]
+
+
+def _fresh_page_on_a_jumpable_clock(ui: Ui) -> None:
+    """Time runs normally but can be jumped (page.clock.fast_forward), so the 6 s of a toast need no real wait."""
+    ui.page.clock.install()
+    ui.page.reload()
+    expect(ui.node("left", "gdrive:")).to_be_visible()
+    ui.expand_all()
+
+
+def test_toasts_stack_bottom_right_info_leaves_by_itself_and_errors_stay_until_closed(make_ui):
+    ui = make_ui(width=1440, height=900).open()
+    _fresh_page_on_a_jumpable_clock(ui)
+    toasts = ui.page.get_by_test_id("toast")
+    ui.node("left", "gdrive:研究/資料").click()
+    ui.page.keyboard.press("Control+x")                                       # an info toast
+    info = toasts.filter(has_text="已剪下")
+    expect(info).to_be_visible()
+    ui.page.keyboard.press("Control+v")                                       # pasting onto itself: an error toast
+    error = toasts.filter(has_text="不能貼上")
+    expect(error).to_be_visible()
+    expect(info).to_have_attribute("data-kind", "info")
+    expect(error).to_have_attribute("data-kind", "error")
+
+    # Bottom right, one above the other, inside the window.
+    first, second = _boxes(toasts)[:2]
+    for b in (first, second):
+        assert b["x"] + b["width"] > 1440 * 0.9 and b["x"] > 1440 * 0.5, b      # at the right edge, not in the middle
+        assert b["x"] + b["width"] <= 1440 and b["y"] + b["height"] <= 900
+    assert second["y"] >= first["y"] + first["height"] - 1                      # stacked, not overlapping
+    assert second["y"] + second["height"] > 900 - 40                            # the stack sits at the bottom
+
+    ui.page.clock.fast_forward(5000)
+    expect(info).to_be_visible()                                                # not yet
+    ui.page.clock.fast_forward(2000)
+    expect(info).to_have_count(0)                                               # info leaves by itself ...
+    ui.page.clock.fast_forward(60_000)
+    expect(error).to_be_visible()                                               # ... an error does not
+    error.get_by_test_id("toast-close").click()
+    expect(error).to_have_count(0)
+
+
+def test_a_warning_leaves_by_itself_too(make_ui):
+    ui = make_ui().open()
+    _fresh_page_on_a_jumpable_clock(ui)
+    ui.drag(("left", "gdrive:研究/資料"), ("right", "dropbox:學校"))          # CROSS_REMOTE: a warning
+    warn = ui.page.get_by_test_id("toast").filter(has_text="跨雲")
+    expect(warn).to_have_attribute("data-kind", "warn")
+    ui.page.clock.fast_forward(5000)
+    expect(warn).to_be_visible()
+    ui.page.clock.fast_forward(2000)
+    expect(warn).to_have_count(0)
+
+
+def test_a_toast_waits_while_the_pointer_is_on_it(make_ui):
+    ui = make_ui().open()
+    _fresh_page_on_a_jumpable_clock(ui)
+    ui.node("left", "gdrive:研究/資料").click()
+    ui.page.keyboard.press("Control+x")
+    info = ui.page.get_by_test_id("toast").filter(has_text="已剪下")
+    expect(info).to_be_visible()
+    info.hover()
+    ui.page.wait_for_timeout(150)
+    ui.page.clock.fast_forward(30_000)
+    expect(info).to_be_visible()                                                # being read: it stays
+    ui.page.mouse.move(300, 300)
+    ui.page.wait_for_timeout(150)
+    ui.page.clock.fast_forward(5000)
+    expect(info).to_be_visible()
+    ui.page.clock.fast_forward(2000)
+    expect(info).to_have_count(0)
+
+    # Keyboard focus on its button holds it just the same.
+    ui.node("left", "gdrive:研究/論文").click()
+    ui.page.keyboard.press("Control+x")
+    again = ui.page.get_by_test_id("toast").filter(has_text="已剪下")
+    expect(again).to_be_visible()
+    again.get_by_test_id("toast-close").focus()
+    ui.page.wait_for_timeout(150)
+    ui.page.clock.fast_forward(30_000)
+    expect(again).to_be_visible()
+    ui.node("left", "gdrive:研究/論文").click()                                 # focus moves away
+    ui.page.wait_for_timeout(150)
+    ui.page.clock.fast_forward(7000)
+    expect(again).to_have_count(0)
+
+
+def test_a_repeated_message_replaces_its_earlier_copy(make_ui):
+    ui = make_ui().open()
+    ui.expand_all()
+    ui.node("left", "gdrive:研究/資料").click()
+    for _ in range(3):
+        ui.page.keyboard.press("Control+x")
+    expect(ui.page.get_by_test_id("toast").filter(has_text="已剪下")).to_have_count(1)
+
+
+def _assert_apart(a: dict, b: dict) -> None:
+    assert (a["x"] + a["width"] <= b["x"] + 0.5 or b["x"] + b["width"] <= a["x"] + 0.5
+            or a["y"] + a["height"] <= b["y"] + 0.5 or b["y"] + b["height"] <= a["y"] + 0.5), (a, b)
+
+
+@pytest.mark.parametrize("height", [900, 640])
+def test_a_toast_never_covers_the_footer_of_the_preview_modal(make_ui, height):
+    ui = make_ui(width=1280, height=height).open()
+    _fresh_page_on_a_jumpable_clock(ui)
+    ui.drag(("left", "gdrive:研究/資料"), ("right", "dropbox:學校"))
+    ui.page.get_by_test_id("preview-button").click()
+    modal = ui.page.get_by_test_id("preview-modal")
+    expect(modal.get_by_test_id("approval-button")).to_be_visible()
+    before = modal.locator(".modal-foot").bounding_box()
+    assert before["y"] + before["height"] <= height
+
+    # Claude stages something meanwhile: the poll shows a toast over the open dialog.
+    ui.mock.external_action(created_by="mcp", items=[{"remote": "gdrive", "path": "研究/論文"}],
+                            dst={"remote": "dropbox", "path": "Archive"})
+    ui.page.clock.fast_forward(3500)
+    toast = ui.page.get_by_test_id("toast").filter(has_text="Claude")
+    expect(toast).to_be_visible()
+    ui.page.wait_for_timeout(400)                                                # the dialog settles into its smaller room
+    foot = modal.locator(".modal-foot").bounding_box()
+    t = toast.bounding_box()
+    assert foot["y"] + foot["height"] <= height and foot["height"] > 20          # the footer is all there
+    _assert_apart(foot, t)
+    _assert_apart(foot, ui.page.get_by_test_id("toasts").bounding_box())
+    expect(modal.get_by_test_id("preview-close")).to_be_visible()
+    modal.get_by_test_id("preview-close").click()                                # and its buttons can be pressed
+    expect(modal).to_have_count(0)
+
+
+def test_a_toast_keeps_clear_of_the_open_drawers_buttons(make_ui):
+    ui = make_ui().open()
+    ui.expand_all()
+    ui.drag(("left", "gdrive:研究/資料"), ("right", "dropbox:學校"))
+    ui.page.get_by_test_id("staged-toggle").click()
+    drawer = ui.page.get_by_test_id("staged-drawer")
+    expect(drawer).to_be_visible()
+    ui.node("left", "gdrive:研究/論文").click()
+    ui.page.keyboard.press("Control+x")
+    toast = ui.page.get_by_test_id("toast").filter(has_text="已剪下")
+    expect(toast).to_be_visible()
+    ui.page.wait_for_timeout(300)
+    _assert_apart(drawer.locator(".drawer-foot").bounding_box(), toast.bounding_box())
+    _assert_apart(drawer.bounding_box(), toast.bounding_box())
+    ui.page.get_by_test_id("drawer-undo").click()                                # the buttons are reachable
+    expect(ui.page.get_by_test_id("staged-count")).to_have_text("0")
+
+
 def test_english_fallback_and_language_switch(make_ui):
     ui = make_ui().open()
     expect(ui.page.get_by_test_id("preview-button")).to_contain_text("預覽")
@@ -1068,8 +1487,21 @@ def test_every_translation_key_exists_in_both_languages(make_ui):
         assert f"viol.{code}.title" in zh and f"viol.{code}.text" in zh, code
     for code in ("MERGE", "CROSS_REMOTE", "READ_ONLY", "CASE_COLLISION"):
         assert f"warn.{code}" in zh, code
-    for code in ("SRC_NOT_FOUND DST_NOT_DIR INTO_ITSELF NAME_EXISTS NOOP BAD_NAME").split():
+    for code in ("SRC_NOT_FOUND DST_NOT_DIR INTO_ITSELF NAME_EXISTS NOOP BAD_NAME QUARANTINE").split():
         assert f"err.{code}" in zh, code
+    # Every conflict code the engine can raise has a title and an explanation. The keys are built from the code
+    # at run time, so the scan above cannot see them; the codes themselves are read from the engine's source.
+    source = Path(drivemerge.workspace.__file__).read_text(encoding="utf-8")
+    engine_codes = set(re.findall(r'\bconflict\([^,]+,\s*"([A-Z_]+)"', source))
+    assert engine_codes == {c for c, _ in ENGINE_CONFLICTS}, engine_codes     # the mock lists what the engine really has
+    for code in engine_codes:
+        assert f"conflict.{code}.title" in zh and f"conflict.{code}.text" in zh, code
+        assert re.search(r"[一-鿿]", dicts["zh-TW"][f"conflict.{code}.text"]), code
+    # ... and so does every reason a staged step can have gone stale for, and the quarantine folder.
+    for code in ("SRC_NOT_FOUND", "DST_NOT_DIR"):
+        assert f"stale.{code}" in zh, code
+    for key in ("quarantine.label", "quarantine.tip", "quarantine.inside", "quarantine.cannotHere", "stale.badge"):
+        assert key in zh, key
 
 
 def test_screenshots_for_a_visual_check(make_ui):
@@ -1078,7 +1510,7 @@ def test_screenshots_for_a_visual_check(make_ui):
         SHOTS.mkdir(parents=True, exist_ok=True)
     except OSError:
         pytest.skip("screenshot directory is not writable")
-    ui = make_ui().open()
+    ui = make_ui(quarantine=True).open()
     ui.expand_all()
     ui.expand("left", "gdrive:研究/論文")
     ui.drag(("left", "gdrive:研究/資料"), ("right", "dropbox:學校"))
@@ -1118,7 +1550,33 @@ def test_screenshots_for_a_visual_check(make_ui):
     expect(ui.page.get_by_test_id("progress")).to_have_attribute("data-phase", "done", timeout=10_000)
     ui.page.screenshot(path=str(SHOTS / "done.png"))
 
-    dark = make_ui(color_scheme="dark", width=1100, height=760).open()
+    # A rescan removed a source under the draft; the preview lists it; a toast arrives beside the open dialog.
+    broken = make_ui(quarantine=True).open()
+    broken.expand_all()
+    broken.drag(("left", "gdrive:研究/資料"), ("right", "dropbox:學校"))
+    broken.drag(("left", "gdrive:學校/課程"), ("right", "dropbox:Archive"))
+    broken.mock.vanish("gdrive", "研究/資料")
+    expect(broken.page.get_by_test_id("staged-stale-count")).to_have_text("1", timeout=8000)
+    broken.page.get_by_test_id("staged-toggle").click()
+    expect(broken.page.get_by_test_id("staged-stale")).to_be_visible()
+    broken.expand("left", f"gdrive:{QUARANTINE}")
+    broken.page.wait_for_timeout(1800)
+    broken.page.screenshot(path=str(SHOTS / "stale-draft.png"))
+    broken.page.get_by_test_id("preview-button").click()
+    expect(broken.page.get_by_test_id("stale-actions")).to_be_visible()
+    broken.page.screenshot(path=str(SHOTS / "stale-preview.png"))
+    broken.mock.external_action(created_by="mcp", items=[{"remote": "gdrive", "path": "研究/論文"}],
+                                dst={"remote": "dropbox", "path": "Archive"})
+    expect(broken.page.get_by_test_id("toast").filter(has_text="Claude")).to_be_visible(timeout=8000)
+    broken.page.wait_for_timeout(500)
+    broken.page.screenshot(path=str(SHOTS / "toast-over-preview.png"))
+    broken.page.get_by_test_id("preview-close").click()
+    broken.mock.preview_mode = "conflicts"
+    broken.page.get_by_test_id("preview-button").click()
+    expect(broken.page.get_by_test_id("conflict").first).to_be_visible()
+    broken.page.screenshot(path=str(SHOTS / "preview-conflicts.png"))
+
+    dark = make_ui(color_scheme="dark", width=1100, height=760, quarantine=True).open()
     dark.expand_all()
     dark.drag(("left", "gdrive:研究/資料"), ("right", "dropbox:學校"))
     expect(dark.node("right", "dropbox:學校/資料")).to_be_visible()

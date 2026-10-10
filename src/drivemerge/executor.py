@@ -6,7 +6,9 @@ fails the op and stops the plan (fail-closed). Nothing is ever overwritten.
 execute_plan never removes bytes: a "delete" is a move into
 <quarantine_dir>/<plan id>/ on the same cloud, and only purge_quarantine
 (a separate, human-approved command) deletes, one file at a time and only
-below that directory.
+below that directory. A move onto a destination that already holds identical
+content is a delete in disguise (the simulator models it so): the source is
+quarantined, the destination is its witness, and nothing is overwritten.
 
 "Provably identical" never rests on size alone. Two files are proven equal by
 a hash type both clouds report, or by a hash_bridges row linking their hash
@@ -17,6 +19,7 @@ supplied the missing link is recorded as a bridge so later ops need none.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sqlite3
 import tempfile
@@ -423,7 +426,7 @@ class _Run:
         write = self.writable(dst_rid, "move")
         existing = self.probe("destination", dst_rid, dst_path)
         if existing is not None:
-            raise _OpFailed(f"destination {existing.loc} already exists; nothing was overwritten")
+            return self._move_onto_existing(op, src, existing, write)
         # Once moved, the source is gone: its hashes must be known now so the destination can be checked against them.
         if not self._know(src):
             self._fingerprint(src, op)
@@ -438,30 +441,54 @@ class _Run:
             raise _OpFailed(f"source {src.loc} is still there after the move")
         return "done"
 
-    def _delete(self, op: Op, src: _Side) -> str:
-        write = self.writable(src.rid, "delete")
-        if op.witness_remote_id is None or not op.witness_path:
-            raise _OpFailed("delete without a witness")
-        wrid, wpath = op.witness_remote_id, op.witness_path
-        _, _, ci = self.remote(wrid)
-        if wrid == src.rid and _fold(wpath, ci) == _fold(src.path, ci):
-            raise _OpFailed(f"the witness is the file being deleted ({src.loc})")
-        root = _quarantine_root(self.config)
-        folded = _fold(wpath, ci)
-        if folded == _fold(root, ci) or folded.startswith(_fold(root, ci) + "/"):
-            raise _OpFailed(f"witness {self.name(wrid)}:{wpath} is inside the quarantine directory, "
-                            "which is not a live copy")
-        wit = self.probe("witness", wrid, wpath)
-        if wit is None:
-            raise _OpFailed(f"witness {self.name(wrid)}:{wpath} does not exist")
-        self.require_same(op, src, wit, "witness check")
+    def _move_onto_existing(self, op: Op, src: _Side, existing: _Side, write: str) -> str:
+        """The destination is taken. If it provably holds the same bytes the move has nothing left to do
+        but remove the source, which goes to quarantine like a deleted duplicate; otherwise nothing changes."""
+        _, _, ci = self.remote(src.rid)
+        if _fold(existing.path, ci) == _fold(src.path, ci):
+            if existing.path != src.path:
+                raise _OpFailed(f"destination {existing.loc} is the source {src.loc} under a name that differs "
+                                "only in case; nothing was changed")
+            self.log("verify", op, what="move onto itself", a=src.loc, b=existing.loc, verdict="same", how="same path")
+            return "skipped"
+        self._require_live("destination", existing.rid, existing.path)
+        proof = self.prove(src, existing, op)
+        self.log("verify", op, what="existing destination", a=src.loc, b=existing.loc,
+                 verdict=proof.verdict, how=proof.how, detail=proof.detail)
+        if proof.verdict != "same":
+            raise _OpFailed(f"destination {existing.loc} already exists and is not provably identical "
+                            f"to the source ({proof.verdict}); nothing was overwritten")
+        self._quarantine(op, src, write, why="the destination already holds identical content")
+        return "done"
 
+    def _require_live(self, role: str, rid: int, path: str) -> None:
+        """Fail unless this location can count as a live copy, i.e. is not inside the quarantine directory."""
+        _, _, ci = self.remote(rid)
+        root = _fold(_quarantine_root(self.config), ci)
+        folded = _fold(path, ci)
+        if folded == root or folded.startswith(root + "/"):
+            raise _OpFailed(f"{role} {self.name(rid)}:{path} is inside the quarantine directory, "
+                            "which is not a live copy")
+
+    def _witness(self, rid: int, path: str, victim: _Side) -> _Side:
+        """Probe the surviving copy that vouches for `victim`: another file, outside quarantine, still there."""
+        _, _, ci = self.remote(rid)
+        if rid == victim.rid and _fold(path, ci) == _fold(victim.path, ci):
+            raise _OpFailed(f"the witness is the file being deleted ({victim.loc})")
+        self._require_live("witness", rid, path)
+        wit = self.probe("witness", rid, path)
+        if wit is None:
+            raise _OpFailed(f"witness {self.name(rid)}:{path} does not exist")
+        return wit
+
+    def _quarantine(self, op: Op, src: _Side, write: str, **why) -> None:
+        """Move the source into this plan's quarantine on its own cloud and check the result."""
         qpath = quarantine_path(self.config, self.plan_id, src.path)
         if not _inside_quarantine(self.config, self.plan_id, qpath):
             raise _OpFailed(f"refusing quarantine path {qpath!r}")
         if self.probe("quarantine target", src.rid, qpath) is not None:
             raise _OpFailed(f"quarantine target {src.name}:{qpath} is already occupied")
-        self.log("intent", op, kind="quarantine", remote=src.name, **{"from": src.path, "to": qpath})
+        self.log("intent", op, kind="quarantine", remote=src.name, **{"from": src.path, "to": qpath}, **why)
         self.rclone.moveto(write, src.path, write, qpath)
         held = self.probe("quarantined copy", src.rid, qpath)
         if held is None:
@@ -470,6 +497,14 @@ class _Run:
         if self.probe("source", src.rid, src.path) is not None:
             raise _OpFailed(f"source {src.loc} is still there after the move to quarantine")
         self.log("quarantine", op, remote=src.name, **{"from": src.path, "to": qpath})
+
+    def _delete(self, op: Op, src: _Side) -> str:
+        write = self.writable(src.rid, "delete")
+        if op.witness_remote_id is None or not op.witness_path:
+            raise _OpFailed("delete without a witness")
+        wit = self._witness(op.witness_remote_id, op.witness_path, src)
+        self.require_same(op, src, wit, "witness check")
+        self._quarantine(op, src, write)
         return "done"
 
     # --------------------------------------------------------- restore / purge
@@ -510,8 +545,22 @@ class _Run:
             raise _OpFailed(f"refusing to purge {name}:{qpath}: not inside {_quarantine_root(self.config)}"
                             f"/{self.plan_id}/")
         write = self.writable(rid, "purge")
-        if self.probe("quarantined copy", rid, qpath) is None:
+        held = self.probe("quarantined copy", rid, qpath)
+        if held is None:
             return False
+        # The quarantined copy may by now be the only one: whatever vouched for it must still be there.
+        if op.op == "delete":
+            wit_rid, wit_path = op.witness_remote_id, op.witness_path
+        else:  # a move that met identical content: the destination vouches
+            wit_rid, wit_path = op.dst_remote_id, op.dst_path
+        if wit_rid is None or not wit_path:
+            raise _OpFailed(f"{name}:{qpath} is kept: the op names no surviving copy")
+        if problem := _path_problem(wit_path):
+            raise _OpFailed(f"{name}:{qpath} is kept: witness path {wit_path!r} {problem}")
+        try:
+            self.require_same(op, held, self._witness(wit_rid, wit_path, held), "witness re-check before purge")
+        except _OpFailed as e:
+            raise _OpFailed(f"{name}:{qpath} is kept: {e}") from e
         self.log("intent", op, kind="purge", remote=name, path=qpath)
         self.rclone.deletefile(write, qpath)
         if self.probe("quarantined copy", rid, qpath) is not None:
@@ -551,13 +600,28 @@ def execute_plan(conn: sqlite3.Connection, rclone: Rclone, config: Config, plan_
         raise ExecutionError(f"plan {plan_id} is {plan.status}; only an approved plan can be executed")
     if not plan.digest:
         raise ExecutionError(f"plan {plan_id} has no simulation digest")
-    if plans.current_digest(conn, plan_id) != plan.digest:
-        raise plans.StaleSimulation(f"plan {plan_id} or the catalog changed since it was simulated; simulate again")
-    claimed = conn.execute("UPDATE plans SET status = 'executing' WHERE id = ? AND status IN ('approved', 'failed')",
-                           (plan_id,)).rowcount
-    if claimed != 1:
+    plans.require_current(conn, plan_id)
+    if not plans.claim_for_execution(conn, plan_id):
         raise ExecutionError(f"plan {plan_id} is already being executed")
+    try:
+        return _run_claimed(conn, rclone, config, plan, tmpdir, progress)
+    finally:
+        _unclaim(conn, plan_id)
 
+
+def _unclaim(conn: sqlite3.Connection, plan_id: int) -> None:
+    """End of a run: the plan is never left 'executing' by this process, and its lock goes away."""
+    with contextlib.suppress(sqlite3.Error):
+        if plans.get_plan(conn, plan_id, with_ops=False).status == "executing":
+            plans.set_status(conn, plan_id, "failed")
+    with contextlib.suppress(sqlite3.Error):
+        plans.release_execution_lock(conn, plan_id)
+
+
+def _run_claimed(conn: sqlite3.Connection, rclone: Rclone, config: Config, plan: plans.Plan,
+                 tmpdir: str | Path | None, progress: Callable[[int, int, Op], None] | None) -> ExecResult:
+    """Execute a plan this process has claimed ('executing' + lock); always leaves it done or failed."""
+    plan_id = plan.id
     ops = plan.ops
     by_seq = {o.seq: o for o in ops}
     total = len(ops)
@@ -605,11 +669,19 @@ def execute_plan(conn: sqlite3.Connection, rclone: Rclone, config: Config, plan_
             own_tmp.cleanup()
 
 
+def _quarantined_ops(conn: sqlite3.Connection, plan: plans.Plan) -> list[Op]:
+    """Finished ops of the plan whose source sits in its quarantine: deletes, and moves that met identical content."""
+    parked = {r[0] for r in conn.execute(
+        "SELECT DISTINCT op_id FROM journal WHERE plan_id = ? AND action = 'quarantine' AND op_id IS NOT NULL",
+        (plan.id,))}
+    return [o for o in plan.ops if o.status == "done" and (o.op == "delete" or (o.op == "move" and o.id in parked))]
+
+
 def restore_plan(conn: sqlite3.Connection, rclone: Rclone, config: Config, plan_id: int) -> ExecResult:
     """Move every quarantined file of this plan back to its original path (newest delete first).
 
     An original path that is taken again is a failure for that file only: it
-    stays in quarantine and the rest are still restored. A restored delete op
+    stays in quarantine and the rest are still restored. A restored op
     is marked 'skipped' so a second restore, a purge or a resume ignores it.
     """
     _require_enabled(config)
@@ -618,8 +690,7 @@ def restore_plan(conn: sqlite3.Connection, rclone: Rclone, config: Config, plan_
         raise ExecutionError(f"plan {plan_id} is executing; wait for it to finish")
     result = ExecResult(plan_id, "done")
     run = _Run(conn, rclone, config, plan_id)
-    for op in sorted((o for o in plan.ops if o.op == "delete" and o.status == "done"),
-                     key=lambda o: o.seq, reverse=True):
+    for op in sorted(_quarantined_ops(conn, plan), key=lambda o: o.seq, reverse=True):
         failure = None
         try:
             run.restore(op)
@@ -637,12 +708,14 @@ def restore_plan(conn: sqlite3.Connection, rclone: Rclone, config: Config, plan_
 
 
 def purge_quarantine(conn: sqlite3.Connection, rclone: Rclone, config: Config, plan_id: int, *,
-                     older_than_days: int = 30) -> ExecResult:
+                     older_than_days: int = 30, tmpdir: str | Path | None = None) -> ExecResult:
     """Permanently delete quarantined files of this plan that were quarantined long enough ago.
 
-    Only files of delete ops that are 'done' and were executed before the
-    cutoff, and only paths below <quarantine_dir>/<plan id>/. `skipped` counts
-    files left alone (too recent, or already gone).
+    Only files of ops that quarantined their source ('done' deletes, and moves onto identical
+    content) before the cutoff, and only paths below <quarantine_dir>/<plan id>/. `skipped` counts
+    files left alone (too recent, or already gone). A file is purged only if what vouched for it
+    (the delete's witness, the move's destination) still exists live and is proven identical now,
+    since the quarantined copy may have become the last one; otherwise it fails and stays.
     """
     _require_enabled(config)
     if older_than_days < 0:
@@ -652,25 +725,30 @@ def purge_quarantine(conn: sqlite3.Connection, rclone: Rclone, config: Config, p
         raise ExecutionError(f"plan {plan_id} is executing; wait for it to finish")
     cutoff = (datetime.now(timezone.utc) - timedelta(days=older_than_days)).strftime(_TS_FORMAT)
     executed = {r[0]: r[1] for r in conn.execute(
-        "SELECT id, executed_at FROM plan_ops WHERE plan_id = ? AND op = 'delete' AND status = 'done'", (plan_id,))}
+        "SELECT id, executed_at FROM plan_ops WHERE plan_id = ? AND status = 'done'", (plan_id,))}
     result = ExecResult(plan_id, "done")
-    run = _Run(conn, rclone, config, plan_id)
-    for op in (o for o in plan.ops if o.id in executed):
-        if executed[op.id] is None or executed[op.id] >= cutoff:
-            result.skipped += 1
-            continue
-        failure = None
-        try:
-            purged = run.purge(op)
-        except Exception as e:
-            failure = _failure_text(e)
-        if failure is not None:
-            run.log("purge", op, status="failed", error=failure)
-            result.failed += 1
-            result.error = result.error or f"{_describe(run, op)}: {failure}"
-        elif purged:
-            result.done += 1
-        else:
-            result.skipped += 1
+    with contextlib.ExitStack() as stack:
+        # Proving a witness identical may mean downloading something, and that needs scratch space.
+        tmp = Path(tmpdir) if tmpdir is not None else Path(stack.enter_context(
+            tempfile.TemporaryDirectory(prefix="drivemerge-purge-")))
+        tmp.mkdir(parents=True, exist_ok=True)
+        run = _Run(conn, rclone, config, plan_id, tmp)
+        for op in _quarantined_ops(conn, plan):
+            if executed[op.id] is None or executed[op.id] >= cutoff:
+                result.skipped += 1
+                continue
+            failure = None
+            try:
+                purged = run.purge(op)
+            except Exception as e:
+                failure = _failure_text(e)
+            if failure is not None:
+                run.log("purge", op, status="failed", error=failure)
+                result.failed += 1
+                result.error = result.error or f"{_describe(run, op)}: {failure}"
+            elif purged:
+                result.done += 1
+            else:
+                result.skipped += 1
     result.status = "done" if result.failed == 0 else "partial"
     return result

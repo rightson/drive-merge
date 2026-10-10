@@ -8,8 +8,11 @@ are replaced with recorders, so these tests check what the CLI sends and prints.
 from __future__ import annotations
 
 import json
+import os
 import re
+import socket
 import stat
+import subprocess
 import sys
 import tomllib
 from dataclasses import dataclass
@@ -536,6 +539,26 @@ def test_violations_give_exit_code_3(run, monkeypatch):
     assert rc == 3 and json.loads(out)["simulation"]["ok"] is False
 
 
+def test_a_capped_report_says_how_much_it_leaves_out(run, monkeypatch):
+    """The simulator lists its first 1000 findings and counts all of them; the summary must not pretend otherwise."""
+    listed = [{"code": "SRC_MISSING", "seq": i, "message": f"op {i} lacks a source"} for i in range(1, 1001)]
+    extra = dict(violations_total=5000, violations_by_code={"DST_EXISTS": 600, "SRC_MISSING": 4399, "NO_WITNESS": 1},
+                 warnings_total=2500)
+    record(monkeypatch, "propose_plan", proposed(ok=False, violations=listed, **extra))
+    rc, out, _ = run("plan", "dedupe")
+    assert rc == 3
+    assert "FAILED, 5,000 violation(s)" in out and "... and 4,980 more" in out
+    assert "by code: SRC_MISSING 4,399, DST_EXISTS 600, NO_WITNESS 1" in out
+    assert "Warnings: 2,500" in out
+    lines = cli.format_report({**proposed(ok=False, violations=listed[:3], **extra)["simulation"]})
+    assert "... and 4,997 more" in "\n".join(lines), "counts what is not listed, not what is not shown"
+
+
+def test_a_report_without_totals_still_prints(run):
+    lines = cli.format_report({"ok": False, "violations": [{"code": "BAD_PATH", "seq": 1, "message": "m"}] * 3})
+    assert lines[0] == "Simulation: FAILED, 3 violation(s)" and "by code" not in "\n".join(lines)
+
+
 def test_nothing_to_do_is_not_an_error(run, monkeypatch):
     record(monkeypatch, "propose_plan", {"plan_id": None, "ops": 0, "skipped": [], "stats": {}, "message": "nothing to do"})
     rc, out, _ = run("plan", "dedupe")
@@ -712,6 +735,125 @@ def test_execute_disabled_error_from_the_executor_is_reported(env, planned, run,
     typed(monkeypatch, "execute 1")
     rc, _, err = trun("plan", "execute", "1", config=env.config_enabled)
     assert rc == 1 and "disabled by policy" in err
+
+
+def _approve_and_run_into_the_ground(env, status="failed"):
+    """Plan 1 approved, then left in `status` (as a run that stopped would leave it)."""
+    conn = db.connect(env.db_path)
+    try:
+        plan = plans.get_plan(conn, 1)
+        plans.approve_plan(conn, 1, plans.short_code(plan.digest), approved_by="test")
+        plans.set_status(conn, 1, status)
+    finally:
+        conn.close()
+
+
+def _rescan_alpha(env):
+    """A newer complete scan: what a rescan after a half-done run looks like to the plan's digest."""
+    conn = db.connect(env.db_path)
+    try:
+        conn.execute("INSERT INTO scans(remote_id, status, started_at, finished_at) "
+                     "VALUES (?, 'complete', ?, ?)", (db.remote_id(conn, "alpha"), db.utcnow(), db.utcnow()))
+    finally:
+        conn.close()
+
+
+def test_a_failed_plan_whose_catalog_changed_is_told_to_get_a_new_plan_before_any_prompt(
+        env, planned, run, trun, no_input, monkeypatch):
+    calls = record(monkeypatch, "execute", {"plan_id": 1, "status": "done"})
+    _approve_and_run_into_the_ground(env)
+    _rescan_alpha(env)
+    rc, out, err = trun("plan", "execute", "1", config=env.config_enabled)
+    assert rc == 1 and "propose a new plan" in err and "cannot be simulated" in err
+    assert "simulate again" not in err
+    assert not calls and "Type" not in out, "refused before asking the human to confirm anything"
+    rc, out, _ = trun("--json", "plan", "execute", "1", config=env.config_enabled)
+    assert rc == 1 and "propose a new plan" in json.loads(out)["error"]
+
+
+def test_an_approved_plan_whose_catalog_changed_is_told_to_simulate_again(env, planned, trun, no_input, monkeypatch):
+    calls = record(monkeypatch, "execute", {"plan_id": 1, "status": "done"})
+    _approve_and_run_into_the_ground(env, status="approved")
+    _rescan_alpha(env)
+    rc, _, err = trun("plan", "execute", "1", config=env.config_enabled)
+    assert rc == 1 and "simulate again" in err and "new plan" not in err and not calls
+
+
+def test_the_executors_own_stale_error_reaches_the_user_the_same_way(env, planned, trun, monkeypatch):
+    """If the catalog changes while the human reads the summary, the executor's refusal says the same thing."""
+    record(monkeypatch, "execute", raises=plans.StaleSimulation("plan 1 failed ...: propose a new plan"))
+    typed(monkeypatch, "execute 1")
+    rc, _, err = trun("plan", "execute", "1", config=env.config_enabled)
+    assert rc == 1 and "propose a new plan" in err
+
+
+def _executing(env, lock):
+    """Plan 1 as a crashed run leaves it: 'executing', with `lock` (a dict, or None for no lock row)."""
+    conn = db.connect(env.db_path)
+    try:
+        plans.set_status(conn, 1, "executing")
+        if lock is not None:
+            conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('executing:1', ?)", (json.dumps(lock),))
+    finally:
+        conn.close()
+
+
+def _holder(pid):
+    return {"pid": pid, "host": socket.gethostname(), "started_at": "2024-05-01T10:00:00.000000Z"}
+
+
+def _dead_pid() -> int:
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait()
+    return child.pid
+
+
+def test_plan_reset_frees_a_plan_left_executing(env, planned, run, jrun):
+    _executing(env, _holder(_dead_pid()))
+    rc, out, err = run("plan", "reset", "1")          # no terminal, no prompt: it never touches a cloud
+    assert rc == 0, err
+    assert "Plan 1 reset to failed" in out and "drivemerge plan execute 1" in out
+    assert jrun("plan", "show", "1")[1]["status"] == "failed"
+    conn = db.connect(env.db_path)
+    assert conn.execute("SELECT COUNT(*) FROM meta WHERE key = 'executing:1'").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM journal WHERE plan_id = 1 AND action = 'reset'").fetchone()[0] == 1
+    conn.close()
+
+
+def test_plan_reset_json(env, planned, run):
+    _executing(env, None)
+    rc, out, _ = run("--json", "plan", "reset", "1")
+    assert rc == 0 and json.loads(out) == {"plan_id": 1, "status": "failed"}
+
+
+def test_plan_reset_refuses_while_the_executor_is_alive(env, planned, run, jrun):
+    _executing(env, _holder(os.getpid()))
+    rc, out, err = run("plan", "reset", "1")
+    assert rc == 1 and f"pid {os.getpid()}" in err and "being executed" in err
+    assert jrun("plan", "show", "1")[1]["status"] == "executing"
+    rc, out, _ = run("--json", "plan", "reset", "1")
+    assert rc == 1 and "being executed" in json.loads(out)["error"]
+
+
+def test_plan_reset_only_applies_to_an_executing_plan(planned, run):
+    rc, _, err = run("plan", "reset", "1")
+    assert rc == 1 and "simulated" in err and "executing" in err
+    rc, _, err = run("plan", "reset", "99")
+    assert rc == 1 and "no plan 99" in err
+
+
+def test_plan_reset_is_not_human_gated_and_calls_no_cloud_method(env, planned, run, monkeypatch):
+    """It is allowed from scripts and from an AI agent session: it only repairs a status in the catalog."""
+    spies = _spy_gated(monkeypatch)
+    monkeypatch.setenv("CLAUDECODE", "1")
+    _executing(env, None)
+    rc, out, err = run("plan", "reset", "1")
+    assert rc == 0, err
+    assert not any(spies.values())
+
+
+def test_plan_reset_needs_an_id(run):
+    assert run("plan", "reset")[0] == 2
 
 
 def test_restore_and_purge_need_their_own_confirmation(planned, run, trun, monkeypatch):
