@@ -26,6 +26,10 @@ class PlanError(Exception):
     pass
 
 
+class PlanNotFound(PlanError):
+    pass
+
+
 class StaleSimulation(PlanError):
     """The catalog or the plan changed since it was simulated."""
 
@@ -75,7 +79,7 @@ def load_ops(conn: sqlite3.Connection, plan_id: int) -> list[Op]:
 def get_plan(conn: sqlite3.Connection, plan_id: int, *, with_ops: bool = True) -> Plan:
     r = conn.execute("SELECT * FROM plans WHERE id = ?", (plan_id,)).fetchone()
     if r is None:
-        raise PlanError(f"no plan {plan_id}")
+        raise PlanNotFound(f"no plan {plan_id}")
     return Plan(
         id=r["id"], title=r["title"], kind=r["kind"], status=r["status"], created_by=r["created_by"],
         params=json.loads(r["params"] or "{}"), digest=r["digest"],
