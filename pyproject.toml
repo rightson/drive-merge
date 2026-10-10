@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "drive-merge"
+version = "0.1.0"
+description = "Catalog, deduplicate and consolidate files across Google Drive, Dropbox, OneDrive and iCloud — metadata first, nothing moves without a simulated plan."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+# The core engine (catalog, dedup, plans, simulation, execution) is stdlib-only.
+dependencies = []
+
+[project.optional-dependencies]
+api = ["fastapi>=0.110", "uvicorn>=0.29"]
+mcp = ["mcp>=1.2"]
+dev = ["pytest>=8", "httpx>=0.27", "fastapi>=0.110", "uvicorn>=0.29", "mcp>=1.2"]
+
+[project.scripts]
+drivemerge = "drivemerge.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/drivemerge"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = ["rclone: needs the rclone binary on PATH"]
