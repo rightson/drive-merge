@@ -1079,10 +1079,12 @@ def _random_world(rng, cat):
 
 
 def _random_ops(rng, rids, files) -> list[Op]:
-    ops, created, keys = [], [], list(files)
+    ops, created, keys, witness = [], [], list(files), None
     for _ in range(rng.choice([1, 1, 2, 3, 4, 6])):
         kind = rng.choice(["copy", "move", "delete", "delete"])
-        if created and rng.random() < 0.3:
+        if witness is not None and rng.random() < 0.6:     # the dangerous follow-up: remove what a delete relied on
+            (sr, sp), kind, witness = witness, rng.choice(["move", "delete"]), None
+        elif created and rng.random() < 0.3:
             sr, sp = rng.choice(created)
         elif keys and rng.random() < 0.85:
             sr, sp = rng.choice(keys)
@@ -1103,6 +1105,7 @@ def _random_ops(rng, rids, files) -> list[Op]:
             else:
                 wr = wp = None
             ops.append(rm(sr, sp, wr, wp, expect_size=exp))
+            witness = (wr, wp) if wr is not None else None
         else:
             dr = rng.choice(rids) if kind == "copy" or rng.random() > 0.9 else sr
             dp = _rand_path(rng)

@@ -102,7 +102,7 @@ def _compare(a: _Node, b: _Node) -> str:
         return "different"
     if a.size is not None and b.size is not None and a.size != b.size:
         return "different"
-    for x, y in zip(a.hashes, b.hashes):
+    for x, y in zip(a.hashes, b.hashes, strict=True):
         if x is not None and y is not None and str(x).lower() != str(y).lower():
             return "different"
     return "same" if a.key == b.key else "unproven"
@@ -212,12 +212,18 @@ class _Engine:
 
     # ----------------------------------------------------------------- overlay
 
+    def label(self, rid: int | None, path: str | None) -> str | None:
+        """'remote:path' for the report's sample; None when the op has no such address."""
+        if rid is None or path is None:
+            return None
+        r = self.remotes.get(rid)
+        return f"{r.name if r else '#' + str(rid)}:{path}"
+
     def _w(self, rid: int | None, path: object) -> str:
         """Remote:path for messages. repr() because file names are untrusted text."""
-        r = self.remotes.get(rid)  # type: ignore[arg-type]
-        return repr(f"{r.name if r else '#' + str(rid)}:{path}")
+        return repr(self.label(rid, path))
 
-    def _add(self, rid: int, path: str, tpl: _Node, entry_id: int | None, seq: int) -> None:
+    def _add(self, rid: int, path: str, tpl: _Node, entry_id: int | None) -> None:
         """Create a virtual file that inherits tpl's identity (key, size, hashes) and its parents."""
         node = _Node(entry_id, path, False, tpl.size, _fold(path.rsplit("/", 1)[-1]),
                      tpl.key, tpl.native, tpl.hashes, True)
@@ -457,7 +463,7 @@ class _Engine:
             if action == "same":
                 self.warnings.append(Violation("NOOP", f"{self._w(drid, dpath)} already holds identical content", seq))
                 return
-            self._add(drid, dpath, src, None, seq)
+            self._add(drid, dpath, src, None)
             st = self._stat(drid)
             st[2] += size
             free = (self.policy.free_bytes or {}).get(drid)
@@ -479,7 +485,7 @@ class _Engine:
                 self._quarantine(srid, size)
                 self.witnesses.append(_Witness(seq, drid, dpath, src.key, src.key, False))
             else:
-                self._add(drid, dpath, src, src.id, seq)
+                self._add(drid, dpath, src, src.id)
         else:
             assert witness is not None
             self._touch(src, srid, spath, seq)
@@ -601,7 +607,8 @@ def simulate_ops(conn: sqlite3.Connection, ops: list[Op], *, plan_id: int | None
     Read-only: it never writes to the database. An op with a violation is not
     applied, so later ops see the state as it would be if the problem were fixed.
     """
-    eng = _Engine(conn, policy or SafetyPolicy())
+    policy = policy or SafetyPolicy()
+    eng = _Engine(conn, policy)
     ordered = _ordered(ops)
     eng.seqs = {s for s, _ in ordered}
     touched = sorted({rid for _, o in ordered for rid in (o.src_remote_id, o.dst_remote_id, o.witness_remote_id)
@@ -617,32 +624,21 @@ def simulate_ops(conn: sqlite3.Connection, ops: list[Op], *, plan_id: int | None
             eng.run_op(op, seq)
         last = seq
 
-    deltas, c_before, c_after, lost = eng.finish(touched)
+    deltas, contents_before, contents_after, lost = eng.finish(touched)
     eng.violations.sort(key=lambda v: (v.seq is None, v.seq or 0))
-    limit = max(0, (policy or SafetyPolicy()).sample_size)
-    sample = []
-    for seq, op in ordered[:limit]:
-        two = op.op != "delete"
-        sample.append({
-            "seq": seq, "op": op.op,
-            "from": _where(eng, op.src_remote_id, op.src_path),
-            "to": _where(eng, op.dst_remote_id, op.dst_path) if two else None,
-            "witness": _where(eng, op.witness_remote_id, op.witness_path),
-            "reason": op.reason,
-        })
+    sample = [{
+        "seq": seq, "op": op.op,
+        "from": eng.label(op.src_remote_id, op.src_path),
+        "to": eng.label(op.dst_remote_id, op.dst_path) if op.op != "delete" else None,
+        "witness": eng.label(op.witness_remote_id, op.witness_path),
+        "reason": op.reason,
+    } for seq, op in ordered[:max(0, policy.sample_size)]]
     return SimulationReport(
         plan_id=plan_id, digest=digest, ok=not eng.violations,
         violations=eng.violations, warnings=eng.warnings, remotes=deltas,
-        contents_before=c_before, contents_after=c_after, contents_lost=lost,
+        contents_before=contents_before, contents_after=contents_after, contents_lost=lost,
         bytes_cross_remote=eng.bytes_cross, op_counts=counts, sample=sample,
     )
-
-
-def _where(eng: _Engine, rid: int | None, path: str | None) -> str | None:
-    if rid is None or path is None:
-        return None
-    r = eng.remotes.get(rid)
-    return f"{r.name if r else '#' + str(rid)}:{path}"
 
 
 def simulate_plan(conn: sqlite3.Connection, plan_id: int, *, policy: SafetyPolicy | None = None) -> SimulationReport:
