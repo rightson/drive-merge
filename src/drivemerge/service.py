@@ -149,6 +149,7 @@ class Service:
         policy = simulate.SafetyPolicy(
             allow_probable_delete=self.config.safety.allow_probable_delete,
             min_copies=self.config.safety.min_copies,
+            quarantine_dir=self.config.safety.quarantine_dir,
         )
         report = simulate.simulate_plan(self.conn, plan_id, policy=policy)
         d = dataclasses.asdict(report)
