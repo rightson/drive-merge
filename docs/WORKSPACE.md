@@ -74,7 +74,7 @@ Locations are `(remote_id, path)`; paths follow catalog conventions ('' = remote
 
 **Moved set M** (for stats and plans): every live catalog entry under the preimage (at that action's time) of any sub-move's `src`, forward-mapped through all actions, keeping those whose final location differs from the origin. Optimise by mapping each distinct parent directory once; map individual files only when a file itself is a move source.
 
-**After-view dir stats** (additive, exact): `after(r, F) = before(r, F) − Σ{size of f in M : origin(f) under F and final(f) not under F} + Σ{size of f in M : final(f) under F and origin(f) not under F}`; `before` comes from `dir_stats` (0 if absent). Same for file counts and dup_files.
+**After-view dir stats** (additive, exact): `after(r, F) = before(r, F) − Σ{size of f in M : origin(f) under F and final(f) not under F} + Σ{size of f in M : final(f) under F and origin(f) not under F}`; `before` comes from `dir_stats` (0 if absent). Same for file counts and dup_files. One refinement keeps the tree and the preview telling the same story: a moved file whose final spot already holds identical content (a *dedupe victim*: the plan deletes it instead of copying) leaves its old folders but arrives in none, so it is skipped in the second sum (and counts as leaving even folders that also hold its twin). When that leaves a content with a single live copy, the survivor stops counting in `dup_files`. The numbers then equal the simulator's per-cloud `files_after` / `bytes_after`.
 
 **Staging validation** (`add_action`), checked against the current after-view:
 - `SRC_NOT_FOUND`: an item does not exist in the after-view.
@@ -96,7 +96,7 @@ For each file in M (dirs produce no ops; mkdir'd dirs produce none):
 - different remote → `copy` to the final location, then `delete` the source with the copy as witness and `depends_on` = the copy's seq (index+1 in the list).
 Order: all moves and copies first (sorted by origin remote, path), then deletes. Reason strings name the draft and action seq.
 
-`preview(conn, draft_id, *, policy=None) -> dict`: build ops; if none, return `{"plan_id": None, "message": "nothing to do"}`; else `plans.create_plan(conn, f"Workspace: {title}", "workspace", ops, created_by="workspace", params={"draft_id", "draft_version"})`, `simulate.simulate_plan`, store `drafts.preview_plan_id/preview_version`, and return `{"plan_id", "draft_version", "simulation": asdict(report), "summary": {...}, "changes": [...], "conflicts": [...], "empty_dirs_left": n}` where `changes` lists one row per moved root `{"from": {"remote", "path"}, "to": {...}, "files", "bytes", "kind": "move" | "copy+delete" | "merge" | "dedupe"}`.
+`preview(conn, draft_id, *, policy=None) -> dict`: build ops; if none, return `{"plan_id": None, "message": "nothing to do"}`; else `plans.create_plan(conn, f"Workspace: {title}", "workspace", ops, created_by="workspace", params={"draft_id", "draft_version"})`, `simulate.simulate_plan`, store `drafts.preview_plan_id/preview_version`, and return `{"plan_id", "draft_version", "ok", "simulation": asdict(report), "summary": {...}, "changes": [...], "conflicts": [...], "empty_dirs_left": n}` (`ok` = simulation ok **and** no conflicts; only then may a UI offer approval). Previewing again cancels the draft's previous preview plan unless it already ran where `changes` lists one row per moved root `{"from": {"remote", "path"}, "to": {...}, "files", "bytes", "kind": "move" | "copy+delete" | "merge" | "dedupe"}`.
 
 A plan whose `params.draft_version` differs from the draft's current version is stale: approval through the UI must refuse it.
 
@@ -127,24 +127,24 @@ Auth: every route accepts the API Bearer token **or** the UI session cookie, exc
 | Method & path | Body / query | Response |
 |---|---|---|
 | `POST /v1/ui/session` | `{"token"}` (the one printed by `drivemerge ui`) | sets cookie `dm_session` (HttpOnly, SameSite=Strict, Path=/); `{"csrf", "approvals_enabled"}` |
-| `GET /v1/ui/config` | | `{"approvals_enabled", "execution_enabled", "remotes": [{"id","name","provider","writable","case_insensitive"}], "version"}` |
+| `GET /v1/ui/config` | | `{"approvals_enabled", "execution_enabled", "remotes": [{"id","name","provider","writable","case_insensitive"}], "version", "csrf"}` (`csrf`: the session's token for a cookie caller, so a reloaded page recovers it; `null` for Bearer) |
 | `GET /v1/tree/roots` | `draft` | `{"roots": [...]}` |
 | `GET /v1/tree` | `remote, path, draft, view=after\|before, ghosts=0\|1, limit, offset` | `{"remote","path","view","draft_version","items":[...],"ghosts":[...],"total"}` |
-| `GET /v1/drafts` / `POST /v1/drafts` | `{"title"}` | list / draft (201) |
+| `GET /v1/drafts` / `POST /v1/drafts` | `?status=open\|applied\|discarded\|all` (default open) / `{"title"}` | `{"drafts": [...]}` / draft (201) |
 | `GET /v1/drafts/{id}` / `DELETE /v1/drafts/{id}` | | draft / `{"ok"}` |
 | `POST /v1/drafts/{id}/actions` | `{"kind":"move","items":[{"remote","path"}],"dst":{"remote","path"},"new_name"?, "note"?}` or `{"kind":"mkdir","dst":{"remote","path"},"new_name"}` | 201 `{"action","draft_version","warnings"}`; 409 `{"error","code"}` |
 | `POST /v1/drafts/{id}/undo` / `redo` | | draft |
 | `DELETE /v1/drafts/{id}/actions/{action_id}` | | `{"draft_version","removed"}` |
-| `POST /v1/drafts/{id}/preview` | | preview dict (+ `"approval_code"` only for a UI session with approvals enabled and an ok simulation) |
-| `GET /v1/suggestions` | `kind=related\|duplicates, remote, limit` | `{"suggestions":[...]}` |
+| `POST /v1/drafts/{id}/preview` | | preview dict without `simulation.digest` (its first 8 characters *are* the approval code), plus `"approval_code"` only for a UI session with approvals enabled and `ok` |
+| `GET /v1/suggestions` | `kind=related\|duplicates (both when omitted), remote, limit` | `{"suggestions":[...]}` |
 | `POST /v1/ui/plans/{id}/approve` | `{"code"}` | `{"ok"}`; refuses stale draft previews (409) |
-| `POST /v1/ui/plans/{id}/execute` | | 202 `{"job_id"}` (one execution at a time; 409 if busy) |
-| `POST /v1/ui/rescan` | `{"remotes":[names]}` | 202 `{"job_id"}` (scan + identity rebuild + dir_stats refresh) |
+| `POST /v1/ui/plans/{id}/execute` | | 202 `{"job_id"}`; 409 `JOB_BUSY` while any job runs (an execution and a rescan both write the catalog), 409 `NOT_APPROVED` / `STALE_PREVIEW`, 403 `EXECUTION_DISABLED`. A finished workspace plan also closes its draft (`result.draft_applied`) |
+| `POST /v1/ui/rescan` | `{"remotes":[names]}` | 202 `{"job_id"}` (scan each remote, then identity rebuild; both refresh `dir_stats`) |
 | `GET /v1/jobs/{job_id}` | | `{"id","kind","status":"running\|done\|failed","progress":{...},"result","error"}` |
 | `GET /v1/plans/{id}/progress` | | `{"status","ops_total","done","failed","skipped","current","recent_journal":[...]}` |
 | `GET /ui/` and `/ui/static/*` | | the single-page app from `src/drivemerge/web/` |
 
-Jobs run in background threads, each with its **own** SQLite connection (`db.connect(config.db_path)`); the request-serving connection is shared and guarded by a lock.
+Jobs run in background threads, each with its **own** SQLite connection (`db.connect(config.db_path)`, so the catalog must be a file); the request-serving connection is shared and guarded by a lock. Errors from this app are `{"error", "code"}`: `WorkspaceError` is 409 with its code, except `NOT_FOUND` (404) and `BAD_REQUEST` (400); an invalid body is 422.
 
 ## E. Suggestions (`src/drivemerge/suggest.py`)
 
@@ -157,3 +157,35 @@ Suggestion shape: `{"id": "<kind>:<stable hash>", "kind", "score", "title", "rea
 ## F. Frontend (`src/drivemerge/web/`)
 
 No build step: `index.html`, `app.js` (ES module using `./vendor/htm-preact-standalone.mjs`), `styles.css`, `i18n.js` (zh-TW default, en fallback). Must work offline (no CDN). Layout and behaviour as in §1; HTML5 drag-and-drop; keyboard undo/redo; polling the open draft's version every 3 s so changes staged by Claude appear; preview modal with violations translated to plain language; approve-and-execute flow with progress; read-only banner when approvals are disabled. Every element the e2e test needs carries a `data-testid`.
+
+## G. Where the implementation is more precise than A–F
+
+Decided during integration; the code and its tests follow these, the sections above are the shorter contract.
+
+**Namespace and plans (`workspace.py`)**
+- A directory made by `mkdir` is mapped only by sub-moves staged *after* it (its origin is its creation spot); earlier sub-moves do not apply to it.
+- Directory counts in the after-view are over distinct locations (a merged folder is one folder, a new `mkdir` folder counts) and every count is clamped at 0. A missing `dir_stats` row counts as zeros, so `dirstats.refresh` must run after scans and identity rebuilds (`Service.scan`, `Service.rebuild_identity` and `Service.bridge` do it).
+- On case-insensitive remotes `build_ops` finds the occupant of a final path by NFC+casefold of the full path; staging stays exact-name plus a `CASE_COLLISION` warning.
+- Conflicts in `info["conflicts"]` (and `preview()["conflicts"]`) carry a `code`: `DIFFERENT_CONTENT`, `DIR_IN_WAY` (a catalog folder is still physically there: executing file by file never removes folders), `FILE_IN_WAY`, `OCCUPIED` (the spot belongs to a file that only leaves in the delete phase) and `CYCLE` (moves that wait on each other, e.g. a swap). `OCCUPIED` and `CYCLE` can pass the simulator when contents are identical, which is why `preview()["ok"]` also requires no conflicts.
+- Moves and copies are ordered topologically so a file lands only after whatever sits on its spot has left; ties break by origin remote id and path. For a conflicted cross-remote copy the paired delete is not emitted.
+- `remove_action` of an already undone action only bumps the version. `WorkspaceError` also uses `NOT_FOUND`, `NOT_OPEN`, `BAD_REQUEST`, `NOTHING_TO_UNDO`, `NOTHING_TO_REDO`.
+- `list_drafts` rows are light: `id, title, status, version, preview_plan_id, preview_version, created_at, updated_at, action_count`.
+
+**Suggestions (`suggest.py`)**
+- Kinds are `"related"` and `"duplicates"`; ids are `related:<12 hex>` / `duplicates:<12 hex>`; actions carry `note` = the suggestion id. The related threshold is 0.25; a shared folder-name word or a shared file is required, file-name vocabulary alone never makes two folders related.
+- Duplicate folders that mirror each other are grouped (one target, several move actions) and a mirrored pair is reported at its top. Nested folders inside one cluster are resolved to the one with the stronger edges.
+
+**Quarantine is not live content**
+- Files parked in the quarantine folder (`[safety] quarantine_dir`) are scanned like any others, but they are deleted files: `identity` leaves them out of every group, duplicate list and bridge candidate, and `suggest` skips them, so a cleaned-up copy is never a "duplicate" of the file that replaced it and the workspace never offers to merge folders out of quarantine. They still count as files and bytes (they occupy the cloud) and appear in the tree.
+- The folder name is recorded in the catalog's `meta` table by `config.sync_remotes` (every `Service` start), so every module that holds only a connection (`db.quarantine_dir`, `db.outside_quarantine`) agrees with the executor.
+
+**Server (`ui_api.py`)**
+- `GET /v1/suggestions` without `kind` returns related followed by duplicates; an unknown kind is 400. A cookie-authenticated unsafe request on a normal route with a foreign `Origin` is 403 `BAD_ORIGIN`.
+- `api_token` may be empty: only the browser session works then. Static HTML carries a CSP (`script-src 'self'`, no inline scripts, no other origins); `index.html` therefore uses absolute `/ui/static/` URLs.
+
+**Service facade (`service.py`)**
+- CLI, REST and MCP reach the workspace through `Service`: read `tree_roots`, `list_dir`, `get_draft`, `list_drafts`, `suggestions`; maintain `refresh_dir_stats` (also run by `scan`, `rebuild_identity` and `bridge`); propose `create_draft`, `discard_draft`, `stage_action(..., created_by)`, `undo_action`, `redo_action`, `remove_action`, `preview_draft`. `preview_draft` returns the simulation digest, so a caller that is not the human at the browser must drop it. Approving and executing stay in the human-only section. `policy()` is the one place the simulator's `SafetyPolicy` is built from the config.
+- MCP has no draft tools yet. When it gets them, they must stage with `created_by="mcp"` (the page shows its "proposed by Claude" badge and toast only for that) and must never expose `approval_code` or the digest.
+
+**Execution**
+- `Service.execute` is the only place that closes a draft: after a `done` run of a plan with `params.draft_id` it marks the draft applied if its version still equals `params.draft_version`; otherwise the draft stays open and the result says why (`draft_applied: false`, `draft_error`). The CLI, the browser and a rescan therefore agree.

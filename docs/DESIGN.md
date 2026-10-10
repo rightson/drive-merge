@@ -135,6 +135,7 @@ rclone 負責所有雲端 I/O；drive-merge 負責目錄、身分判定、規劃
 - **copy**：`rclone copyto --ignore-existing`，完成後驗證目的地；跨 hash 網域時用 bridge 或下載目的地重算來驗證，**驗證通過前，依賴它的 delete 不會執行**。
 - **delete = 移到同一朵雲的隔離區** `.drive-merge-quarantine/<plan-id>/<原路徑>`（伺服器端搬移，可還原；`drivemerge plan restore` 一鍵還原）。真正刪除是另一個指令 `purge`，預設保留 30 天，同樣需要 TTY 核准。
 - 每一步寫入 `journal`。
+- **隔離區內的檔案不算 live 內容**：重掃會看到它們，但身分判定（群組、重複清單、bridging 候選）與資料夾建議一律略過，所以被清掉的副本不會又變成「重複檔」。它們仍計入檔案數與容量。隔離資料夾名稱（`[safety] quarantine_dir`）由 `sync_remotes` 記在 catalog 的 `meta`，讓只拿到連線的模組也能一致判斷。
 
 ### 7.4 LLM 與 prompt injection
 LLM（Claude Code、其他聊天介面）能做的：搜尋、看統計與 folder profiles、提出規則、建立 Plan、模擬、解釋報告。不能做的：核准、執行、purge。即使雲端裡某個檔名試圖誘導 LLM，最壞結果是一份**提案**，它仍需通過模擬並由你在 TTY 核准。

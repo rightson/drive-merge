@@ -65,23 +65,15 @@ def _error(status: int, message: str, headers: dict[str, str] | None = None) -> 
     return JSONResponse({"error": message}, status_code=status, headers=headers)
 
 
-def create_app(service: Service, *, token: str) -> FastAPI:
-    """FastAPI app over `service`. Every route except GET /healthz needs the bearer token."""
-    _check_token(token)
-    expected = token.encode()
-    lock = threading.Lock()  # one shared SQLite connection: one service call at a time
+def bearer_ok(authorization: str | None, expected: bytes | None) -> bool:
+    """True when `Authorization: Bearer <token>` carries the expected token (None disables bearer auth)."""
+    scheme, _, presented = (authorization or "").partition(" ")
+    return (expected is not None and scheme.lower() == "bearer"
+            and hmac.compare_digest(presented.encode(), expected))
 
-    # Docs and schema would be unauthenticated routes, so they are not served.
-    app = FastAPI(title="drive-merge", version=__version__,
-                  docs_url=None, redoc_url=None, openapi_url=None)
 
-    def require_token(authorization: str | None = Header(default=None)) -> None:
-        scheme, _, presented = (authorization or "").partition(" ")
-        if scheme.lower() != "bearer" or not hmac.compare_digest(presented.encode(), expected):
-            raise HTTPException(401, "missing or invalid bearer token", headers={"WWW-Authenticate": "Bearer"})
-
-    api = APIRouter(dependencies=[Depends(require_token)])
-
+def install_error_handlers(app: FastAPI) -> None:
+    """Map service/plan errors to JSON `{"error": ...}` responses; shared with the UI app."""
     def http_error(_: Request, exc: StarletteHTTPException) -> JSONResponse:
         return _error(exc.status_code, str(exc.detail), exc.headers)
 
@@ -100,9 +92,35 @@ def create_app(service: Service, *, token: str) -> FastAPI:
     app.add_exception_handler(plans.PlanError, plan_error)
     app.add_exception_handler(KeyError, not_found)
 
+
+def create_app(service: Service, *, token: str) -> FastAPI:
+    """FastAPI app over `service`. Every route except GET /healthz needs the bearer token."""
+    _check_token(token)
+    expected = token.encode()
+
+    # Docs and schema would be unauthenticated routes, so they are not served.
+    app = FastAPI(title="drive-merge", version=__version__,
+                  docs_url=None, redoc_url=None, openapi_url=None)
+
+    def require_token(authorization: str | None = Header(default=None)) -> None:
+        if not bearer_ok(authorization, expected):
+            raise HTTPException(401, "missing or invalid bearer token", headers={"WWW-Authenticate": "Bearer"})
+
+    install_error_handlers(app)
+
     @app.get("/healthz")
     def healthz() -> dict:
         return {"ok": True}
+
+    # One shared SQLite connection: one service call at a time.
+    app.include_router(build_router(service, threading.Lock(), dependencies=[Depends(require_token)]))
+    return app
+
+
+def build_router(service: Service, lock: threading.Lock, *, dependencies: list[Any]) -> APIRouter:
+    """The /v1 catalog and plan routes. `dependencies` is the auth the including app requires;
+    `lock` serialises use of the service's single SQLite connection."""
+    api = APIRouter(dependencies=dependencies)
 
     @api.get("/v1/stats")
     def stats() -> dict:
@@ -199,8 +217,7 @@ def create_app(service: Service, *, token: str) -> FastAPI:
             service.cancel(plan_id)
         return {"ok": True}
 
-    app.include_router(api)
-    return app
+    return api
 
 
 def serve(config: Config, *, allow_remote: bool = False) -> None:
@@ -213,4 +230,4 @@ def serve(config: Config, *, allow_remote: bool = False) -> None:
     uvicorn.run(app, host=host, port=config.api.port)
 
 
-__all__ = ["create_app", "serve", "LOOPBACK_HOSTS"]
+__all__ = ["create_app", "build_router", "install_error_handlers", "bearer_ok", "serve", "LOOPBACK_HOSTS"]

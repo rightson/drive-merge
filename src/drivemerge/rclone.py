@@ -81,7 +81,8 @@ def _drain(stream, sink: deque) -> None:
 
 
 class Rclone:
-    """Builds and runs rclone commands. Never shells out; never syncs or deletes."""
+    """Builds and runs rclone commands. Never shells out and never syncs; the single
+    delete it offers is `deletefile` (one file, used only by the executor's purge)."""
 
     def __init__(self, binary: str = "rclone", *, config: str | None = None,
                  extra_args: Sequence[str] = (), runner: Runner | None = None):
@@ -224,6 +225,23 @@ class Rclone:
         argv = self._argv("moveto", ["--ignore-existing"],
                           [self.join(src_remote, src_path), self.join(dst_remote, dst_path)])
         self._run_checked("moveto", argv)
+
+    def deletefile(self, remote: str, path: str) -> None:
+        """Permanently delete exactly one file (`rclone deletefile`).
+
+        The only destructive call in this wrapper, used solely by the
+        executor's purge. rclone refuses a directory and exits non-zero for a
+        missing file, so a wrong path can never remove a tree. The path is
+        validated here as well: it must name something below the remote root
+        (never the root itself, never an absolute path or a '..' segment), so
+        a caller bug cannot point the delete outside the remote.
+        """
+        if not path or path.startswith("/") or "\x00" in path:
+            raise ValueError(f"deletefile needs a relative file path, got {path!r}")
+        if any(seg in ("", ".", "..") for seg in path.split("/")):
+            raise ValueError(f"deletefile path has an empty, '.' or '..' segment: {path!r}")
+        argv = self._argv("deletefile", [], [self.join(remote, path)])
+        self._run_checked("deletefile", argv)
 
     def download(self, remote: str, path: str, local_path: str) -> None:
         """Copy a remote file to a local scratch path, replacing whatever is there.

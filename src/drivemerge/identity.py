@@ -36,9 +36,14 @@ _HEX = re.compile(r"[0-9a-f]+")
 _DOWNLOAD_ORDER = {"local": 0, "drive": 1, "dropbox": 2, "onedrive": 3, "iclouddrive": 4}
 
 
-def _live(a: str = "") -> str:
-    """SQL for 'a file that exists and has bytes'; `a` is an optional table alias prefix like 'e.'."""
-    return f"{a}present = 1 AND {a}is_dir = 0 AND {a}is_native_doc = 0 AND {a}size IS NOT NULL"
+def _live(conn: sqlite3.Connection, a: str = "") -> str:
+    """SQL for 'a file that exists, has bytes and is not parked in quarantine'; `a` is an optional alias like 'e.'.
+
+    A quarantined file is a deleted file waiting for purge: counting it would make every cleaned-up
+    copy look like a duplicate again (and offer it as the witness for its own replacement).
+    """
+    return (f"{a}present = 1 AND {a}is_dir = 0 AND {a}is_native_doc = 0 AND {a}size IS NOT NULL "
+            f"AND {db.outside_quarantine(conn, a)}")
 
 
 def _hashed(a: str = "") -> str:
@@ -119,7 +124,7 @@ def _union_by_hash(conn: sqlite3.Connection, comps: _Components) -> int:
         cur.execute(                                    # values that occur once cannot link anything
             f"SELECT id, size, {t} FROM entries "
             f"WHERE {t} IN (SELECT {t} FROM entries WHERE {t} IS NOT NULL GROUP BY {t} HAVING COUNT(*) > 1) "
-            f"AND {t} <> '' AND {_live()} ORDER BY {t}, size"
+            f"AND {t} <> '' AND {_live(conn)} ORDER BY {t}, size"
         )
         prev_hash = prev_size = first = None
         flagged = False
@@ -154,7 +159,7 @@ def _valid_source(conn: sqlite3.Connection, bridge: Mapping[str, Any]) -> int | 
     if sid is None or bridge["source_mtime"] is None:
         return None
     e = _rows(conn).execute(
-        f"SELECT size, mtime, {', '.join(HASH_TYPES)} FROM entries e WHERE e.id = ? AND {_live('e.')}", (sid,)
+        f"SELECT size, mtime, {', '.join(HASH_TYPES)} FROM entries e WHERE e.id = ? AND {_live(conn, 'e.')}", (sid,)
     ).fetchone()
     if e is None or e["size"] != bridge["size"] or e["mtime"] != bridge["source_mtime"]:
         return None
@@ -178,7 +183,7 @@ def _union_by_bridges(conn: sqlite3.Connection, comps: _Components) -> None:
             ids.add(source)
         for t in HASH_TYPES:
             for (eid,) in _tuples(conn).execute(
-                f"SELECT id FROM entries WHERE {t} = ? AND +size = ? AND {_live()}", (b[t], b["size"])
+                f"SELECT id FROM entries WHERE {t} = ? AND +size = ? AND {_live(conn)}", (b[t], b["size"])
             ):
                 ids.add(eid)
         if len(ids) > 1:
@@ -209,7 +214,7 @@ def rebuild_groups(conn: sqlite3.Connection) -> GroupStats:
 
         cur = _tuples(conn)
         cur.execute(
-            f"SELECT id, size, content_group, md5, sha1, sha256, dropbox, quickxor FROM entries WHERE {_live()}"
+            f"SELECT id, size, content_group, md5, sha1, sha256, dropbox, quickxor FROM entries WHERE {_live(conn)}"
         )
         for row in cur:
             eid = row[0]
@@ -234,7 +239,7 @@ def rebuild_groups(conn: sqlite3.Connection) -> GroupStats:
                 new_groups.append(_NO_GROUP if new is None else new)
 
         for (eid,) in _tuples(conn).execute(
-            f"SELECT id FROM entries WHERE content_group IS NOT NULL AND NOT ({_live()})"
+            f"SELECT id FROM entries WHERE content_group IS NOT NULL AND NOT ({_live(conn)})"
         ):
             ids.append(eid)
             new_groups.append(_NO_GROUP)
@@ -289,7 +294,7 @@ _COPY_ORDER = "ORDER BY r.name, e.path, e.id"
 
 def _copies(conn: sqlite3.Connection, where: str, params: tuple) -> list[Copy]:
     cur = _tuples(conn)
-    cur.execute(f"{_COPY_SELECT} WHERE {_live('e.')} AND {where} {_COPY_ORDER}", params)
+    cur.execute(f"{_COPY_SELECT} WHERE {_live(conn, 'e.')} AND {where} {_COPY_ORDER}", params)
     return [Copy(*r) for r in cur]
 
 
@@ -329,7 +334,7 @@ def duplicate_groups(conn: sqlite3.Connection, *, confidence: str = "exact", rem
         raise ValueError(f"confidence must be 'exact' or 'probable', not {confidence!r}")
     having, params = _group_filters(conn, remote, cross_remote_only, path_prefix)
     params.update(min_size=min_size, limit=max(limit, 0), offset=max(offset, 0))
-    live = _live("e.")
+    live = _live(conn, "e.")
     cur = _tuples(conn)
     out: list[DupGroup] = []
     if confidence == "exact":
@@ -375,7 +380,7 @@ def locations(conn: sqlite3.Connection, entry_id: int) -> list[Copy]:
     locations: a tombstone must never be counted as a surviving copy.
     """
     row = conn.execute(
-        f"SELECT content_group FROM entries e WHERE e.id = ? AND {_live('e.')}", (entry_id,)
+        f"SELECT content_group FROM entries e WHERE e.id = ? AND {_live(conn, 'e.')}", (entry_id,)
     ).fetchone()
     if row is None:
         return []
@@ -387,9 +392,9 @@ def locations(conn: sqlite3.Connection, entry_id: int) -> list[Copy]:
 def same_content(conn: sqlite3.Connection, a: int, b: int) -> bool:
     """True only when both are live files proven identical by hash (exact, never probable)."""
     if a == b:
-        return bool(conn.execute(f"SELECT 1 FROM entries e WHERE e.id = ? AND {_live('e.')}", (a,)).fetchone())
+        return bool(conn.execute(f"SELECT 1 FROM entries e WHERE e.id = ? AND {_live(conn, 'e.')}", (a,)).fetchone())
     rows = conn.execute(
-        f"SELECT content_group FROM entries e WHERE e.id IN (?, ?) AND {_live('e.')}", (a, b)
+        f"SELECT content_group FROM entries e WHERE e.id IN (?, ?) AND {_live(conn, 'e.')}", (a, b)
     ).fetchall()
     return len(rows) == 2 and rows[0][0] is not None and rows[0][0] == rows[1][0]
 
@@ -455,7 +460,7 @@ def bridge_candidates(conn: sqlite3.Connection, *, max_bytes: int | None = None,
     cur.execute(
         f"""WITH cls AS (
                 SELECT size FROM entries
-                WHERE {_live()} AND size >= :min_size{size_cap}
+                WHERE {_live(conn)} AND size >= :min_size{size_cap}
                 GROUP BY size
                 HAVING (COUNT(DISTINCT CASE WHEN {hashed} THEN {sig} END) >= 2
                         AND COUNT(DISTINCT CASE WHEN {hashed} THEN COALESCE(content_group, -id) END) >= 2)
@@ -464,7 +469,7 @@ def bridge_candidates(conn: sqlite3.Connection, *, max_bytes: int | None = None,
             SELECT e.size, e.id, e.name_norm, e.path, e.content_group, r.name, r.provider, e.remote_id,
                    {', '.join('e.' + t for t in HASH_TYPES)}
             FROM entries e JOIN remotes r ON r.id = e.remote_id
-            WHERE e.size IN (SELECT size FROM cls) AND {_live('e.')}
+            WHERE e.size IN (SELECT size FROM cls) AND {_live(conn, 'e.')}
             ORDER BY e.size, e.id""",
         {"min_size": min_size, "max_bytes": max_bytes},
     )
@@ -642,7 +647,7 @@ def bridge_entry(conn: sqlite3.Connection, rclone: Any, entry_id: int, tmpdir: s
     cur = _rows(conn)
     row = cur.execute(
         f"SELECT e.id, e.path, e.size, e.mtime, e.md5, e.sha1, e.sha256, e.dropbox, e.quickxor, r.read_remote "
-        f"FROM entries e JOIN remotes r ON r.id = e.remote_id WHERE e.id = ? AND {_live('e.')}", (entry_id,)
+        f"FROM entries e JOIN remotes r ON r.id = e.remote_id WHERE e.id = ? AND {_live(conn, 'e.')}", (entry_id,)
     ).fetchone()
     if row is None:
         raise ValueError(f"entry {entry_id} is not a live file")

@@ -2,11 +2,12 @@
 
 Everything returns JSON-serialisable values. Methods are grouped by trust level:
 
-* read        — catalog queries; safe for anyone with access to the service
-* maintain    — scans and hash bridging; read-only on the clouds
-* propose     — build and simulate plans; writes only to the local catalog
+* read        — catalog queries and workspace trees; safe for anyone with access to the service
+* maintain    — scans, hash bridging and directory statistics; read-only on the clouds
+* propose     — build and simulate plans, stage workspace drafts; writes only to the local catalog
 * human-only  — approve / execute / restore / purge. The MCP server and the
-                REST API never call these; the CLI gates them behind a TTY.
+                REST API never call these; the CLI gates them behind a TTY and
+                the browser workspace behind its own session (ui_api).
 """
 
 from __future__ import annotations
@@ -16,7 +17,9 @@ import sqlite3
 import tempfile
 from pathlib import Path
 
-from . import builders, classify, db, executor, identity, plans, search, simulate
+from . import (
+    builders, classify, db, dirstats, executor, identity, plans, search, simulate, suggest, workspace,
+)
 from .config import Config, sync_remotes
 from .rclone import Rclone
 from .scanner import scan_remote
@@ -97,11 +100,20 @@ class Service:
     # ------------------------------------------------------------ maintain
 
     def scan(self, remote: str, *, root: str = "", progress=None, force: bool = False) -> dict:
-        return _plain(scan_remote(self.conn, self.rclone, self.config.remote(remote), root=root,
-                                  progress=progress, force=force))
+        res = _plain(scan_remote(self.conn, self.rclone, self.config.remote(remote), root=root,
+                                 progress=progress, force=force))
+        # Folder counts in the workspace come from dir_stats; keep them in step with the catalog.
+        self.refresh_dir_stats([remote])
+        return res
 
     def rebuild_identity(self) -> dict:
-        return _plain(identity.rebuild_groups(self.conn))
+        res = _plain(identity.rebuild_groups(self.conn))
+        self.refresh_dir_stats()  # dup_files depends on the content groups just rebuilt
+        return res
+
+    def refresh_dir_stats(self, remotes: list[str] | None = None) -> dict:
+        ids = [db.remote_id(self.conn, r) for r in remotes] if remotes else None
+        return dirstats.refresh(self.conn, remote_ids=ids)
 
     def bridge(self, *, max_bytes: int | None = None, limit: int = 100, progress=None) -> dict:
         """Download each candidate once (read remote only), hash it, record the bridge, regroup."""
@@ -116,6 +128,8 @@ class Service:
                 if progress:
                     progress(len(done), len(failed))
         stats = identity.rebuild_groups(self.conn) if done else None
+        if done:
+            self.refresh_dir_stats()
         return {"bridged": len(done), "failed": failed, "groups": _plain(stats)}
 
     # ------------------------------------------------------------- propose
@@ -126,12 +140,16 @@ class Service:
             raise ServiceError(f"unknown plan kind {kind!r}; expected one of {PLAN_KINDS}")
         params = dict(params)
         rules_text = params.pop("rules", None)
+        # Quarantined files are deleted content, not live copies; builders must know where they are.
+        quarantine = {"quarantine_dir": self.config.safety.quarantine_dir}
         if kind == "dedupe":
-            result = builders.build_dedupe(self.conn, **params)
+            result = builders.build_dedupe(self.conn, **{**quarantine, **params})
         elif kind == "consolidate":
-            result = builders.build_consolidate(self.conn, ruleset=self.ruleset(rules_text), **params)
+            result = builders.build_consolidate(self.conn, ruleset=self.ruleset(rules_text),
+                                                **{**quarantine, **params})
         elif kind == "reorganize":
-            result = builders.build_reorganize(self.conn, ruleset=self.ruleset(rules_text), **params)
+            result = builders.build_reorganize(self.conn, ruleset=self.ruleset(rules_text),
+                                               **{**quarantine, **params})
         else:
             result = builders.build_manual(self.conn, params.get("ops", []))
         if not result.ops:
@@ -145,13 +163,14 @@ class Service:
         return {"plan_id": plan_id, "ops": len(result.ops), "skipped": result.skipped[:200],
                 "stats": result.stats, "simulation": report}
 
+    def policy(self) -> simulate.SafetyPolicy:
+        """The simulator's safety policy as configured; one place so every caller simulates alike."""
+        s = self.config.safety
+        return simulate.SafetyPolicy(allow_probable_delete=s.allow_probable_delete, min_copies=s.min_copies,
+                                     quarantine_dir=s.quarantine_dir)
+
     def simulate(self, plan_id: int) -> dict:
-        policy = simulate.SafetyPolicy(
-            allow_probable_delete=self.config.safety.allow_probable_delete,
-            min_copies=self.config.safety.min_copies,
-            quarantine_dir=self.config.safety.quarantine_dir,
-        )
-        report = simulate.simulate_plan(self.conn, plan_id, policy=policy)
+        report = simulate.simulate_plan(self.conn, plan_id, policy=self.policy())
         d = dataclasses.asdict(report)
         d["approval_code"] = plans.short_code(report.digest) if report.ok else None
         return d
@@ -171,13 +190,81 @@ class Service:
     def cancel(self, plan_id: int) -> None:
         plans.cancel_plan(self.conn, plan_id)
 
+    # ----------------------------------------------------- workspace drafts
+    # A draft is a list of staged moves over a virtual namespace; staging never touches a cloud.
+    # `preview_draft` turns it into an ordinary plan and simulates it, so approval and execution
+    # stay in the human-only section below.
+
+    def tree_roots(self, *, draft_id: int | None = None) -> list[dict]:
+        return workspace.roots(self.conn, draft_id=draft_id)
+
+    def list_dir(self, remote: str, path: str = "", **kw) -> dict:
+        return workspace.list_dir(self.conn, remote, path, **kw)
+
+    def create_draft(self, title: str) -> dict:
+        return workspace.create_draft(self.conn, title)
+
+    def list_drafts(self, *, status: str | None = "open") -> list[dict]:
+        return workspace.list_drafts(self.conn, status=status)
+
+    def get_draft(self, draft_id: int) -> dict:
+        return workspace.get_draft(self.conn, draft_id)
+
+    def discard_draft(self, draft_id: int) -> None:
+        workspace.discard_draft(self.conn, draft_id)
+
+    def stage_action(self, draft_id: int, action: dict, *, created_by: str) -> dict:
+        return workspace.add_action(self.conn, draft_id, action, created_by=created_by)
+
+    def undo_action(self, draft_id: int) -> dict:
+        return workspace.undo(self.conn, draft_id)
+
+    def redo_action(self, draft_id: int) -> dict:
+        return workspace.redo(self.conn, draft_id)
+
+    def remove_action(self, draft_id: int, action_id: int) -> dict:
+        return workspace.remove_action(self.conn, draft_id, action_id)
+
+    def preview_draft(self, draft_id: int) -> dict:
+        """Build, persist and simulate the draft's plan. The result carries the simulation's digest:
+        callers that talk to anyone but the human at the browser must drop it (and `approval_code`)."""
+        return workspace.preview(self.conn, draft_id, policy=self.policy())
+
+    def suggestions(self, kind: str | None = None, *, remote: str | None = None, limit: int = 20) -> list[dict]:
+        """Related and duplicate folder suggestions, ready to stage as draft actions."""
+        if kind not in (None, "related", "duplicates"):
+            raise ServiceError("kind must be 'related' or 'duplicates'")
+        found: list[dict] = []
+        if kind in (None, "related"):
+            found += suggest.related_folders(self.conn, remote=remote, limit=limit)
+        if kind in (None, "duplicates"):
+            found += suggest.duplicate_folders(self.conn, remote=remote, limit=limit)
+        return found
+
     # ---------------------------------------------------------- human-only
 
     def approve(self, plan_id: int, code: str, *, approved_by: str) -> None:
         plans.approve_plan(self.conn, plan_id, code, approved_by=approved_by)
 
     def execute(self, plan_id: int, *, progress=None) -> dict:
-        return _plain(executor.execute_plan(self.conn, self.rclone, self.config, plan_id, progress=progress))
+        """Run an approved plan. A finished workspace plan also closes its draft, so the browser,
+        the CLI and a later rescan all agree that the staged moves have happened."""
+        result = _plain(executor.execute_plan(self.conn, self.rclone, self.config, plan_id, progress=progress))
+        params = plans.get_plan(self.conn, plan_id, with_ops=False).params
+        if params.get("draft_id") is not None and result.get("status") == "done":
+            result.update(self._close_draft(params["draft_id"], params.get("draft_version")))
+        return result
+
+    def _close_draft(self, draft_id: int, previewed_version: int | None) -> dict:
+        """Mark the draft behind a finished plan applied. Never fails the run: the clouds are already changed."""
+        try:
+            row = self.conn.execute("SELECT version FROM drafts WHERE id = ?", (draft_id,)).fetchone()
+            if row is not None and row[0] != previewed_version:
+                return {"draft_applied": False, "draft_error": f"draft {draft_id} changed after this preview"}
+            workspace.mark_applied(self.conn, draft_id)
+            return {"draft_applied": True}
+        except Exception as e:  # WorkspaceError (not open any more), sqlite errors, ...
+            return {"draft_applied": False, "draft_error": str(e) or type(e).__name__}
 
     def restore(self, plan_id: int) -> dict:
         return _plain(executor.restore_plan(self.conn, self.rclone, self.config, plan_id))

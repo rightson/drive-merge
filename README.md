@@ -59,6 +59,14 @@ drivemerge plan execute 1                  # needs [safety] execution_enabled = 
 drivemerge plan restore 1                  # undo deletes (moves them back from quarantine)
 ```
 
+### Visual workspace
+
+```bash
+drivemerge ui                              # opens http://127.0.0.1:8765/ui/ (one-time token in the URL)
+```
+
+Two tree panes show any two places side by side, across clouds. Drag files and folders to better levels, rename, undo and redo, flip between the "after" and "before" views, and take suggestions for related or duplicate folders. Nothing touches a cloud while you drag: the staged moves are previewed through the same simulator as every other plan (before/after per cloud, conflicts, dedupes), and only a typed 8-character approval code starts the execution — and only when `drivemerge ui` runs in your own interactive terminal, outside an AI agent. See [docs/WORKSPACE.md](docs/WORKSPACE.md).
+
 API and MCP:
 
 ```bash
@@ -72,7 +80,8 @@ External databases can sync incrementally from `GET /v1/changes?cursor=...`.
 
 ```bash
 uv venv && uv pip install -e '.[dev]'
-pytest
+pytest                  # everything, including the browser tests (headless Chromium via Playwright)
+pytest -m "not ui"      # without them
 ```
 
 The core (`src/drivemerge`) uses only the Python standard library; FastAPI and the MCP SDK are optional extras.

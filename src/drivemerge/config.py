@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import providers
-from .db import utcnow
+from .db import set_quarantine_dir, utcnow
 
 DEFAULT_CONFIG_PATH = Path(os.environ.get("DRIVEMERGE_CONFIG", "~/.config/drive-merge/config.toml")).expanduser()
 DEFAULT_DB_PATH = "~/.local/share/drive-merge/catalog.db"
@@ -104,7 +104,8 @@ def load_config(path: str | Path | None = None) -> Config:
 
 def sync_remotes(conn: sqlite3.Connection, config: Config) -> None:
     """Upsert config remotes into the `remotes` table (rows are never deleted:
-    entries reference them)."""
+    entries reference them), and record the quarantine folder every module must treat as not live."""
+    set_quarantine_dir(conn, config.safety.quarantine_dir)
     for r in config.remotes:
         prov = providers.get(r.provider)
         conn.execute(

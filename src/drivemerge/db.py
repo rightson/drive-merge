@@ -8,6 +8,7 @@ from importlib import resources
 from pathlib import Path
 
 SCHEMA_VERSION = 1
+DEFAULT_QUARANTINE_DIR = ".drive-merge-quarantine"
 
 
 def utcnow() -> str:
@@ -82,6 +83,36 @@ def remote_id(conn: sqlite3.Connection, name: str) -> int:
     if row is None:
         raise KeyError(f"unknown remote {name!r}")
     return int(row[0])
+
+
+def quarantine_dir(conn: sqlite3.Connection) -> str:
+    """Where the executor parks deleted files, as the last config sync recorded it ('' = no quarantine).
+
+    The catalog scans quarantined files like any other, so every module that talks about "live"
+    content needs to know the folder; storing it next to the data keeps all of them in agreement.
+    """
+    row = conn.execute("SELECT value FROM meta WHERE key = 'quarantine_dir'").fetchone()
+    return DEFAULT_QUARANTINE_DIR if row is None else row[0]
+
+
+def set_quarantine_dir(conn: sqlite3.Connection, value: str) -> None:
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES ('quarantine_dir', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (value.strip("/"),),
+    )
+
+
+def outside_quarantine(conn: sqlite3.Connection, alias: str = "") -> str:
+    """SQL condition: the entry is not inside the quarantine folder (always true when there is none).
+
+    Compared by whole path segments and literally, case-sensitively like the executor writes it.
+    """
+    q = quarantine_dir(conn).strip("/")
+    if not q:
+        return "1"
+    lit = q.replace("'", "''")
+    return f"NOT ({alias}path = '{lit}' OR substr({alias}path, 1, {len(q) + 1}) = '{lit}/')"
 
 
 def snapshot(conn: sqlite3.Connection) -> dict[str, int]:
