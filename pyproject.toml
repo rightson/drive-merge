@@ -14,8 +14,8 @@ dependencies = []
 
 [project.optional-dependencies]
 api = ["fastapi>=0.110", "uvicorn>=0.29"]
-mcp = ["mcp>=1.2"]
-dev = ["pytest>=8", "httpx>=0.27", "fastapi>=0.110", "uvicorn>=0.29", "mcp>=1.2"]
+mcp = ["mcp>=2.3"]
+dev = ["pytest>=8", "httpx>=0.27", "fastapi>=0.110", "uvicorn>=0.29", "mcp>=2.3", "playwright>=1.56"]
 
 [project.scripts]
 drivemerge = "drivemerge.cli:main"
@@ -26,4 +26,4 @@ packages = ["src/drivemerge"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
-markers = ["rclone: needs the rclone binary on PATH"]
+markers = ["rclone: needs the rclone binary on PATH", "ui: drives the web UI in headless Chromium"]

@@ -181,3 +181,50 @@ CREATE TABLE IF NOT EXISTS journal (
     action  TEXT NOT NULL,                      -- 'approve' | 'precheck' | 'copy' | 'verify' | 'quarantine' | 'error' ...
     detail  TEXT                                -- JSON
 );
+
+-- ---------------------------------------------------------------------------
+-- Visual workspace (docs/WORKSPACE.md): drafts are staged, undoable
+-- rearrangements of a virtual namespace. Nothing here touches a cloud; a
+-- draft becomes a plan only through workspace.preview(), and that plan goes
+-- through the same simulate -> approve -> execute path as every other plan.
+
+CREATE TABLE IF NOT EXISTS drafts (
+    id              INTEGER PRIMARY KEY,
+    title           TEXT NOT NULL,
+    status          TEXT NOT NULL CHECK (status IN ('open', 'applied', 'discarded')),
+    version         INTEGER NOT NULL DEFAULT 0,   -- bumps on every change; previews bind to it
+    preview_plan_id INTEGER REFERENCES plans(id),
+    preview_version INTEGER,                      -- draft version the preview plan was built from
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+);
+
+-- One row per user gesture (one drag = one action = one undo step).
+CREATE TABLE IF NOT EXISTS draft_actions (
+    id            INTEGER PRIMARY KEY,
+    draft_id      INTEGER NOT NULL REFERENCES drafts(id) ON DELETE CASCADE,
+    seq           INTEGER NOT NULL,
+    kind          TEXT NOT NULL CHECK (kind IN ('move', 'mkdir')),
+    items         TEXT NOT NULL,                -- JSON [{"remote_id": 1, "path": "a/b"}]: virtual paths when staged; [] for mkdir
+    dst_remote_id INTEGER NOT NULL REFERENCES remotes(id),
+    dst_path      TEXT NOT NULL,                -- destination directory (virtual); for mkdir the parent
+    new_name      TEXT,                         -- rename (single-item move) or the mkdir folder name
+    note          TEXT,                         -- why: suggestion id, an LLM's rationale, ...
+    created_by    TEXT NOT NULL,                -- 'ui' | 'mcp' | 'cli' | 'api'
+    state         TEXT NOT NULL DEFAULT 'active' CHECK (state IN ('active', 'undone')),
+    created_at    TEXT NOT NULL,
+    UNIQUE (draft_id, seq)
+);
+
+-- Recursive per-directory aggregates of live files, refreshed after scans
+-- and identity rebuilds (dirstats.refresh). path '' is the remote root.
+CREATE TABLE IF NOT EXISTS dir_stats (
+    remote_id INTEGER NOT NULL REFERENCES remotes(id),
+    path      TEXT NOT NULL,
+    files     INTEGER NOT NULL,
+    dirs      INTEGER NOT NULL,
+    bytes     INTEGER NOT NULL,
+    dup_files INTEGER NOT NULL,                 -- files whose content has another live copy anywhere
+    mtime_max TEXT,
+    PRIMARY KEY (remote_id, path)
+) WITHOUT ROWID;
