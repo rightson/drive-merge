@@ -639,3 +639,60 @@ def test_real_batching_with_small_batches_matches_single_batch(conn, local_remot
     assert (res.files, res.dirs) == (6, 4)
     versions = {row["row_version"] for row in conn.execute("SELECT row_version FROM entries")}
     assert len(versions) == 5  # ceil(10 / 2) batches, one version each
+
+
+# --- tombstone guard and interrupted scans (added by the lead) ----------------
+
+def _fake_rclone(items):
+    import json as _json
+
+    def runner(args):
+        return 0, "[\n" + ",\n".join(_json.dumps(i) for i in items) + "\n]\n", ""
+    from drivemerge.rclone import Rclone
+    return Rclone(runner=runner)
+
+
+def _items(n):
+    return [{"Path": f"f{i}.txt", "Name": f"f{i}.txt", "Size": 1, "ModTime": "2024-01-01T00:00:00Z",
+             "IsDir": False} for i in range(n)]
+
+
+def test_mass_disappearance_is_refused_without_force(conn):
+    from drivemerge.config import Config, RemoteConfig, sync_remotes
+    from drivemerge.scanner import SuspiciousScan, scan_remote
+    rc = RemoteConfig(name="x", provider="other", read="x:")
+    sync_remotes(conn, Config(remotes=[rc]))
+    scan_remote(conn, _fake_rclone(_items(100)), rc)
+    with pytest.raises(SuspiciousScan):
+        scan_remote(conn, _fake_rclone(_items(10)), rc)
+    assert conn.execute("SELECT COUNT(*) FROM entries WHERE present = 1").fetchone()[0] == 100
+    assert conn.execute("SELECT status FROM scans ORDER BY id DESC LIMIT 1").fetchone()[0] == "failed"
+    res = scan_remote(conn, _fake_rclone(_items(10)), rc, force=True)
+    assert res.tombstoned == 90
+
+
+def test_small_trees_and_modest_deletions_are_not_blocked(conn):
+    from drivemerge.config import Config, RemoteConfig, sync_remotes
+    from drivemerge.scanner import scan_remote
+    rc = RemoteConfig(name="x", provider="other", read="x:")
+    sync_remotes(conn, Config(remotes=[rc]))
+    scan_remote(conn, _fake_rclone(_items(100)), rc)
+    assert scan_remote(conn, _fake_rclone(_items(60)), rc).tombstoned == 40
+    scan_remote(conn, _fake_rclone(_items(0)), RemoteConfig(name="x", provider="other", read="x:"), force=True)
+    sync_remotes(conn, Config(remotes=[RemoteConfig(name="y", provider="other", read="y:")]))
+    ry = RemoteConfig(name="y", provider="other", read="y:")
+    scan_remote(conn, _fake_rclone(_items(20)), ry)
+    assert scan_remote(conn, _fake_rclone([]), ry).tombstoned == 20  # below the size threshold
+
+
+def test_stale_running_scan_is_marked_failed(conn):
+    from drivemerge import db as _db
+    from drivemerge.config import Config, RemoteConfig, sync_remotes
+    from drivemerge.scanner import scan_remote
+    rc = RemoteConfig(name="x", provider="other", read="x:")
+    sync_remotes(conn, Config(remotes=[rc]))
+    conn.execute("INSERT INTO scans(remote_id, status, started_at) VALUES (?, 'running', ?)",
+                 (_db.remote_id(conn, "x"), _db.utcnow()))
+    scan_remote(conn, _fake_rclone(_items(1)), rc)
+    statuses = [r[0] for r in conn.execute("SELECT status FROM scans ORDER BY id")]
+    assert statuses == ["failed", "complete"]

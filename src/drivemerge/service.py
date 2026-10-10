@@ -96,8 +96,9 @@ class Service:
 
     # ------------------------------------------------------------ maintain
 
-    def scan(self, remote: str, *, root: str = "", progress=None) -> dict:
-        return _plain(scan_remote(self.conn, self.rclone, self.config.remote(remote), root=root, progress=progress))
+    def scan(self, remote: str, *, root: str = "", progress=None, force: bool = False) -> dict:
+        return _plain(scan_remote(self.conn, self.rclone, self.config.remote(remote), root=root,
+                                  progress=progress, force=force))
 
     def rebuild_identity(self) -> dict:
         return _plain(identity.rebuild_groups(self.conn))

@@ -50,7 +50,7 @@ drivemerge search "報告 2023"               # substring search, works for CJK 
 drivemerge duplicates --cross-remote
 drivemerge bridge --max-bytes 5G           # download+hash ambiguous files once, then rebuild
 drivemerge profiles --remote dropbox --depth 2
-drivemerge rules preview --rules my-rules.toml --target gdrive
+drivemerge rules preview --rules my-rules.toml --target-root Archive
 
 drivemerge plan consolidate --target gdrive --root Archive   # copy-only by default
 drivemerge plan show 1                     # simulation report: before/after per cloud

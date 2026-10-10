@@ -169,6 +169,37 @@ def _tombstone(conn: sqlite3.Connection, remote_id: int, scan_id: int, root: str
     return conn.execute(sql, args).rowcount
 
 
+class SuspiciousScan(Exception):
+    """A listing that succeeded but lost most of what was there before.
+
+    Expired credentials, a half-mounted folder or a provider hiccup can make
+    rclone exit 0 with an (almost) empty listing. Tombstoning on that would
+    make the catalog claim the files are gone; refuse unless forced.
+    """
+
+
+# Refuse to tombstone more than this share of a sizeable subtree in one scan.
+_TOMBSTONE_GUARD_RATIO = 0.5
+_TOMBSTONE_GUARD_MIN_ROWS = 50
+
+
+def _check_tombstone_guard(conn: sqlite3.Connection, remote_id: int, scan_id: int, root: str) -> None:
+    where = "remote_id = ? AND present = 1"
+    args: list = [remote_id]
+    if root:
+        where += " AND path >= ? AND path < ?"
+        args += [root + "/", root + "0"]
+    live, missing = conn.execute(
+        f"SELECT COUNT(*), COALESCE(SUM(last_seen_scan < ?), 0) FROM entries WHERE {where}",
+        [scan_id, *args],
+    ).fetchone()
+    if live >= _TOMBSTONE_GUARD_MIN_ROWS and missing > live * _TOMBSTONE_GUARD_RATIO:
+        raise SuspiciousScan(
+            f"listing is missing {missing} of {live} previously seen entries; nothing was marked deleted. "
+            "If they really are gone, scan again with force=True (CLI: --force)."
+        )
+
+
 def _mark_failed(conn: sqlite3.Connection, scan_id: int, exc: BaseException) -> None:
     try:
         if conn.in_transaction:
@@ -182,16 +213,24 @@ def _mark_failed(conn: sqlite3.Connection, scan_id: int, exc: BaseException) -> 
 
 
 def scan_remote(conn: sqlite3.Connection, rclone: Rclone, remote: RemoteConfig, *, root: str = "",
-                batch_size: int = 2000, progress: Callable[[int, int, int], None] | None = None) -> ScanResult:
+                batch_size: int = 2000, progress: Callable[[int, int, int], None] | None = None,
+                force: bool = False) -> ScanResult:
     """Scan `remote` (optionally only below `root`) into the catalog.
 
     The remote row must already exist (config.sync_remotes). Tombstoning only
     happens after the listing finished without error, so a failed or
-    interrupted scan can never make files look deleted.
+    interrupted scan can never make files look deleted; a listing that lost
+    most of a subtree raises SuspiciousScan unless `force`.
     """
     remote_id = db.remote_id(conn, remote.name)
     root = root.strip("/")
     batch_size = max(1, batch_size)
+    # A 'running' row left by a process that died mid-scan would otherwise stay running forever.
+    conn.execute(
+        "UPDATE scans SET status = 'failed', finished_at = ?, error = 'interrupted before completion' "
+        "WHERE remote_id = ? AND status = 'running'",
+        (db.utcnow(), remote_id),
+    )
     scan_id = conn.execute(
         "INSERT INTO scans(remote_id, root, status, started_at) VALUES (?, ?, 'running', ?) RETURNING id",
         (remote_id, root, db.utcnow()),
@@ -222,6 +261,8 @@ def scan_remote(conn: sqlite3.Connection, rclone: Rclone, remote: RemoteConfig, 
                 progress(files, dirs, size_total)
 
         with db.transaction(conn):
+            if not force:
+                _check_tombstone_guard(conn, remote_id, scan_id, root)
             tombstoned = _tombstone(conn, remote_id, scan_id, root)
             conn.execute(
                 "UPDATE scans SET status = 'complete', finished_at = ?, files_seen = ?, dirs_seen = ?, "
