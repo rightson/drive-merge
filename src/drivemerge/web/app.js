@@ -1,0 +1,466 @@
+// drive-merge visual workspace: two tree panes, a draft of staged moves, preview and approval.
+// All state that matters lives on the server (the draft); this file only drives it.
+import {
+  html, render, useEffect, useRef, useState,
+} from './vendor/htm-preact-standalone.mjs';
+import { getLang, setLang, t } from './i18n.js';
+import * as api from './api.js';
+import { Icon } from './icons.js';
+import { AppCtx } from './ctx.js';
+import { Pane } from './tree.js';
+import { StagedDrawer, SuggestionsDrawer } from './panels.js';
+import { PreviewModal } from './preview.js';
+import { DialogHost, Toasts } from './ui.js';
+import {
+  baseName, errorText, fmtBytes, fmtNum, keepBothName, parentOf, safeStorage, todayStamp,
+} from './util.js';
+
+const POLL_MS = 3000;
+const SPLIT_KEY = 'dm-split';
+const DRAFT_KEY = 'dm-draft';
+
+const defaultTitle = () => t('draft.defaultTitle', { date: todayStamp() });
+
+function Splitter({ frac, setFrac, boxRef }) {
+  const onPointerDown = (e) => { e.preventDefault(); e.currentTarget.setPointerCapture(e.pointerId); };
+  const onPointerMove = (e) => {
+    if (!e.currentTarget.hasPointerCapture(e.pointerId) || !boxRef.current) return;
+    const r = boxRef.current.getBoundingClientRect();
+    setFrac(Math.min(0.75, Math.max(0.25, (e.clientX - r.left) / r.width)));
+  };
+  const onKeyDown = (e) => {
+    const step = e.shiftKey ? 0.1 : 0.03;
+    if (e.key === 'ArrowLeft') { e.preventDefault(); setFrac(Math.max(0.25, frac - step)); }
+    if (e.key === 'ArrowRight') { e.preventDefault(); setFrac(Math.min(0.75, frac + step)); }
+  };
+  return html`<div class="splitter" role="separator" aria-orientation="vertical" aria-label=${t('pane.resize')}
+    aria-valuenow=${Math.round(frac * 100)} aria-valuemin="25" aria-valuemax="75" tabindex="0" data-testid="splitter"
+    onPointerDown=${onPointerDown} onPointerMove=${onPointerMove} onKeyDown=${onKeyDown}
+    onDblClick=${() => setFrac(0.5)}></div>`;
+}
+
+function App() {
+  const [lang, setLangState] = useState(getLang());
+  const [fatal, setFatal] = useState('');
+  const [config, setConfig] = useState(null);
+  const [draft, setDraft] = useState(null);
+  const [drafts, setDrafts] = useState([]);
+  const [tick, setTick] = useState(0);
+  const [drawer, setDrawer] = useState(null);
+  const [previewOpen, setPreviewOpen] = useState(false);
+  const [toasts, setToasts] = useState([]);
+  const [dialog, setDialog] = useState(null);
+  const [frac, setFrac] = useState(() => {
+    const v = parseFloat(safeStorage('get', SPLIT_KEY));
+    return v >= 0.25 && v <= 0.75 ? v : 0.5;
+  });
+  const draftRef = useRef(null);
+  const chain = useRef(Promise.resolve());
+  const inFlight = useRef(0);
+  const toastId = useRef(0);
+  const leftRef = useRef(null);
+  const rightRef = useRef(null);
+  const panesBox = useRef(null);
+  const modalOpen = useRef(false);
+  const replacing = useRef(false);
+  modalOpen.current = previewOpen || !!dialog;
+
+  useEffect(() => { safeStorage('set', SPLIT_KEY, String(frac)); }, [frac]);
+
+  // ---------------------------------------------------------------- toasts and dialogs
+  const dismiss = (id) => setToasts((xs) => xs.filter((x) => x.id !== id));
+  function toast(kind, text, action) {
+    toastId.current += 1;
+    const id = toastId.current;
+    setToasts((xs) => [...xs.slice(-4), { id, kind, text, action }]);
+    setTimeout(() => dismiss(id), action ? 12000 : kind === 'error' ? 9000 : 5500);
+    return id;
+  }
+  const ask = (type, opts) => new Promise((resolve) => {
+    setDialog({ type, ...opts, resolve: (v) => { setDialog(null); resolve(v); } });
+  });
+  const confirmDialog = (opts) => ask('confirm', opts);
+  const promptDialog = (opts) => ask('prompt', opts);
+
+  // ---------------------------------------------------------------- draft state
+  function adopt(d) {
+    draftRef.current = d;
+    setDraft(d);
+    safeStorage('set', DRAFT_KEY, String(d.id));
+    return d;
+  }
+
+  async function refreshDraftList() {
+    try { setDrafts(await api.listDrafts()); } catch (e) { /* the select keeps its old options */ }
+  }
+
+  async function syncDraft() {
+    const d = adopt(await api.getDraft(draftRef.current.id));
+    setTick((x) => x + 1);
+    refreshDraftList();
+    return d;
+  }
+
+  async function startDraft(title) {
+    const d = adopt(await api.createDraft(title || defaultTitle()));
+    setTick((x) => x + 1);
+    refreshDraftList();
+    return d;
+  }
+
+  /** The open draft was applied, discarded or lost: continue on a fresh one. */
+  async function replaceDraft(message) {
+    if (replacing.current) return;
+    replacing.current = true;
+    try {
+      const list = await api.listDrafts();
+      const open = list.find((x) => x.id !== (draftRef.current && draftRef.current.id));
+      if (open) adopt(await api.getDraft(open.id)); else await startDraft();
+      setTick((x) => x + 1);
+      refreshDraftList();
+      if (message) toast('info', message);
+    } catch (e) {
+      toast('error', errorText(e));
+    } finally {
+      replacing.current = false;
+    }
+  }
+
+  // Everything that changes the draft runs one at a time, in the order the user did it.
+  const enqueue = (fn) => {
+    inFlight.current += 1;
+    const p = chain.current.then(fn, fn);
+    chain.current = p.catch(() => {}).then(() => { inFlight.current -= 1; });
+    return p;
+  };
+
+  function showWarnings(warnings, dst) {
+    const seen = new Set();
+    (warnings || []).forEach((w) => {
+      if (seen.has(w.code)) return;
+      seen.add(w.code);
+      toast('warn', t(`warn.${w.code}`, { dst: dst ? `${dst.remote}:${dst.path}` : '' }, w.message));
+    });
+  }
+
+  async function failStaging(e, items, dst, opts) {
+    if (e.code === 'NOT_OPEN' || (e.code === 'NOT_FOUND' && /draft/.test(e.message))) {
+      await replaceDraft(t('draft.closed'));
+      return;
+    }
+    if (e.code === 'NAME_EXISTS' && opts.keepBoth !== false) {
+      toast('error', errorText(e), { label: t('act.keepBoth'), run: () => keepBoth(items, dst) });
+    } else {
+      toast('error', errorText(e));
+    }
+  }
+
+  const stageMove = (items, dst, opts = {}) => enqueue(async () => {
+    if (!draftRef.current) return false;
+    const body = { kind: 'move', items, dst: { remote: dst.remote, path: dst.path } };
+    if (opts.newName) body.new_name = opts.newName;
+    try {
+      const r = await api.addAction(draftRef.current.id, body);
+      showWarnings(r.warnings, dst);
+      await syncDraft();
+      return true;
+    } catch (e) {
+      await failStaging(e, items, dst, opts);
+      return false;
+    }
+  });
+
+  const stageMkdir = (dst, name) => enqueue(async () => {
+    if (!draftRef.current) return false;
+    try {
+      const r = await api.addAction(draftRef.current.id, { kind: 'mkdir', dst: { remote: dst.remote, path: dst.path }, new_name: name });
+      showWarnings(r.warnings, dst);
+      await syncDraft();
+      return true;
+    } catch (e) {
+      await failStaging(e, [], dst, { keepBoth: false });
+      return false;
+    }
+  });
+
+  const stageMany = (actions) => enqueue(async () => {
+    let staged = 0;
+    for (const a of actions) {
+      try {
+        const r = await api.addAction(draftRef.current.id, a);
+        showWarnings(r.warnings, a.dst);
+        staged += 1;
+      } catch (e) {
+        toast('error', errorText(e));
+        break;
+      }
+    }
+    if (staged) { await syncDraft(); toast('success', t('sug.addedN', { n: staged })); }
+    return staged;
+  });
+
+  /** Retry a move that hit NAME_EXISTS, giving each clashing item "name (2).ext". */
+  const keepBoth = (items, dst) => enqueue(async () => {
+    let staged = 0;
+    for (const it of items) {
+      const name = baseName(it.path);
+      const isDir = !!it.is_dir;
+      for (let n = items.length === 1 ? 2 : 1; n < 40; n += 1) {
+        const body = { kind: 'move', items: [{ remote: it.remote, path: it.path }], dst: { remote: dst.remote, path: dst.path } };
+        if (n > 1) body.new_name = keepBothName(name, n, isDir);
+        try {
+          const r = await api.addAction(draftRef.current.id, body);
+          showWarnings(r.warnings, dst);
+          staged += 1;
+          break;
+        } catch (e) {
+          if (e.code === 'NAME_EXISTS') continue;
+          toast('error', errorText(e));
+          n = 99;
+        }
+      }
+    }
+    if (staged) { await syncDraft(); toast('success', t('act.keptBoth', { n: staged })); }
+    return staged;
+  });
+
+  const renameItem = (item, newName) => stageMove(
+    [{ remote: item.remote, path: item.path }],
+    { remote: item.remote, path: parentOf(item.path) },
+    { newName, keepBoth: false },
+  );
+
+  const stepHistory = (kind) => enqueue(async () => {
+    const d = draftRef.current;
+    if (!d) return;
+    if (kind === 'undo' ? !d.undo_available : !d.redo_available) {
+      toast('info', t(kind === 'undo' ? 'err.NOTHING_TO_UNDO' : 'err.NOTHING_TO_REDO'));
+      return;
+    }
+    try {
+      adopt(await (kind === 'undo' ? api.undo(d.id) : api.redo(d.id)));
+      setTick((x) => x + 1);
+      refreshDraftList();
+    } catch (e) {
+      toast('error', errorText(e));
+      try { await syncDraft(); } catch (e2) { /* keep the toast */ }
+    }
+  });
+
+  const removeAction = (id) => enqueue(async () => {
+    try {
+      const r = await api.removeAction(draftRef.current.id, id);
+      await syncDraft();
+      if (r.removed && r.removed.length > 1) toast('info', t('staged.alsoRemoved', { n: r.removed.length - 1 }));
+    } catch (e) {
+      toast('error', errorText(e));
+    }
+  });
+
+  async function clearDraft() {
+    const ok = await confirmDialog({
+      title: t('staged.clearTitle'), message: t('staged.clearText'), okLabel: t('staged.clearOk'), danger: true,
+    });
+    if (!ok) return;
+    try {
+      await api.discardDraft(draftRef.current.id);
+      await startDraft();
+      toast('success', t('staged.cleared'));
+    } catch (e) {
+      toast('error', errorText(e));
+    }
+  }
+
+  async function newDraft() {
+    const title = await promptDialog({
+      title: t('draft.newTitle'), label: t('draft.titleLabel'), value: defaultTitle(), okLabel: t('draft.create'),
+    });
+    if (!title) return;
+    try { await startDraft(title); } catch (e) { toast('error', errorText(e)); }
+  }
+
+  async function selectDraft(id) {
+    try {
+      adopt(await api.getDraft(id));
+      setTick((x) => x + 1);
+    } catch (e) {
+      toast('error', errorText(e));
+      refreshDraftList();
+    }
+  }
+
+  async function afterExecution() {
+    setTick((x) => x + 1);
+    try {
+      const d = await api.getDraft(draftRef.current.id);
+      if (d.status !== 'open') await replaceDraft(t('draft.autoNew')); else adopt(d);
+    } catch (e) {
+      await replaceDraft(t('draft.autoNew'));
+    }
+  }
+
+  const reveal = (side, loc, opts) => {
+    const pane = (side === 'left' ? leftRef : rightRef).current;
+    return pane ? pane.reveal(loc, opts) : undefined;
+  };
+
+  // ---------------------------------------------------------------- start up
+  useEffect(() => {
+    (async () => {
+      const hash = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+      const token = hash.get('token');
+      // The one-time token must not stay in the address bar, history or a bookmark.
+      if (token) window.history.replaceState(null, '', window.location.pathname + window.location.search);
+      api.setUnauthorizedHandler(() => setFatal(t('fatal.session')));
+      try {
+        let approvals;
+        if (token) {
+          const session = await api.login(token);
+          api.setCsrf(session.csrf);
+          approvals = session.approvals_enabled;
+        }
+        const cfg = await api.config();
+        // A reloaded page has no URL token; the server hands a live session its CSRF token again.
+        if (cfg.csrf && !api.hasCsrf()) api.setCsrf(cfg.csrf);
+        if (cfg.approvals_enabled === undefined) cfg.approvals_enabled = !!approvals;
+        setConfig(cfg);
+        const list = await api.listDrafts();
+        setDrafts(list);
+        const saved = Number(safeStorage('get', DRAFT_KEY));
+        const pick = list.find((x) => x.id === saved) || list[0];
+        if (pick) adopt(await api.getDraft(pick.id)); else await startDraft();
+      } catch (e) {
+        setFatal(e.status === 401 || e.status === 403 ? (token ? t('fatal.login') : t('fatal.session')) : errorText(e));
+      }
+    })();
+  }, []);
+
+  // Poll the open draft: another tab or Claude (through MCP) may have staged something.
+  const draftId = draft ? draft.id : null;
+  useEffect(() => {
+    if (!draftId) return undefined;
+    const timer = setInterval(async () => {
+      const mine = draftRef.current;
+      if (!mine || mine.id !== draftId || document.hidden || inFlight.current > 0) return;
+      try {
+        const d = await api.getDraft(draftId);
+        // Our own change may have landed while this request was out; that is not news.
+        if (draftRef.current !== mine || inFlight.current > 0) return;
+        if (d.status !== 'open') {
+          adopt(d);
+          if (!modalOpen.current) replaceDraft(t('draft.closed'));
+          return;
+        }
+        if (d.version === mine.version) return;
+        const known = new Set(mine.actions.map((a) => a.id));
+        const fresh = d.actions.filter((a) => a.state === 'active' && !known.has(a.id));
+        adopt(d);
+        setTick((x) => x + 1);
+        refreshDraftList();
+        if (fresh.some((a) => a.created_by === 'mcp')) toast('claude', t('draft.fromClaude'));
+        else toast('info', t('draft.changedElsewhere'));
+      } catch (e) { /* offline for a moment: try again next time */ }
+    }, POLL_MS);
+    return () => clearInterval(timer);
+  }, [draftId]);
+
+  // Undo / redo from the keyboard, unless the user is typing in a field or a dialog is open.
+  useEffect(() => {
+    const onKey = (e) => {
+      const el = e.target;
+      if (el && (['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName) || el.isContentEditable)) return;
+      if (modalOpen.current || !(e.ctrlKey || e.metaKey) || e.altKey) return;
+      const k = e.key.toLowerCase();
+      if (k === 'z') { e.preventDefault(); stepHistory(e.shiftKey ? 'redo' : 'undo'); }
+      else if (k === 'y') { e.preventDefault(); stepHistory('redo'); }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
+
+  const switchLang = () => {
+    const next = getLang() === 'zh-TW' ? 'en' : 'zh-TW';
+    setLang(next);
+    setLangState(next);
+    document.documentElement.lang = next === 'zh-TW' ? 'zh-Hant-TW' : 'en';
+    document.title = t('app.title');
+  };
+
+  // ---------------------------------------------------------------- render
+  if (fatal) {
+    return html`<main class="fatal" data-testid="fatal" role="alert">
+      <${Icon} name="alert" size=${28} /><h1>${t('fatal.title')}</h1><p>${fatal}</p></main>`;
+  }
+  if (!config || !draft) return html`<main class="fatal" data-testid="loading"><span class="spinner"></span> ${t('common.loading')}</main>`;
+
+  const active = draft.actions.filter((a) => a.state === 'active');
+  const sum = draft.summary || {};
+  const ctx = {
+    config, draft, toast, confirm: confirmDialog, prompt: promptDialog, reveal,
+    stageMove, stageMkdir, stageMany, rename: renameItem, afterExecution,
+    undo: () => stepHistory('undo'), redo: () => stepHistory('redo'), removeAction, clearDraft,
+  };
+  const toggleDrawer = (name) => setDrawer((d) => (d === name ? null : name));
+
+  return html`<${AppCtx.Provider} value=${ctx}>
+    <div class="app" data-lang=${lang}>
+      ${config.approvals_enabled === false && html`<div class="banner banner-info" role="note" data-testid="approvals-banner">
+        <${Icon} name="info" size=${17} />
+        <span><strong>${t('banner.title')}</strong> ${t('banner.text')}
+          <code>drivemerge plan approve ${'<id>'}</code> ${t('banner.and')} <code>drivemerge plan execute ${'<id>'}</code> ${t('banner.after')}</span>
+      </div>`}
+      <header class="topbar">
+        <div class="brand"><${Icon} name="folder" size=${20} /><span>drive-merge</span>
+          ${config.version && html`<small title=${t('app.version')}>${config.version}</small>`}</div>
+        <div class="group draft-group">
+          <label class="visually-hidden" for="draft-select">${t('draft.select')}</label>
+          <select id="draft-select" class="select" data-testid="draft-select" value=${draft.id}
+            onChange=${(e) => selectDraft(Number(e.target.value))}>
+            ${(drafts.some((x) => x.id === draft.id) ? drafts : [draft, ...drafts]).map((x) => html`<option key=${x.id} value=${x.id}>
+              #${x.id} ${x.title}</option>`)}
+          </select>
+          <button class="btn btn-small" data-testid="draft-new" onClick=${newDraft} title=${t('draft.new')}>
+            <${Icon} name="plus" size=${15} /><span class="btn-text">${t('draft.new')}</span></button>
+        </div>
+        <div class="group">
+          <button class="btn" data-testid="undo-button" disabled=${!draft.undo_available} onClick=${() => stepHistory('undo')}
+            title=${t('draft.undoTip')}><${Icon} name="undo" size=${16} /><span class="btn-text">${t('draft.undo')}</span></button>
+          <button class="btn" data-testid="redo-button" disabled=${!draft.redo_available} onClick=${() => stepHistory('redo')}
+            title=${t('draft.redoTip')}><${Icon} name="redo" size=${16} /><span class="btn-text">${t('draft.redo')}</span></button>
+        </div>
+        <div class="group">
+          <button class=${'btn' + (drawer === 'staged' ? ' on' : '')} data-testid="staged-toggle" aria-pressed=${drawer === 'staged'}
+            title=${t('staged.button')} onClick=${() => toggleDrawer('staged')}><${Icon} name="list" size=${16} />
+            <span class="btn-text">${t('staged.button')}</span>
+            <span class="count-pill" data-testid="staged-count">${active.length}</span></button>
+          <button class=${'btn' + (drawer === 'suggestions' ? ' on' : '')} data-testid="suggestions-toggle" aria-pressed=${drawer === 'suggestions'}
+            title=${t('sug.button')} onClick=${() => toggleDrawer('suggestions')}><${Icon} name="sparkle" size=${16} />
+            <span class="btn-text">${t('sug.button')}</span></button>
+        </div>
+        <span class="spacer"></span>
+        ${sum.moved_files > 0 && html`<span class="topbar-summary" data-testid="draft-summary">
+          ${t('draft.summary', { files: fmtNum(sum.moved_files), bytes: fmtBytes(sum.moved_bytes) })}</span>`}
+        <button class="btn btn-small" data-testid="lang-toggle" onClick=${switchLang} title=${t('app.language')}>
+          ${lang === 'zh-TW' ? 'EN' : '中文'}</button>
+        <button class="btn btn-primary" data-testid="preview-button" disabled=${active.length === 0}
+          onClick=${() => { setToasts([]); setPreviewOpen(true); }}><${Icon} name="eye" size=${16} /> ${t('draft.preview')}</button>
+      </header>
+      <div class="workspace">
+        <div class="panes" ref=${panesBox} style=${{ gridTemplateColumns: `minmax(260px, ${frac}fr) 10px minmax(260px, ${1 - frac}fr)` }}>
+          <${Pane} side="left" draft=${draft} tick=${tick} handle=${leftRef} />
+          <${Splitter} frac=${frac} setFrac=${setFrac} boxRef=${panesBox} />
+          <${Pane} side="right" draft=${draft} tick=${tick} handle=${rightRef} />
+        </div>
+        ${drawer === 'staged' && html`<${StagedDrawer} draft=${draft} onClose=${() => setDrawer(null)} />`}
+        ${drawer === 'suggestions' && html`<${SuggestionsDrawer} draft=${draft} onClose=${() => setDrawer(null)} />`}
+      </div>
+      ${previewOpen && html`<${PreviewModal} draft=${draft} onClose=${() => setPreviewOpen(false)} />`}
+      <${DialogHost} request=${dialog} />
+      <${Toasts} toasts=${toasts} dismiss=${dismiss} />
+    </div>
+  <//>`;
+}
+
+document.title = t('app.title');
+document.documentElement.lang = getLang() === 'zh-TW' ? 'zh-Hant-TW' : 'en';
+render(html`<${App} />`, document.getElementById('root'));

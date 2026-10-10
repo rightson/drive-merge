@@ -1,0 +1,119 @@
+# Default layout rules for a personal archive (drive-merge classify.py).
+#
+# How it works
+#   * A *unit* is a folder that must move as a whole and keep its inner structure
+#     (a code repo, an app bundle, ...). Rules with `unit = true` decide where a
+#     unit goes; every other rule sorts *loose* files one by one.
+#   * Rules are tried top to bottom; the first one whose keys all match wins.
+#     Files nothing matched go to `layout.fallback`, which keeps their original
+#     structure, so "unsure" never means "scattered".
+#
+# Match keys (all optional, AND-ed):
+#   category   list of: photo video audio document pdf spreadsheet presentation
+#              archive code design other
+#   ext        lowercase extensions, no dot
+#   path_glob  fnmatch on the full original path, case-insensitive ('*' crosses '/')
+#   name_regex re.search on the file name (prefix with (?i) to ignore case)
+#   min_size / max_size   bytes
+#   remote     list of remote names
+#   unit       true = this rule places units. Then category/ext are those of the
+#              unit folder's name ('Foo.pages' -> ext pages), path_glob/name_regex
+#              match the unit folder, and sizes compare the unit's total bytes.
+#
+# Target variables:
+#   {name} {stem} {ext} {category} {year} {month} {day} {remote}
+#   {parent} (immediate parent folder name)  {dir} (original parent path)
+#   {path} (original full path)  {unit} (unit folder name)
+#   {relpath} (path inside the unit; the original path for loose files)
+# {year}/{month}/{day} come from the file name (IMG_20190304_..., 2019-03-04 ...)
+# first, then from the modified time, else "unknown". In a unit rule every
+# variable describes the unit folder except {relpath}, and a unit rule's target
+# must contain {relpath}. An empty variable becomes "_".
+
+[layout]
+# A folder that directly contains a child matching one of these is a unit.
+unit_markers = [
+  ".git", "package.json", "pyproject.toml", "setup.py", "Cargo.toml", "go.mod",
+  "pom.xml", "build.gradle", "Gemfile", "composer.json", "*.xcodeproj", "*.sln", "*.csproj",
+]
+# A folder whose own name matches is a unit. A pattern containing '/' is matched
+# against the whole path instead, e.g. "Clients/*" makes each client folder a unit.
+bundle_patterns = [
+  "*.pages", "*.key", "*.numbers", "*.app", "*.photoslibrary", "*.fcpbundle",
+  "*.band", "*.rtfd", "*.logicx", "*.aplibrary", "*.imovielibrary",
+]
+fallback = "Unsorted/{remote}/{path}"
+
+# ---- units: placed as a whole, internal structure kept ----------------------
+
+[[rule]]
+name = "iwork-bundles"
+unit = true
+ext = ["pages", "numbers", "key", "rtfd"]
+target = "Documents/{year}/{unit}/{relpath}"
+
+[[rule]]
+name = "app-bundles"
+unit = true
+ext = ["app"]
+target = "Applications/{unit}/{relpath}"
+
+[[rule]]
+name = "media-projects"
+unit = true
+ext = ["photoslibrary", "aplibrary", "imovielibrary", "fcpbundle", "logicx", "band"]
+target = "Media Projects/{unit}/{relpath}"
+
+# Everything else detected as a unit is a project (repos, app sources, ...).
+[[rule]]
+name = "projects"
+unit = true
+target = "Projects/{unit}/{relpath}"
+
+# ---- loose files ---------------------------------------------------------------
+
+# Before "photos": a screenshot is a png, but it is not a photo.
+[[rule]]
+name = "screenshots"
+category = ["photo"]
+name_regex = '(?i)^(screenshot|screen ?shot|cleanshot|屏幕快照|屏幕截图|截屏|スクリーンショット)'
+target = "Screenshots/{year}/{name}"
+
+[[rule]]
+name = "photos"
+category = ["photo"]
+target = "Photos/{year}/{year}-{month}/{name}"
+
+[[rule]]
+name = "videos"
+category = ["video"]
+target = "Videos/{year}/{name}"
+
+# Albums are folders: keep the immediate parent folder (the album) with its tracks.
+[[rule]]
+name = "music"
+category = ["audio"]
+target = "Music/{parent}/{name}"
+
+[[rule]]
+name = "documents"
+category = ["document", "pdf", "presentation"]
+target = "Documents/{year}/{name}"
+
+[[rule]]
+name = "spreadsheets"
+category = ["spreadsheet"]
+target = "Documents/Spreadsheets/{year}/{name}"
+
+[[rule]]
+name = "design"
+category = ["design"]
+target = "Design/{year}/{name}"
+
+[[rule]]
+name = "archives"
+category = ["archive"]
+target = "Archives/{year}/{name}"
+
+# Loose code and "other" files are deliberately not matched: without their
+# project around them they belong where they were, so they take the fallback.

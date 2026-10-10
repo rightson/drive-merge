@@ -1,0 +1,141 @@
+// Side drawers: the staged-changes list and the folder suggestions.
+import { html, useContext, useEffect, useState } from './vendor/htm-preact-standalone.mjs';
+import { t } from './i18n.js';
+import * as api from './api.js';
+import { Icon } from './icons.js';
+import { AppCtx } from './ctx.js';
+import { describeAction, errorText, fmtBytes, fmtLoc, fmtNum } from './util.js';
+
+const SUGGESTION_NOTE = /^(related|duplicates):[0-9a-f]+$/i;
+
+function Drawer({ title, count, testid, onClose, children, footer }) {
+  return html`<aside class="drawer" data-testid=${testid} aria-label=${title}>
+    <header class="drawer-head">
+      <h2>${title}</h2>
+      ${count !== undefined && html`<span class="count-pill">${count}</span>`}
+      <button class="icon-btn drawer-close" aria-label=${t('common.close')} data-testid="drawer-close" onClick=${onClose}>
+        <${Icon} name="x" size=${16} /></button>
+    </header>
+    <div class="drawer-body">${children}</div>
+    ${footer && html`<footer class="drawer-foot">${footer}</footer>`}
+  </aside>`;
+}
+
+function StagedItem({ a, undone }) {
+  const ctx = useContext(AppCtx);
+  const d = describeAction(a);
+  const note = a.note && !SUGGESTION_NOTE.test(a.note) ? a.note : a.note ? t('staged.fromSuggestion') : '';
+  return html`<li class=${'staged-item' + (undone ? ' undone' : '')} data-testid=${undone ? 'staged-item-undone' : 'staged-item'}
+    data-action-id=${a.id} data-seq=${a.seq} data-created-by=${a.created_by}>
+    <span class="seq">#${a.seq}</span>
+    <div class="staged-main">
+      <button class="staged-title" title=${t('staged.reveal')} onClick=${() => ctx.reveal('right', a.dst)}>${d.title}</button>
+      ${d.detail && html`<div class="staged-detail">${d.detail}</div>`}
+      ${note && html`<div class="staged-note">${note}</div>`}
+    </div>
+    ${a.created_by === 'mcp' && html`<span class="badge badge-claude" data-testid="claude-badge"
+      title=${t('staged.byClaude')}><${Icon} name="claude" size=${11} />Claude</span>`}
+    ${!undone && html`<button class="icon-btn" data-testid="staged-remove" aria-label=${t('staged.remove')}
+      title=${t('staged.remove')} onClick=${() => ctx.removeAction(a.id)}><${Icon} name="x" size=${14} /></button>`}
+  </li>`;
+}
+
+export function StagedDrawer({ draft, onClose }) {
+  const ctx = useContext(AppCtx);
+  const active = draft.actions.filter((a) => a.state === 'active');
+  const undone = draft.actions.filter((a) => a.state === 'undone');
+  const sum = draft.summary || {};
+  const footer = html`
+    <button class="btn" data-testid="drawer-undo" disabled=${!draft.undo_available} onClick=${ctx.undo}>
+      <${Icon} name="undo" size=${15} /> ${t('draft.undo')}</button>
+    <button class="btn" data-testid="drawer-redo" disabled=${!draft.redo_available} onClick=${ctx.redo}>
+      <${Icon} name="redo" size=${15} /> ${t('draft.redo')}</button>
+    <span class="spacer"></span>
+    <button class="btn btn-danger-ghost" data-testid="staged-clear" disabled=${draft.actions.length === 0} onClick=${ctx.clearDraft}>
+      <${Icon} name="trash" size=${15} /> ${t('staged.clear')}</button>`;
+  return html`<${Drawer} title=${t('staged.title')} count=${active.length} testid="staged-drawer" onClose=${onClose} footer=${footer}>
+    ${sum.moved_files > 0 && html`<p class="drawer-summary" data-testid="staged-summary">
+      ${t('staged.summary', { files: fmtNum(sum.moved_files), bytes: fmtBytes(sum.moved_bytes) })}
+      ${sum.cross_remote_bytes > 0 && ` ${t('staged.summaryCross', { bytes: fmtBytes(sum.cross_remote_bytes) })}`}</p>`}
+    ${active.length === 0 && html`<p class="empty-hint">${t('staged.empty')}</p>`}
+    <ol class="staged-list" data-testid="staged-list">
+      ${active.map((a) => html`<${StagedItem} key=${a.id} a=${a} />`)}
+    </ol>
+    ${undone.length > 0 && html`<h3 class="drawer-sub">${t('staged.redoable', { n: undone.length })}</h3>
+      <ol class="staged-list">${undone.map((a) => html`<${StagedItem} key=${a.id} a=${a} undone />`)}</ol>`}
+  <//>`;
+}
+
+function SuggestionCard({ s, added, onAdd, onReveal }) {
+  const folders = s.folders || [];
+  return html`<article class=${'sug-card' + (added ? ' added' : '')} data-testid="suggestion-card" data-sid=${s.id}>
+    <h3 class="sug-title">${s.title}</h3>
+    <p class="sug-reason">${s.reason}</p>
+    <ul class="sug-folders">
+      ${folders.map((f, i) => html`<li key=${fmtLoc(f)}>
+        <span class="sug-folder-name" title=${fmtLoc(f)}><${Icon} name="folder" size=${14} class="cat-folder" />
+          <span>${fmtLoc(f)}</span>${i === 0 && html`<span class="badge badge-anchor">${t('sug.anchor')}</span>`}</span>
+        <span class="sug-folder-meta">${t('pane.files', { n: fmtNum(f.files) })} · ${fmtBytes(f.bytes)}</span>
+        <span class="sug-folder-btns">
+          <button class="btn btn-tiny" data-testid=${'sug-folder-left-' + i} onClick=${() => onReveal('left', [f])}>${t('sug.left')}</button>
+          <button class="btn btn-tiny" data-testid=${'sug-folder-right-' + i} onClick=${() => onReveal('right', [f])}>${t('sug.right')}</button>
+        </span></li>`)}
+    </ul>
+    ${(s.terms || []).length > 0 && html`<div class="chips">${s.terms.map((term) => html`<span class="chip" key=${term}>${term}</span>`)}</div>`}
+    <div class="sug-actions">
+      <button class="btn btn-small" data-testid="suggestion-show-left" onClick=${() => onReveal('left', folders)}>${t('sug.showLeft')}</button>
+      <button class="btn btn-small" data-testid="suggestion-show-right" onClick=${() => onReveal('right', folders)}>${t('sug.showRight')}</button>
+      <button class="btn btn-small btn-primary" data-testid="suggestion-add" disabled=${added || !(s.actions || []).length}
+        onClick=${onAdd}>${added ? t('sug.added') : t('sug.add')}</button>
+    </div>
+  </article>`;
+}
+
+export function SuggestionsDrawer({ draft, onClose }) {
+  const ctx = useContext(AppCtx);
+  const [kind, setKind] = useState('related');
+  const [state, setState] = useState({ loading: true, items: [], error: '' });
+  const [added, setAdded] = useState({});
+
+  async function load(k) {
+    setState({ loading: true, items: [], error: '' });
+    try {
+      setState({ loading: false, items: await api.suggestions(k), error: '' });
+    } catch (e) {
+      setState({ loading: false, items: [], error: errorText(e) });
+    }
+  }
+  useEffect(() => { load(kind); }, [kind]);
+
+  async function add(s) {
+    const n = await ctx.stageMany(s.actions);
+    if (n === s.actions.length) setAdded((x) => ({ ...x, [`${draft.id}:${s.id}`]: true }));
+  }
+
+  // Anchor on the chosen side and the first other folder on the opposite side, so the pair can be compared at once.
+  function show(side, folders) {
+    if (!folders.length) return;
+    const other = side === 'left' ? 'right' : 'left';
+    ctx.reveal(side, folders[0], { expandTarget: true });
+    if (folders.length > 1) ctx.reveal(other, folders[1], { expandTarget: true });
+  }
+
+  const tabs = [['related', t('sug.related')], ['duplicates', t('sug.duplicates')]];
+  return html`<${Drawer} title=${t('sug.title')} testid="suggestions-drawer" onClose=${onClose}>
+    <div class="tabs" role="tablist">
+      ${tabs.map(([k, label]) => html`<button role="tab" aria-selected=${kind === k} class=${kind === k ? 'on' : ''}
+        data-testid=${'sug-tab-' + k} onClick=${() => setKind(k)}>${label}</button>`)}
+      <span class="spacer"></span>
+      <button class="icon-btn" aria-label=${t('common.refresh')} title=${t('common.refresh')} onClick=${() => load(kind)}>
+        <${Icon} name="refresh" size=${15} /></button>
+    </div>
+    <p class="drawer-hint">${kind === 'related' ? t('sug.relatedHint') : t('sug.duplicatesHint')}</p>
+    ${state.loading && html`<p class="empty-hint">${t('common.loading')}</p>`}
+    ${state.error && html`<p class="empty-hint error">${state.error}</p>`}
+    ${!state.loading && !state.error && state.items.length === 0 && html`<p class="empty-hint">${t('sug.none')}</p>`}
+    <div class="sug-list" data-testid="suggestion-list">
+      ${state.items.map((s) => html`<${SuggestionCard} key=${s.id} s=${s} added=${!!added[`${draft.id}:${s.id}`]}
+        onAdd=${() => add(s)} onReveal=${show} />`)}
+    </div>
+  <//>`;
+}
