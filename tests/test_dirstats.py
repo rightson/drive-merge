@@ -177,6 +177,8 @@ def test_refresh_200k_files_in_seconds(conn, catalog):
         return (g, f"p:{path}", path, parent, name, name.casefold(), "", "other",
                 int(is_dir), size, mtime, 1, scan, scan, rv, group)
 
+    # Trigram FTS indexing of 200k paths would dominate setup; dir_stats never reads FTS.
+    conn.execute("DROP TRIGGER entries_fts_ai")
     insert = ("INSERT INTO entries(remote_id, entry_key, path, parent, name, name_norm, ext, category, "
               "is_dir, size, mtime, present, first_seen_scan, last_seen_scan, row_version, content_group) "
               "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
@@ -184,7 +186,8 @@ def test_refresh_200k_files_in_seconds(conn, catalog):
     for t in range(40):
         dir_rows.append(row(f"t{t:02d}", True))
         dir_rows.extend(row(f"t{t:02d}/s{s:02d}", True) for s in range(25))
-    conn.executemany(insert, dir_rows)
+    with db.transaction(conn):
+        conn.executemany(insert, dir_rows)
 
     n = 200_000
     sizes, mtimes, groups = [], [], []
@@ -197,10 +200,11 @@ def test_refresh_200k_files_in_seconds(conn, catalog):
         mtimes.append(mtime)
         groups.append(group)
         file_rows.append(row(f"t{i % 40:02d}/s{(i // 40) % 25:02d}/f{i:06d}.bin", False, size, mtime, group))
-    conn.executemany(insert, file_rows)
+    with db.transaction(conn):
+        conn.executemany(insert, file_rows)
 
-    counts = Counter(g_ for g_ in groups if g_ is not None)
-    dup = [1 if g_ is not None and counts[g_] >= 2 else 0 for g_ in groups]
+    counts = Counter(grp for grp in groups if grp is not None)
+    dup = [1 if grp is not None and counts[grp] >= 2 else 0 for grp in groups]
 
     started = time.perf_counter()
     result = dirstats.refresh(conn)
