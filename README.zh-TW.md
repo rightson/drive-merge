@@ -6,7 +6,7 @@
 
 drive-merge 在你的電腦上執行。它透過 [rclone](https://rclone.org) 將每個雲端的 **中繼資料**（絕不包含檔案內容）彙整進本機 SQLite 資料庫，告訴你每一份內容存放在哪裡，證明哪些檔案是重複的，提出整潔的資料夾架構建議，並且——僅透過經過模擬且經人工核准的計畫——將所有內容整合到單一雲端。
 
-設計文件：[docs/DESIGN.zh-TW.md](docs/DESIGN.zh-TW.md) — 架構、安全模型，以及你可以調整的待決事項 — 與 [docs/WORKSPACE.zh-TW.md](docs/WORKSPACE.zh-TW.md) — 視覺化工作區。繁體中文版本位於 `docs/*.zh-TW.md`。
+設計文件：[docs/DESIGN.zh-TW.md](docs/DESIGN.zh-TW.md) — 架構、安全模型，以及你可以調整的待決事項；[docs/WORKSPACE.zh-TW.md](docs/WORKSPACE.zh-TW.md) — 視覺化工作區；以及 [docs/EXPLORE.zh-TW.md](docs/EXPLORE.zh-TW.md) — 總覽、探索與比較三個檢視。繁體中文版本位於 `docs/*.zh-TW.md`。
 
 ## 設計理由
 
@@ -68,6 +68,8 @@ drivemerge ui                              # opens http://127.0.0.1:8765/ui/ (on
 ```
 
 兩個樹狀窗格可並排顯示任意兩個位置，並可跨越不同雲端。拖曳檔案與資料夾到更適當的層級、重新命名、復原與重做、在「變更後」與「變更前」檢視之間切換，並取得相關或重複資料夾的建議。拖曳期間完全不會碰觸任何雲端：暫存的移動會透過與其他所有計畫相同的模擬器進行預覽（每個雲端的前後狀態、衝突、去重），只有輸入的 8 字元核准代碼才會開始執行——而且僅限於 `drivemerge ui` 在你自己的互動式終端機中執行、而非在 AI 代理程式之中時。頁面預設為英文；瀏覽器列出中文時則顯示繁體中文，`EN` / `中文` 按鈕可切換並會記住你的選擇。請參閱 [docs/WORKSPACE.zh-TW.md](docs/WORKSPACE.zh-TW.md)。
+
+頁面左側的導覽列還能開啟三個唯讀的檢視，它們都會通往工作區：**總覽**（各雲端的內容重疊多少：用交集圖呈現哪些內容在哪些雲端，以及哪些只存在於單一雲端）、**探索**（用名稱或像 `type:pdf not:gdrive copies:1` 這樣的查詢找檔案；內容相同的副本會歸成一列，每個雲端一欄）與**比較**（對任意雲端上的任意兩個資料夾做對齊的差異檢視：相同、不同、搬動過、只在一邊，並有按鈕可把合併加入你的草稿）。它們不會寫入任何雲端，也不會更動 catalog。請參閱 [docs/EXPLORE.zh-TW.md](docs/EXPLORE.zh-TW.md)。
 
 API 與 MCP：
 

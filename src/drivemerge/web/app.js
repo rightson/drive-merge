@@ -12,6 +12,10 @@ import { CatalogBanner, StagedDrawer, SuggestionsDrawer } from './panels.js';
 import { PreviewModal } from './preview.js';
 import { DialogHost, Toasts } from './ui.js';
 import {
+  Rail, ViewHost, currentView, navigate, useRoute, useShortcuts,
+} from './shell.js';
+import { compareHash } from './query.js';
+import {
   baseName, errorText, fmtBytes, fmtLoc, fmtNum, keepBothName, lastMove, parentOf, safeStorage, todayStamp, wordParams,
 } from './util.js';
 
@@ -67,9 +71,14 @@ function App() {
   const rightRef = useRef(null);
   const panesBox = useRef(null);
   const modalOpen = useRef(false);
+  const wsRef = useRef(null);
   const replacing = useRef(false);
   const ranHere = useRef(new Set());
   modalOpen.current = previewOpen || !!dialog;
+  // The rail and the read-only views (shell.js): the workspace below stays mounted whichever view shows.
+  const route = useRoute();
+  useShortcuts(route);
+  const onWorkspace = route.view === 'workspace';
 
   useEffect(() => { safeStorage('set', SPLIT_KEY, String(frac)); }, [frac]);
 
@@ -349,6 +358,14 @@ function App() {
     return pane ? pane.reveal(loc, opts) : undefined;
   };
 
+  /** Show the workspace and focus an item in the left pane (the other views' Reveal). */
+  const revealInWorkspace = async (loc) => {
+    navigate('#/workspace');
+    // The panes are laid out only once the workspace is un-hidden; scrolling to the row needs that.
+    for (let n = 0; n < 40 && (!wsRef.current || wsRef.current.hidden); n += 1) await new Promise((r) => requestAnimationFrame(r));
+    return reveal('left', loc);
+  };
+
   // ---------------------------------------------------------------- start up
   useEffect(() => {
     (async () => {
@@ -424,7 +441,7 @@ function App() {
     const onKey = (e) => {
       const el = e.target;
       if (el && (['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName) || el.isContentEditable)) return;
-      if (modalOpen.current || !(e.ctrlKey || e.metaKey) || e.altKey) return;
+      if (modalOpen.current || !(e.ctrlKey || e.metaKey) || e.altKey || currentView() !== 'workspace') return;
       const k = e.key.toLowerCase();
       if (k === 'z') { e.preventDefault(); stepHistory(e.shiftKey ? 'redo' : 'undo'); }
       else if (k === 'y') { e.preventDefault(); stepHistory('redo'); }
@@ -454,12 +471,17 @@ function App() {
     config, draft, toast, confirm: confirmDialog, prompt: promptDialog, reveal,
     stageMove, stageMkdir, stageMany, rename: renameItem, afterExecution, resolveClash,
     outdated, markOutdated, catalogRefreshed,
+    nav: navigate, lang, switchLang, revealInWorkspace, openWorkspace: () => navigate('#/workspace'),
+    compare: (a, b) => navigate(compareHash({ remote: a.remote, path: a.path }, { remote: b.remote, path: b.path })),
+    compareWith: (a) => navigate(compareHash({ remote: a.remote, path: a.path }, null)),
     undo: () => stepHistory('undo'), redo: () => stepHistory('redo'), removeAction, clearDraft,
   };
   const toggleDrawer = (name) => setDrawer((d) => (d === name ? null : name));
 
   return html`<${AppCtx.Provider} value=${ctx}>
-    <div class="app" data-lang=${lang} data-drawer=${drawer || undefined}>
+    <div class="app" data-lang=${lang} data-drawer=${onWorkspace ? drawer || undefined : undefined} data-view=${route.view}>
+      <${Rail} route=${route} />
+      <div class="shell-main">
       ${config.approvals_enabled === false && html`<div class="banner banner-info" role="note" data-testid="approvals-banner">
         <${Icon} name="info" size=${17} />
         <span><strong>${t('banner.title')}</strong> ${t('banner.text')}
@@ -467,6 +489,7 @@ function App() {
       </div>`}
       ${outdated && html`<${CatalogBanner} remotes=${outdated.remotes} onFresh=${() => { catalogRefreshed(); toast('success', t('prog.rescanned')); }}
         onDismiss=${() => setOutdated(null)} />`}
+      <div class="ws" ref=${wsRef} hidden=${!onWorkspace} data-testid="workspace-host">
       <header class="topbar">
         <div class="brand"><${Icon} name="folder" size=${20} /><span>drive-merge</span>
           ${config.version && html`<small title=${t('app.version')}>${config.version}</small>`}</div>
@@ -513,6 +536,9 @@ function App() {
         </div>
         ${drawer === 'staged' && html`<${StagedDrawer} draft=${draft} onClose=${() => setDrawer(null)} />`}
         ${drawer === 'suggestions' && html`<${SuggestionsDrawer} draft=${draft} onClose=${() => setDrawer(null)} />`}
+      </div>
+      </div>
+      ${!onWorkspace && html`<${ViewHost} route=${route} />`}
       </div>
       ${previewOpen && html`<${PreviewModal} draft=${draft} onClose=${() => setPreviewOpen(false)} />`}
       <${DialogHost} request=${dialog} />

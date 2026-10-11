@@ -6,7 +6,7 @@ Merge files from Google Drive, Dropbox, OneDrive and iCloud into one place — w
 
 drive-merge runs on your machine. It catalogs **metadata** (never file contents) from every cloud into a local SQLite database via [rclone](https://rclone.org), tells you where each piece of content lives, proves which files are duplicates, proposes a clean folder layout, and — only through simulated, human-approved plans — consolidates everything into one cloud.
 
-Design documents: [docs/DESIGN.md](docs/DESIGN.md) — architecture, safety model, and the open decisions you can adjust — and [docs/WORKSPACE.md](docs/WORKSPACE.md) — the visual workspace. Traditional Chinese versions exist as `docs/*.zh-TW.md`.
+Design documents: [docs/DESIGN.md](docs/DESIGN.md) — architecture, safety model, and the open decisions you can adjust — [docs/WORKSPACE.md](docs/WORKSPACE.md) — the visual workspace — and [docs/EXPLORE.md](docs/EXPLORE.md) — the Overview, Explore and Compare views. Traditional Chinese versions exist as `docs/*.zh-TW.md`.
 
 ## Why it is built this way
 
@@ -68,6 +68,8 @@ drivemerge ui                              # opens http://127.0.0.1:8765/ui/ (on
 ```
 
 Two tree panes show any two places side by side, across clouds. Drag files and folders to better levels, rename, undo and redo, flip between the "after" and "before" views, and take suggestions for related or duplicate folders. Nothing touches a cloud while you drag: the staged moves are previewed through the same simulator as every other plan (before/after per cloud, conflicts, dedupes), and only a typed 8-character approval code starts the execution — and only when `drivemerge ui` runs in your own interactive terminal, outside an AI agent. The page is in English, or in Traditional Chinese when your browser lists a Chinese language; the `EN` / `中文` button switches and is remembered. See [docs/WORKSPACE.md](docs/WORKSPACE.md).
+
+The rail on the left of the page also opens three read-only views that lead into the workspace: **Overview** (how your clouds overlap: an intersection chart of which content lives on which clouds, and what exists on only one), **Explore** (find a file by name or by a query such as `type:pdf not:gdrive copies:1`; identical copies are grouped, with one presence column per cloud) and **Compare** (an aligned diff of any two folders on any clouds: same, different, moved, one side only, with a button that stages a merge into your draft). They never write a cloud or change the catalog. See [docs/EXPLORE.md](docs/EXPLORE.md).
 
 API and MCP:
 

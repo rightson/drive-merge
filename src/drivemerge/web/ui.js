@@ -1,5 +1,6 @@
 // Small shared widgets: modal shell, confirm/prompt dialogs, toast stack.
-import { html, useEffect, useLayoutEffect, useRef, useState } from './vendor/htm-preact-standalone.mjs';
+import { html, useContext, useEffect, useLayoutEffect, useRef, useState } from './vendor/htm-preact-standalone.mjs';
+import { AppCtx } from './ctx.js';
 import { t } from './i18n.js';
 import { Icon } from './icons.js';
 
@@ -103,4 +104,16 @@ export function Toasts({ toasts, dismiss }) {
   return html`<div class="toasts" ref=${box} data-testid="toasts" aria-live="polite" aria-atomic="false">
     ${toasts.map((x) => html`<${Toast} key=${x.id} x=${x} dismiss=${dismiss} />`)}
   </div>`;
+}
+
+/** Title row of the read-only views: heading, the view's own controls, and the language button the topbar has too. */
+export function ViewHeader({ title, hint, children }) {
+  const ctx = useContext(AppCtx);
+  return html`<header class="view-head">
+    <div class="view-title"><h1>${title}</h1>${hint && html`<p>${hint}</p>`}</div>
+    <span class="spacer"></span>
+    ${children}
+    <button class="btn btn-small" data-testid="view-lang" onClick=${ctx.switchLang} title=${t('app.language')}>
+      ${ctx.lang === 'zh-TW' ? 'EN' : '中文'}</button>
+  </header>`;
 }

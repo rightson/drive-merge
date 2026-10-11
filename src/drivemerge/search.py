@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import sqlite3
 import unicodedata
-from typing import Any
+from typing import Any, NamedTuple
 
 HASH_KEYS = ("md5", "sha1", "sha256", "dropbox", "quickxor")
 
@@ -74,20 +74,28 @@ def _like(term: str) -> str:
     return f"%{escaped}%"
 
 
-def search(conn: sqlite3.Connection, q: str | None = None, *, remote: str | None = None,
-           category: str | None = None, ext: str | None = None, min_size: int | None = None,
-           max_size: int | None = None, modified_after: str | None = None,
-           modified_before: str | None = None, path_prefix: str | None = None,
-           include_dirs: bool = False, include_missing: bool = False,
-           duplicates_only: bool = False, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
-    """Search the catalog. Live files only unless the flags say otherwise.
+class Filter(NamedTuple):
+    """A compiled search filter: the FROM clause, WHERE conditions and their parameters, and the order.
 
-    Each whitespace-separated term in `q` must match the name or the path, in
-    either Unicode form (macOS/iCloud store NFD paths); `path_prefix` likewise.
-    Terms of 3+ characters use the trigram FTS index and are ranked by bm25;
-    shorter terms use LIKE and results fall back to remote, path order.
-    `modified_after` is inclusive and `modified_before` exclusive. Size
-    filters apply to files with a known size.
+    `fts` tells whether the query has a full-text term (then `src` is the FTS join and `order` ranks by bm25).
+    """
+    src: str
+    conds: list[str]
+    params: list[Any]
+    order: str
+    fts: bool
+
+
+def build_filter(q: str | None = None, *, remote: str | None = None, category: str | None = None,
+                 ext: str | None = None, min_size: int | None = None, max_size: int | None = None,
+                 modified_after: str | None = None, modified_before: str | None = None,
+                 path_prefix: str | None = None, include_dirs: bool = False,
+                 include_missing: bool = False) -> Filter:
+    """The WHERE builder behind `search` and `explore.explore`, so both match exactly alike.
+
+    Each whitespace-separated term in `q` must match the name or the path, in either Unicode form;
+    `path_prefix` likewise. Terms of 3+ characters use the trigram FTS index (bm25 order), shorter
+    ones use LIKE. `modified_after` is inclusive and `modified_before` exclusive.
     """
     terms = _terms(q)
     conds: list[str] = []
@@ -141,13 +149,35 @@ def search(conn: sqlite3.Connection, q: str | None = None, *, remote: str | None
         conds.append("(" + " OR ".join(["(e.path = ? OR substr(e.path, 1, ?) = ?)"] * len(forms)) + ")")
         for f in forms:
             params += [f, len(f) + 1, f + "/"]
+    return Filter(src, conds, params, order, bool(fts))
+
+
+def search(conn: sqlite3.Connection, q: str | None = None, *, remote: str | None = None,
+           category: str | None = None, ext: str | None = None, min_size: int | None = None,
+           max_size: int | None = None, modified_after: str | None = None,
+           modified_before: str | None = None, path_prefix: str | None = None,
+           include_dirs: bool = False, include_missing: bool = False,
+           duplicates_only: bool = False, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
+    """Search the catalog. Live files only unless the flags say otherwise.
+
+    Each whitespace-separated term in `q` must match the name or the path, in
+    either Unicode form (macOS/iCloud store NFD paths); `path_prefix` likewise.
+    Terms of 3+ characters use the trigram FTS index and are ranked by bm25;
+    shorter terms use LIKE and results fall back to remote, path order.
+    `modified_after` is inclusive and `modified_before` exclusive. Size
+    filters apply to files with a known size.
+    """
+    f = build_filter(q, remote=remote, category=category, ext=ext, min_size=min_size, max_size=max_size,
+                     modified_after=modified_after, modified_before=modified_before, path_prefix=path_prefix,
+                     include_dirs=include_dirs, include_missing=include_missing)
+    conds = list(f.conds)
     if duplicates_only:
         conds.append(_DUPLICATED)
 
     where = " AND ".join(conds) or "1"
-    sql = f"SELECT {_COLS} {src} WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?"
+    sql = f"SELECT {_COLS} {f.src} WHERE {where} ORDER BY {f.order} LIMIT ? OFFSET ?"
     limit = min(max(int(limit), 1), 1000)
-    rows = conn.execute(sql, [*params, limit, max(int(offset), 0)]).fetchall()
+    rows = conn.execute(sql, [*f.params, limit, max(int(offset), 0)]).fetchall()
     return [entry_to_dict(r) for r in rows]
 
 

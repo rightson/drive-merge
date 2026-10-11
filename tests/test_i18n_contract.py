@@ -218,6 +218,22 @@ def test_every_refusal_has_a_sentence_that_uses_only_what_every_site_sends():
             assert placeholders(d[f"err.{code}"]) <= usable, f"{lang} err.{code}: {placeholders(d[f'err.{code}']) - usable}"
 
 
+def test_every_code_the_explore_compare_and_coverage_views_can_raise_has_a_sentence():
+    """CompareError(code, message, **params) is what compare.py, explore.py, coverage.py and the service raise
+    (docs/EXPLORE.md section A); the page words each code from its params in both languages."""
+    sites: dict[str, list[set[str]]] = {}
+    for path in ("compare.py", "explore.py", "coverage.py", "service.py"):
+        for call in calls(path, "CompareError"):
+            sites.setdefault(const(call.args[0]), []).append(keyword_names(call))
+    assert set(sites) == {"NOT_FOUND", "QUARANTINE", "NOT_A_FOLDER", "COMPARE_NESTED", "COMPARE_TOO_LARGE",
+                          "BAD_QUERY"}, sorted(sites)
+    for code, per_site in sites.items():
+        need(f"err.{code}")
+        usable = set.intersection(*per_site)
+        for lang, d in DICTS.items():
+            assert placeholders(d[f"err.{code}"]) <= usable, f"{lang} err.{code}: {placeholders(d[f'err.{code}']) - usable}"
+
+
 def test_the_jobs_and_staged_step_codes_have_sentences():
     for code in ("SRC_NOT_FOUND", "DST_NOT_DIR"):
         need(f"stale.{code}")

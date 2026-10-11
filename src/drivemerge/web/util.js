@@ -58,6 +58,10 @@ export function wordParams(ns, params) {
   for (const k of KIND_PARAMS) {
     if (typeof out[k] === 'string') out[k] = t(`${ns}.${k}.${out[k]}`, out, out[k]);
   }
+  // Which side of a comparison a refusal is about ("left" | "right").
+  if (out.side === 'left' || out.side === 'right') out.side = t(`cmp.side.${out.side}`);
+  if (typeof out.files === 'number') out.files = fmtNum(out.files);
+  if (typeof out.limit === 'number') out.limit = fmtNum(out.limit);
   return out;
 }
 
@@ -229,3 +233,8 @@ export function suggestionText(s) {
     reason: t(`sug.${s.code}.reason`, reason(p), s.reason),
   };
 }
+
+/** "2024-03-01T10:00:00Z" -> "2024-03-01"; "" for a missing time. */
+export const fmtDay = (iso) => (iso ? String(iso).slice(0, 10) : '');
+/** "2024-03-01T10:00:00Z" -> "2024-03-01 10:00" (as the catalog wrote it, not converted). */
+export const fmtDateTime = (iso) => (iso ? String(iso).slice(0, 16).replace('T', ' ') : '');
