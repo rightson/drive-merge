@@ -9,6 +9,7 @@ from __future__ import annotations
 import hmac
 import re
 import threading
+from collections.abc import Callable
 from typing import Any, Literal
 
 import uvicorn
@@ -20,13 +21,10 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from . import __version__, builders, plans
 from .compare import CompareError
 from .config import Config
-from .service import Service, ServiceError
+from .service import Service, ServiceError, scrub_secrets
 
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 _NO_PLAN = re.compile(r"no plan \d+")
-# The first 8 characters of a digest ARE the approval code, and `snapshot` is what the digest binds to.
-# Only the human at the terminal or browser may see them; MCP and the CLI's --json drop them too.
-_SECRET_KEYS = frozenset({"digest", "approval_code", "snapshot"})
 
 
 class _Body(BaseModel):
@@ -51,6 +49,12 @@ class PlanBody(_Body):
     title: str | None = None
 
 
+class EstimateBody(_Body):
+    kind: str
+    params: dict[str, Any] = Field(default_factory=dict)
+    sample: int = Field(default=50, ge=0, le=500)
+
+
 def _check_token(token: str) -> None:
     if not token or not token.strip():
         raise ValueError("the API token is empty; run `drivemerge init` to generate one")
@@ -64,16 +68,6 @@ def _given(**kwargs: Any) -> dict[str, Any]:
 def _csv(value: str | None) -> list[str]:
     """A comma-separated query parameter as a list (empty items dropped)."""
     return [part.strip() for part in (value or "").split(",") if part.strip()]
-
-
-def scrub_secrets(obj: Any) -> Any:
-    """`obj` without approval secrets at any depth, so a caller holding only the API token never learns the
-    code a person is meant to read off their own screen."""
-    if isinstance(obj, dict):
-        return {k: scrub_secrets(v) for k, v in obj.items() if k not in _SECRET_KEYS}
-    if isinstance(obj, (list, tuple)):
-        return [scrub_secrets(v) for v in obj]
-    return obj
 
 
 def _message(exc: Exception) -> str:
@@ -114,6 +108,10 @@ def install_error_handlers(app: FastAPI, *, coded: bool = False) -> None:
     def not_found(_: Request, exc: KeyError) -> JSONResponse:
         return _error(404, _message(exc), code=code("NOT_FOUND"))
 
+    def build_error(_: Request, exc: builders.BuildError) -> JSONResponse:
+        # Always coded, like compare errors: the facts are the same for a script and for the page.
+        return _error(400, _message(exc), code=exc.code, params=exc.params)
+
     def plan_error(_: Request, exc: plans.PlanError) -> JSONResponse:
         missing = _NO_PLAN.fullmatch(str(exc))
         return _error(404 if missing else 400, str(exc), code=code("NOT_FOUND" if missing else "BAD_REQUEST"))
@@ -123,8 +121,9 @@ def install_error_handlers(app: FastAPI, *, coded: bool = False) -> None:
         return _error(exc.status, str(exc), code=exc.code, params=exc.params)
 
     app.add_exception_handler(StarletteHTTPException, http_error)
-    for exc_type in (ValueError, ServiceError, builders.BuildError):  # the last two subclass ValueError
+    for exc_type in (ValueError, ServiceError):  # ServiceError subclasses ValueError
         app.add_exception_handler(exc_type, bad_request)
+    app.add_exception_handler(builders.BuildError, build_error)
     app.add_exception_handler(CompareError, compare_error)
     app.add_exception_handler(plans.PlanError, plan_error)
     app.add_exception_handler(KeyError, not_found)
@@ -154,11 +153,13 @@ def create_app(service: Service, *, token: str) -> FastAPI:
     return app
 
 
-def build_router(service: Service, lock: threading.Lock, *, dependencies: list[Any]) -> APIRouter:
+def build_router(service: Service, lock: threading.Lock, *, dependencies: list[Any],
+                 created_by: Callable[[Request], str] | None = None) -> APIRouter:
     """The /v1 catalog and plan routes. `dependencies` is the auth the including app requires;
     `lock` serialises use of the service's single SQLite connection. Plan responses leave here scrubbed of
     the digest, the approval code and the snapshot: every caller of these routes is a bearer client or a
-    page, and the code reaches a human only through the workspace preview or the CLI."""
+    page, and the code reaches a human only through the workspace preview, the plan review or the CLI.
+    `created_by(request)` names who proposes a plan (default "api"; the UI app says "ui" for a browser session)."""
     api = APIRouter(dependencies=dependencies)
 
     @api.get("/v1/stats")
@@ -262,10 +263,21 @@ def build_router(service: Service, lock: threading.Lock, *, dependencies: list[A
         with lock:
             return {"plans": scrub_secrets(service.plans(status=status, limit=limit))}
 
-    @api.post("/v1/plans", status_code=201)
-    def create_plan(body: PlanBody) -> dict:
+    @api.post("/v1/plans/estimate")
+    def estimate_plan(body: EstimateBody) -> dict:
         with lock:
-            return scrub_secrets(service.propose_plan(body.kind, body.params, created_by="api", title=body.title))
+            return scrub_secrets(service.estimate_plan(body.kind, body.params, sample=body.sample))
+
+    @api.get("/v1/plans/summaries")
+    def plan_summaries(status: str | None = None, limit: int = Query(default=100, ge=1, le=500)) -> dict:
+        with lock:
+            return {"plans": scrub_secrets(service.plan_summaries(status=status or None, limit=limit))}
+
+    @api.post("/v1/plans", status_code=201)
+    def create_plan(body: PlanBody, request: Request) -> dict:
+        with lock:
+            return scrub_secrets(service.propose_plan(body.kind, body.params, title=body.title,
+                                                      created_by=created_by(request) if created_by else "api"))
 
     @api.get("/v1/plans/{plan_id}")
     def get_plan(plan_id: int, ops_limit: int = 200) -> dict:

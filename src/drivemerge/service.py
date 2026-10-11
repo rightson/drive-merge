@@ -31,6 +31,20 @@ PLAN_KINDS = ("dedupe", "consolidate", "reorganize", "manual")
 RESERVED_PARAMS = ("draft_id", "draft_version")
 MAX_COMPARE_FILES = 100000
 MAX_COVERAGE_BARS = 64
+MAX_GROUP_PAGE = 200       # dedupe groups an estimate lists per page
+SAMPLE_SKIPPED = 200       # skipped files a build result hands back
+# The first 8 characters of a digest ARE the approval code, and `snapshot` is what the digest binds to.
+SECRET_KEYS = frozenset({"digest", "approval_code", "snapshot"})
+
+
+def scrub_secrets(obj):
+    """`obj` without approval secrets at any depth, so a caller holding only the API token never learns the
+    code a person is meant to read off their own screen."""
+    if isinstance(obj, dict):
+        return {k: scrub_secrets(v) for k, v in obj.items() if k not in SECRET_KEYS}
+    if isinstance(obj, (list, tuple)):
+        return [scrub_secrets(v) for v in obj]
+    return obj
 
 
 def _plain(obj):
@@ -151,11 +165,20 @@ class Service:
         ids = [db.remote_id(self.conn, r) for r in remotes] if remotes else None
         return dirstats.refresh(self.conn, remote_ids=ids)
 
-    def bridge(self, *, max_bytes: int | None = None, limit: int = 100, progress=None) -> dict:
-        """Download each candidate once (read remote only), hash it, record the bridge, regroup."""
+    def bridge_candidates(self, *, max_bytes: int | None = None, limit: int = 100) -> dict:
+        """How many files `bridge` would download with these limits, and their bytes. Read-only."""
+        found = identity.bridge_candidates(self.conn, max_bytes=max_bytes, limit=limit)
+        return {"count": len(found), "bytes": sum(c.size for c in found)}
+
+    def bridge(self, *, max_bytes: int | None = None, limit: int = 100, progress=None, started=None) -> dict:
+        """Download each candidate once (read remote only), hash it, record the bridge, regroup.
+        `progress(done, failed)` runs after each file; `started(total)` once, with the number of candidates."""
         done, failed = [], []
         with tempfile.TemporaryDirectory(prefix="drivemerge-bridge-") as tmp:
-            for cand in identity.bridge_candidates(self.conn, max_bytes=max_bytes, limit=limit):
+            candidates = identity.bridge_candidates(self.conn, max_bytes=max_bytes, limit=limit)
+            if started:
+                started(len(candidates))
+            for cand in candidates:
                 try:
                     identity.bridge_entry(self.conn, self.rclone, cand.entry_id, tmp)
                     done.append(cand.entry_id)
@@ -170,8 +193,8 @@ class Service:
 
     # ------------------------------------------------------------- propose
 
-    def propose_plan(self, kind: str, params: dict, *, created_by: str, title: str | None = None) -> dict:
-        """Build a plan, persist it as a draft and simulate it. Never touches a cloud."""
+    def _build(self, kind: str, params: dict) -> tuple[builders.BuildResult, dict, str | None]:
+        """Run the builder of `kind`: (result, params without `rules`, the rules text or None). Persists nothing."""
         if kind not in PLAN_KINDS:
             raise ServiceError(f"unknown plan kind {kind!r}; expected one of {PLAN_KINDS}")
         claimed = [k for k in RESERVED_PARAMS if k in params]
@@ -192,16 +215,62 @@ class Service:
                                                **{**quarantine, **params})
         else:
             result = builders.build_manual(self.conn, params.get("ops", []))
+        return result, params, rules_text
+
+    def propose_plan(self, kind: str, params: dict, *, created_by: str, title: str | None = None) -> dict:
+        """Build a plan, persist it as a draft and simulate it. Never touches a cloud."""
+        result, params, rules_text = self._build(kind, params)
         if not result.ops:
-            return {"plan_id": None, "ops": 0, "skipped": result.skipped[:200], "stats": result.stats,
-                    "message": "nothing to do"}
+            return {"plan_id": None, "ops": 0, "skipped": result.skipped[:SAMPLE_SKIPPED], "stats": result.stats,
+                    "message": "nothing to do", "code": "NOTHING_TO_DO"}
         if rules_text is not None:
             params["rules"] = rules_text
         plan_id = plans.create_plan(self.conn, title or f"{kind} plan", kind, result.ops,
                                     created_by=created_by, params=params)
         report = self.simulate(plan_id)
-        return {"plan_id": plan_id, "ops": len(result.ops), "skipped": result.skipped[:200],
+        return {"plan_id": plan_id, "ops": len(result.ops), "skipped": result.skipped[:SAMPLE_SKIPPED],
                 "stats": result.stats, "simulation": report}
+
+    def estimate_plan(self, kind: str, params: dict, *, sample: int = 50) -> dict:
+        """What `propose_plan` would build, without persisting anything (no plan, no simulation, no catalog write).
+
+        `params` are handled exactly as in propose_plan. For dedupe, `group_offset` / `group_limit` (default 0 / 50)
+        page the `groups` list and are not passed to the builder. Each group is {key, size, reclaim, skipped,
+        copies: [{entry_id, remote, path, mtime, keep, remove, usable, why_not}]}, in the builder's order.
+        """
+        params = dict(params)
+        window = None
+        if kind == "dedupe":
+            offset, limit = (params.pop("group_offset", 0), params.pop("group_limit", 50))
+            for name, value, low in (("group_offset", offset, 0), ("group_limit", limit, 1)):
+                if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= 10 ** 9:
+                    raise ServiceError(f"{name} must be an integer of at least {low}")
+            window = (offset, min(limit, MAX_GROUP_PAGE))
+            params["group_window"] = window
+        if isinstance(sample, bool) or not isinstance(sample, int) or sample < 0:
+            raise ServiceError("sample must be a non-negative integer")
+        result, params, _ = self._build(kind, params)
+        names = {r[0]: r[1] for r in self.conn.execute("SELECT id, name FROM remotes")}
+
+        def place(remote_id: int | None, path: str | None) -> dict | None:
+            return None if remote_id is None else {"remote": names.get(remote_id, str(remote_id)), "path": path}
+
+        shown = []
+        for op in result.ops[:sample]:
+            item = {"op": op.op, "src": place(op.src_remote_id, op.src_path), "size": op.expect_size,
+                    "reason": op.reason}
+            if op.dst_remote_id is not None:
+                item["dst"] = place(op.dst_remote_id, op.dst_path)
+            if op.witness_remote_id is not None:
+                item["witness"] = place(op.witness_remote_id, op.witness_path)
+            shown.append(item)
+        out = {"kind": kind, "ops": len(result.ops), "stats": result.stats,
+               "skipped": result.skipped[:SAMPLE_SKIPPED], "skipped_total": len(result.skipped), "sample": shown,
+               "nothing_to_do": not result.ops}
+        if kind == "dedupe":
+            out.update(groups=result.groups, group_offset=window[0], group_limit=window[1],
+                       groups_total=result.stats["groups_examined"])
+        return out
 
     def policy(self) -> simulate.SafetyPolicy:
         """The simulator's safety policy as configured; one place so every caller simulates alike."""
@@ -226,6 +295,31 @@ class Service:
 
     def plans(self, *, status: str | None = None, limit: int = 50) -> list[dict]:
         return _plain(plans.list_plans(self.conn, status=status, limit=limit))
+
+    def plan_summaries(self, status: str | None = None, limit: int = 100) -> list[dict]:
+        """One row per plan for a list view, newest first: the plan's header, its op count, whether its last
+        simulation passed (`ok`, None when it never ran) with the number of violations (`problems`), its
+        scrubbed `params`, the `draft_id` it previews and `outdated`: the catalog was scanned again since that
+        simulation, so it has to be simulated again before it can be approved."""
+        rows = plans.list_plans(self.conn, status=status or None, limit=limit)
+        counts = {r[0]: r[1] for r in self.conn.execute(
+            f"SELECT plan_id, COUNT(*) FROM plan_ops WHERE plan_id IN ({','.join('?' * len(rows))}) GROUP BY plan_id",
+            [p.id for p in rows])} if rows else {}
+        current = db.snapshot(self.conn)
+        out = []
+        for p in rows:
+            sim = plans.latest_simulation(self.conn, p.id)
+            out.append({
+                "id": p.id, "kind": p.kind, "title": p.title, "status": p.status, "created_by": p.created_by,
+                "created_at": p.created_at, "simulated_at": p.simulated_at, "approved_at": p.approved_at,
+                "finished_at": p.finished_at, "ops": counts.get(p.id, 0),
+                "ok": None if sim is None else bool(sim.ok),
+                "problems": 0 if sim is None else sim.violations_total,
+                "params": scrub_secrets(p.params), "draft_id": draft_of(p),
+                "outdated": p.status in ("draft", "simulated", "approved") and p.snapshot is not None
+                            and p.snapshot != current,
+            })
+        return out
 
     def cancel(self, plan_id: int) -> None:
         plans.cancel_plan(self.conn, plan_id)
@@ -315,4 +409,4 @@ class Service:
                                                 older_than_days=older_than_days))
 
 
-__all__ = ["Service", "ServiceError", "PLAN_KINDS", "RESERVED_PARAMS", "draft_of"]
+__all__ = ["Service", "ServiceError", "PLAN_KINDS", "RESERVED_PARAMS", "draft_of", "scrub_secrets"]

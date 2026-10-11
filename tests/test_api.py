@@ -436,7 +436,6 @@ def test_unknown_plan_kind_is_400_from_the_real_service(client):
 
 @pytest.mark.parametrize("exc", [
     plans.PlanError("bad plan"),
-    builders.BuildError("bad ops"),
     ServiceError("bad request"),
     ValueError("bad value"),
 ])
@@ -445,6 +444,16 @@ def test_planning_errors_map_to_400(client, service, monkeypatch, exc):
     r = client.post("/v1/plans", headers=AUTH, json={"kind": "manual"})
     assert r.status_code == 400
     assert r.json() == {"error": str(exc)}
+
+
+def test_build_error_is_answered_coded(client, service, monkeypatch):
+    _record(monkeypatch, service, "propose_plan", raises=builders.BuildError("bad ops"))
+    r = client.post("/v1/plans", headers=AUTH, json={"kind": "manual"})
+    assert (r.status_code, r.json()) == (400, {"error": "bad ops", "code": "BUILD_ERROR"})
+    _record(monkeypatch, service, "propose_plan",
+            raises=builders.BuildError("target 'x' is read-only", "READ_ONLY", remote="x"))
+    r = client.post("/v1/plans", headers=AUTH, json={"kind": "manual"})
+    assert r.json() == {"error": "target 'x' is read-only", "code": "READ_ONLY", "params": {"remote": "x"}}
 
 
 def test_plan_error_from_simulate_is_400(client, service, conn, monkeypatch):

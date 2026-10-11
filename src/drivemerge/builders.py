@@ -32,15 +32,32 @@ _MAX_SUFFIX = 1000     # ' (2)' ... ' (1000)' before a destination is given up o
 _HASH_PREFERENCE = ("sha256", "dropbox", "sha1", "md5", "quickxor")
 
 
+# Why a file is left alone, as a code the page words (skip.<CODE> in web/i18n.js). A skipped entry carries
+# `entry_id`, `location` ("remote:path"), `code`, its English `reason` and, for LAYOUT_*, `dest` ("remote:path").
+# The last two are not skips but the `why_not` of a dedupe group's copy that cannot be the kept one (they share
+# the dictionary): QUARANTINE (inside the quarantine folder) and OTHER_CLOUD (on a cloud this plan does not thin).
+SKIP_CODES = ("READ_ONLY", "AMBIGUOUS_PATH", "NATIVE_DOC", "SIZE_UNKNOWN", "PROBABLE_ONLY", "LAYOUT_BLOCKED",
+              "LAYOUT_TAKEN", "QUARANTINE", "OTHER_CLOUD")
+# Every `why_not` of Service.estimate_plan's group copies.
+NOT_KEEPABLE_CODES = ("QUARANTINE", "NATIVE_DOC", "AMBIGUOUS_PATH", "OTHER_CLOUD")
+
+
 @dataclass
 class BuildResult:
     ops: list[Op] = field(default_factory=list)
-    skipped: list[dict] = field(default_factory=list)   # {"entry_id"?, "location", "reason"}
+    skipped: list[dict] = field(default_factory=list)   # {"entry_id"?, "location", "code", "reason", "dest"?}
     stats: dict = field(default_factory=dict)
+    groups: list[dict] = field(default_factory=list)    # dedupe only, and only for a requested `group_window`
 
 
 class BuildError(ValueError):
-    pass
+    """A request a builder refuses. `code` is machine-readable and `params` hold the facts the message was made
+    from, so that the page can word it in its own language; str(e) is the English sentence."""
+
+    def __init__(self, message: str, code: str = "BUILD_ERROR", **params: Any):
+        super().__init__(message)
+        self.code = code
+        self.params = params
 
 
 def best_hash(row) -> str | None:
@@ -54,12 +71,12 @@ def best_hash(row) -> str | None:
 def parse_location(conn: sqlite3.Connection, loc: str) -> tuple[int, str]:
     """'gdrive:Photos/a.jpg' -> (remote_id, 'Photos/a.jpg'). Remote names never contain ':'."""
     if ":" not in loc:
-        raise BuildError(f"expected '<remote>:<path>', got {loc!r}")
+        raise BuildError(f"expected '<remote>:<path>', got {loc!r}", "BAD_LOCATION", location=loc)
     name, path = loc.split(":", 1)
     try:
         return db.remote_id(conn, name), path.strip("/")
     except KeyError as e:
-        raise BuildError(str(e)) from None
+        raise BuildError(str(e), "UNKNOWN_REMOTE", remote=name) from None
 
 
 def _live_files_at(conn: sqlite3.Connection, rid: int, path: str) -> list[sqlite3.Row]:
@@ -102,14 +119,14 @@ def build_manual(conn: sqlite3.Connection, specs: list[dict]) -> BuildResult:
     for i, spec in enumerate(specs, start=1):
         kind = spec.get("op")
         if kind not in ("copy", "move", "delete"):
-            raise BuildError(f"op #{i}: 'op' must be copy, move or delete")
+            raise BuildError(f"op #{i}: 'op' must be copy, move or delete", "BAD_OP", index=i)
         if "src" not in spec:
-            raise BuildError(f"op #{i}: missing 'src'")
+            raise BuildError(f"op #{i}: missing 'src'", "MISSING_SRC", index=i)
         src_rid, src_path = parse_location(conn, spec["src"])
         dst = parse_location(conn, spec["dst"]) if spec.get("dst") else None
         wit = parse_location(conn, spec["witness"]) if spec.get("witness") else None
         if kind in ("copy", "move") and dst is None:
-            raise BuildError(f"op #{i}: {kind} needs 'dst'")
+            raise BuildError(f"op #{i}: {kind} needs 'dst'", "MISSING_DST", index=i, op=kind)
         reason = spec.get("reason")
 
         def make(row, rel: str | None):
@@ -285,7 +302,7 @@ def _named(remotes: Mapping[int, _Remote], name: str) -> _Remote:
     for r in remotes.values():
         if r.name == name:
             return r
-    raise BuildError(f"unknown remote {name!r}")
+    raise BuildError(f"unknown remote {name!r}", "UNKNOWN_REMOTE", remote=name)
 
 
 def _names(remotes: Mapping[int, _Remote], names: Iterable[str] | str | None) -> list[_Remote]:
@@ -362,8 +379,15 @@ def _rows_by_id(conn: sqlite3.Connection, ids: Iterable[int]) -> dict[int, sqlit
     return out
 
 
-def _skip(result: BuildResult, f: _File, reason: str) -> None:
-    result.skipped.append({"entry_id": f.entry_id, "location": f.loc, "reason": reason})
+def _skip(result: BuildResult, f: _File, reason: str, code: str, **extra: Any) -> None:
+    result.skipped.append({"entry_id": f.entry_id, "location": f.loc, "code": code, "reason": reason, **extra})
+
+
+def _skipped_by_reason(result: BuildResult) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for s in result.skipped:
+        counts[s["code"]] = counts.get(s["code"], 0) + 1
+    return counts
 
 
 class _Namespace:
@@ -448,6 +472,11 @@ def _unplaceable(remote: str, dest: str, status: str) -> str:
     return f"cannot be placed at {remote}:{dest}: {what}"
 
 
+def _skip_unplaceable(result: BuildResult, f: _File, remote: str, dest: str, status: str) -> None:
+    _skip(result, f, _unplaceable(remote, dest, status), "LAYOUT_BLOCKED" if status == "blocked" else "LAYOUT_TAKEN",
+          dest=f"{remote}:{dest}")
+
+
 def _namespace(conn: sqlite3.Connection, remote: _Remote, files: Iterable[_File]) -> _Namespace:
     ns = _Namespace(remote.ci)
     for (path,) in conn.execute("SELECT path FROM entries WHERE remote_id = ? AND present = 1 AND is_dir = 1",
@@ -462,7 +491,9 @@ def _namespace(conn: sqlite3.Connection, remote: _Remote, files: Iterable[_File]
 
 def build_dedupe(conn: sqlite3.Connection, *, remote: str | None = None, cross_remote: bool = False,
                  path_prefix: str | None = None, min_size: int = 1, prefer_remotes: Sequence[str] = (),
-                 limit_groups: int | None = None, quarantine_dir: str = DEFAULT_QUARANTINE) -> BuildResult:
+                 limit_groups: int | None = None, quarantine_dir: str = DEFAULT_QUARANTINE,
+                 keep: Mapping[str, int] | None = None, skip_groups: Sequence[str] = (),
+                 group_window: tuple[int, int] | None = None) -> BuildResult:
     """Delete redundant exact copies, always keeping one per content (and per remote, unless cross_remote).
 
     Without cross_remote each remote is thinned on its own: the keeper (choose_keeper) stays and the
@@ -473,6 +504,14 @@ def build_dedupe(conn: sqlite3.Connection, *, remote: str | None = None, cross_r
     at ambiguous Drive paths, native docs and quarantined files are never touched; the first two
     are reported in `skipped`. Only exact groups are used: a probable duplicate is never a reason to delete.
     `limit_groups` stops after that many groups produced a delete.
+
+    `keep` maps a group key ('g:<content_group>') to the entry id that must be kept instead of the policy's
+    choice, in the pool that holds it (the cloud's own copies, or the whole group with cross_remote); other
+    pools follow the policy. It must be a copy the builder could have kept (BAD_KEEPER {group, entry_id}
+    otherwise: not in the group, on a cloud this plan does not thin, quarantined, a native doc or at an
+    ambiguous path). `skip_groups` lists group keys that produce no ops. A key that names no group of this
+    build is BAD_GROUP {group}. `group_window` = (offset, count) fills `BuildResult.groups` with the details
+    of that slice of the examined groups, in build order (Service.estimate_plan pages them).
     """
     remotes = _remote_map(conn)
     only = _named(remotes, remote) if remote is not None else None
@@ -481,10 +520,13 @@ def build_dedupe(conn: sqlite3.Connection, *, remote: str | None = None, cross_r
     min_size = 1 if min_size is None else min_size
     in_quarantine = _quarantine_test(quarantine_dir)
     providers = _provider_map(remotes)
+    keep, skip = _group_overrides(keep, skip_groups)
     result = BuildResult()
     ambiguous: dict[int, set[str]] = {}
-    examined = made = reclaimed = 0
+    seen: set[str] = set()
+    examined = made = reclaimed = considered = 0
     offset = 0
+    stopped = False
     while limit_groups is None or made < limit_groups:
         groups = identity.duplicate_groups(
             conn, confidence="exact", remote=only.name if only else None, path_prefix=prefix or None,
@@ -495,9 +537,25 @@ def build_dedupe(conn: sqlite3.Connection, *, remote: str | None = None, cross_r
         rows = _rows_by_id(conn, (c.entry_id for g in groups for c in g.copies))
         for g in groups:
             if limit_groups is not None and made >= limit_groups:
+                stopped = True
                 break
+            seen.add(g.key)
+            position = examined
             examined += 1
-            copies = [c for c in g.copies if not in_quarantine(c.path) and not rows[c.entry_id]["is_native_doc"]]
+            watch = group_window is not None and group_window[0] <= position < group_window[0] + group_window[1]
+            why_not = {c.entry_id: _not_keepable(conn, c, rows[c.entry_id], in_quarantine, ambiguous,
+                                                 None if cross_remote else only)
+                       for c in g.copies}
+            forced = keep.get(g.key)
+            if forced is not None and (forced not in why_not or why_not[forced] is not None):
+                raise BuildError(f"entry {forced} cannot be kept for group {g.key}: it is not a usable copy there",
+                                 "BAD_KEEPER", group=g.key, entry_id=forced)
+            if g.key in skip:
+                if watch:
+                    result.groups.append(_group_detail(g, why_not, set(), set(), skipped=True))
+                continue
+            copies = [c for c in g.copies if why_not[c.entry_id] not in ("QUARANTINE", "NATIVE_DOC")]
+            considered += len(copies)
             if cross_remote:
                 pools = [copies]
             else:
@@ -507,48 +565,110 @@ def build_dedupe(conn: sqlite3.Connection, *, remote: str | None = None, cross_r
                         by_remote[c.remote_id].append(c)
                 pools = [by_remote[rid] for rid in sorted(by_remote)]
             before = len(result.ops)
+            kept: set[int] = set()
+            removed: set[int] = set()
             for pool in pools:
-                for victim, keeper in _dedupe_pool(conn, pool, prefer, providers, prefix, remotes, ambiguous, result):
+                pairs, keeper = _dedupe_pool(conn, pool, prefer, providers, prefix, remotes, ambiguous, result,
+                                             forced)
+                if keeper is not None:
+                    kept.add(keeper.entry_id)
+                for victim, keeper in pairs:
                     row = rows[victim.entry_id]
                     result.ops.append(op_from_entry(
                         row, "delete", witness_remote_id=keeper.remote_id, witness_path=keeper.path,
                         reason=f"duplicate of {keeper.remote}:{keeper.path}"))
                     reclaimed += victim.size
+                    removed.add(victim.entry_id)
             made += len(result.ops) > before
+            if watch:
+                result.groups.append(_group_detail(g, why_not, kept, removed, skipped=False))
+    if not stopped:  # a key may name a group the loop never reached only when limit_groups stopped it early
+        for key in (*keep, *skip):
+            if key not in seen:
+                raise BuildError(f"{key} is not a duplicate group of this plan", "BAD_GROUP", group=key)
     result.stats = {"groups_examined": examined, "groups": made, "deletes": len(result.ops),
-                    "bytes_reclaimed": reclaimed, "skipped": len(result.skipped)}
+                    "bytes_reclaimed": reclaimed, "skipped": len(result.skipped), "copies_considered": considered,
+                    "skipped_by_reason": _skipped_by_reason(result)}
     return result
+
+
+def _group_overrides(keep: Mapping[str, int] | None, skip_groups: Sequence[str]) -> tuple[dict[str, int], set[str]]:
+    """The validated `keep` and `skip_groups` arguments of build_dedupe (they arrive from JSON)."""
+    if keep is not None and not isinstance(keep, Mapping):
+        raise BuildError("keep must map group keys to entry ids", "BAD_PARAM", param="keep")
+    if isinstance(skip_groups, str) or not all(isinstance(k, str) for k in skip_groups or ()):
+        raise BuildError("skip_groups must be a list of group keys", "BAD_PARAM", param="skip_groups")
+    for group, entry_id in (keep or {}).items():
+        if not isinstance(group, str) or isinstance(entry_id, bool) or not isinstance(entry_id, int):
+            raise BuildError(f"keep[{group!r}] must be an entry id", "BAD_KEEPER", group=str(group),
+                             entry_id=entry_id if isinstance(entry_id, (int, str)) else None)
+    return dict(keep or {}), set(skip_groups or ())
+
+
+def _not_keepable(conn: sqlite3.Connection, c: identity.Copy, row: sqlite3.Row, in_quarantine: Callable[[str], bool],
+                  ambiguous: dict[int, set[str]], only: _Remote | None) -> str | None:
+    """Code (NOT_KEEPABLE_CODES) of the reason this copy can never be the kept one of its pool, else None.
+    `only` is the single cloud a per-cloud dedupe is restricted to."""
+    if in_quarantine(c.path):
+        return "QUARANTINE"
+    if row["is_native_doc"]:
+        return "NATIVE_DOC"
+    if c.remote_id not in ambiguous:
+        ambiguous[c.remote_id] = _ambiguous_paths(conn, c.remote_id)
+    if c.path in ambiguous[c.remote_id]:
+        return "AMBIGUOUS_PATH"
+    if only is not None and c.remote_id != only.id:
+        return "OTHER_CLOUD"
+    return None
+
+
+def _group_detail(g: identity.DupGroup, why_not: Mapping[int, str | None], kept: set[int], removed: set[int], *,
+                  skipped: bool) -> dict:
+    return {"key": g.key, "size": g.size, "skipped": skipped,
+            "reclaim": 0 if skipped else sum(c.size for c in g.copies if c.entry_id in removed),
+            "copies": [{"entry_id": c.entry_id, "remote": c.remote, "path": c.path, "mtime": c.mtime,
+                        "keep": c.entry_id in kept, "remove": c.entry_id in removed,
+                        "usable": why_not[c.entry_id] is None, "why_not": why_not[c.entry_id]}
+                       for c in g.copies]}
 
 
 def _dedupe_pool(conn: sqlite3.Connection, pool: list[identity.Copy], prefer: list[str],
                  providers: Mapping[str | int, str], prefix: str, remotes: Mapping[int, _Remote],
-                 ambiguous: dict[int, set[str]], result: BuildResult) -> list[tuple[identity.Copy, identity.Copy]]:
-    """(victim, keeper) pairs for one set of identical copies; records what it will not touch."""
-    if len(pool) < 2:
-        return []
+                 ambiguous: dict[int, set[str]], result: BuildResult, forced: int | None = None,
+                 ) -> tuple[list[tuple[identity.Copy, identity.Copy]], identity.Copy | None]:
+    """((victim, keeper) pairs, keeper) for one set of identical copies; records what it will not touch.
+
+    The keeper is `forced` (an entry id) when this pool holds it, else the policy's choice; None when no copy of
+    the pool is usable."""
     amb: list[identity.Copy] = []
     usable: list[identity.Copy] = []
     for c in pool:
         if c.remote_id not in ambiguous:
             ambiguous[c.remote_id] = _ambiguous_paths(conn, c.remote_id)
         (amb if c.path in ambiguous[c.remote_id] else usable).append(c)
+    if len(pool) < 2:
+        return [], (usable[0] if usable else None)
     for c in amb:
         if _in_prefix(c.path, prefix):
             result.skipped.append({"entry_id": c.entry_id, "location": f"{c.remote}:{c.path}",
-                                   "reason": "ambiguous path"})
+                                   "code": "AMBIGUOUS_PATH", "reason": "ambiguous path"})
+    if not usable:
+        return [], None
+    keeper = next((c for c in usable if c.entry_id == forced), None) if forced is not None else None
+    if keeper is None:
+        keeper = choose_keeper(usable, prefer_remotes=prefer, providers=providers)
     if len(usable) < 2:
-        return []
-    keeper = choose_keeper(usable, prefer_remotes=prefer, providers=providers)
+        return [], keeper
     pairs = []
     for c in usable:
         if c is keeper or not _in_prefix(c.path, prefix):
             continue
         if not remotes[c.remote_id].writable:
             result.skipped.append({"entry_id": c.entry_id, "location": f"{c.remote}:{c.path}",
-                                   "reason": "read-only remote"})
+                                   "code": "READ_ONLY", "reason": "read-only remote"})
             continue
         pairs.append((c, keeper))
-    return pairs
+    return pairs, keeper
 
 
 # --------------------------------------------------------------------------- consolidate
@@ -621,8 +741,8 @@ class _Consolidation:
 
     # ------------------------------------------------------------ small helpers
 
-    def _skip(self, f: _File, reason: str) -> None:
-        _skip(self.result, f, reason)
+    def _skip(self, f: _File, reason: str, code: str) -> None:
+        _skip(self.result, f, reason, code)
 
     def _row(self, f: _File) -> sqlite3.Row:
         return self.conn.execute("SELECT * FROM entries WHERE id = ?", (f.entry_id,)).fetchone()
@@ -650,7 +770,7 @@ class _Consolidation:
         return self._probable.get((f.size, f.name_norm), [])
 
     def _unplaced(self, f: _File, dest: str, status: str) -> None:
-        self._skip(f, _unplaceable(self.tgt.name, dest, status))
+        _skip_unplaceable(self.result, f, self.tgt.name, dest, status)
 
     # ------------------------------------------------------------ op makers
 
@@ -684,11 +804,11 @@ class _Consolidation:
         by_key: dict[str, _Content] = {}
         for f in self.sfiles:
             if f.native:
-                self._skip(f, "native doc: no bytes to copy, and deleting it is unverifiable")
+                self._skip(f, "native doc: no bytes to copy, and deleting it is unverifiable", "NATIVE_DOC")
             elif f.path in self.s_amb[f.remote_id]:
-                self._skip(f, "ambiguous path")
+                self._skip(f, "ambiguous path", "AMBIGUOUS_PATH")
             elif f.size is None:
-                self._skip(f, "size unknown")
+                self._skip(f, "size unknown", "SIZE_UNKNOWN")
             else:
                 by_key.setdefault(f.key, _Content(f.key)).s.append(f)
         alone = self.reorganize_target or self.delete_sources   # target-only contents have work to do
@@ -762,7 +882,7 @@ class _Consolidation:
                                       providers=self.providers) if free else None
                 where = self.final.get(match.entry_id, match.path) if match else None
                 if match is None or not self.include_probable or _fold(posixpath.basename(where)) != first.name_norm:
-                    self._skip(first, _NEEDS_BRIDGING)
+                    self._skip(first, _NEEDS_BRIDGING, "PROBABLE_ONLY")
                     c.s = []
                     return
                 self._claimed.add(match.entry_id)
@@ -811,7 +931,7 @@ class _Consolidation:
             if loc is None:
                 continue
             if not self.remotes[f.remote_id].writable:
-                self._skip(f, "read-only remote")
+                self._skip(f, "read-only remote", "READ_ONLY")
                 continue
             self._delete(f, loc, "copy kept at")
         if c.primary is None:
@@ -845,8 +965,11 @@ class _Consolidation:
             "contents": len(contents) + self.idle,
             "already_on_target": self.idle + sum(1 for c in contents if c.t or c.probable),
             "to_copy": len(self.copies),
-            "bytes_to_copy": sum(op.expect_size or 0 for op in self.copies), "moves": len(self.moves),
+            "bytes_to_copy": sum(op.expect_size or 0 for op in self.copies),
+            "bytes_cross_remote": sum(op.expect_size or 0 for op in self.copies if op.dst_remote_id != op.src_remote_id),
+            "moves": len(self.moves), "moves_on_target": len(self.moves),
             "deletes": len(self.deletes), "skipped": len(self.result.skipped),
+            "skipped_by_reason": _skipped_by_reason(self.result),
         }
         return self.result
 
@@ -872,7 +995,7 @@ def build_consolidate(conn: sqlite3.Connection, *, target: str, target_root: str
     remotes = _remote_map(conn)
     tgt = _named(remotes, target)
     if not tgt.writable:
-        raise BuildError(f"target {target!r} is read-only (no write_remote configured)")
+        raise BuildError(f"target {target!r} is read-only (no write_remote configured)", "READ_ONLY", remote=target)
     srcs = [r for r in (_names(remotes, sources) if sources else remotes.values()) if r.id != tgt.id]
     prefer = [r.name for r in _names(remotes, prefer_remotes)]
     run = _Consolidation(
@@ -897,7 +1020,7 @@ def build_reorganize(conn: sqlite3.Connection, *, remote: str, ruleset: classify
     remotes = _remote_map(conn)
     rem = _named(remotes, remote)
     if not rem.writable:
-        raise BuildError(f"remote {remote!r} is read-only (no write_remote configured)")
+        raise BuildError(f"remote {remote!r} is read-only (no write_remote configured)", "READ_ONLY", remote=remote)
     prefix = _clean_prefix(path_prefix)
     files = {f.entry_id: f for f in _load_files(conn, rem, prefix="", in_quarantine=_quarantine_test(quarantine_dir))}
     ns = _namespace(conn, rem, files.values())
@@ -912,7 +1035,7 @@ def build_reorganize(conn: sqlite3.Connection, *, remote: str, ruleset: classify
             continue
         examined += 1
         if f.path in ambiguous:
-            _skip(result, f, "ambiguous path")
+            _skip(result, f, "ambiguous path", "AMBIGUOUS_PATH")
             continue
         if ns.same_path(f.path, p.target_path):
             in_place += 1
@@ -921,7 +1044,7 @@ def build_reorganize(conn: sqlite3.Connection, *, remote: str, ruleset: classify
         if status == "inplace":
             in_place += 1
         elif status in ("blocked", "full"):
-            _skip(result, f, _unplaceable(rem.name, p.target_path, status))
+            _skip_unplaceable(result, f, rem.name, p.target_path, status)
         else:
             op = op_from_entry(conn.execute("SELECT * FROM entries WHERE id = ?", (f.entry_id,)).fetchone(), "move",
                                dst_remote_id=rem.id, dst_path=final, reason=f"reorganize ({p.rule})")
