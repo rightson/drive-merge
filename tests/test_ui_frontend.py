@@ -164,6 +164,23 @@ CATALOG = [
 ]
 
 
+# Duplicate groups as Service.estimate_plan sees them: every live copy with the reason it could not be kept, if any.
+def _copy(entry_id: int, remote: str, path: str, why_not: str | None = None) -> dict:
+    return {"entry_id": entry_id, "remote": remote, "path": path, "mtime": "2023-06-01T10:00:00Z", "why_not": why_not}
+
+
+DUP_GROUPS = [
+    {"key": "g:11", "size": 4_100_000, "copies": [_copy(201, "gdrive", "Photos/2019/IMG_0412.jpg"),
+                                                   _copy(202, "gdrive", "Backup/IMG_0412 (1).jpg"),
+                                                   _copy(203, "dropbox", "Photos/IMG_0412.jpg")]},
+    {"key": "g:12", "size": 52_000, "copies": [_copy(204, "gdrive", "學校/report.pdf"),
+                                                _copy(205, "gdrive", "Backup/report.pdf", "AMBIGUOUS_PATH"),
+                                                _copy(206, "gdrive", "Old/report.pdf")]},
+    {"key": "g:13", "size": 9_000_000, "copies": [_copy(207, "dropbox", "Archive/old.zip"), _copy(208, "dropbox", "Archive/old (copy).zip"),
+                                                   _copy(209, "dropbox", f"{QUARANTINE}/3/old.zip", "QUARANTINE")]},
+]
+
+
 def _join(base: str, name: str) -> str:
     return f"{base}/{name}" if base else name
 
@@ -228,6 +245,14 @@ class MockApi:
         self.unique_names: set[str] = {"figure3.png"}  # one-side files whose content exists nowhere else
         self.explore_fail: tuple[str, dict] | None = None  # (code, params): /v1/explore refuses with a 400
         self.session_open = False
+        self.remotes = copy.deepcopy(REMOTES)       # what /v1/ui/config reports (a test may add a read-only cloud)
+        self.plans: dict[int, dict] = {}            # the Plans view: summaries plus each plan's ops and simulation
+        self.next_plan_id = 20
+        self.dup_groups = copy.deepcopy(DUP_GROUPS)
+        self.estimate_delay: Any = None             # (n) -> seconds a canned estimate answer is held back (see delay_estimate)
+        self.bridge_candidates = {"count": 3, "bytes": 2_400_000}
+        self.bridge_polls = 0
+        self.apply_draft_on_done = True
         self.next_draft_id = 1
         self.next_action_id = 1
         self.draft = self._new_draft("整理 測試")
@@ -522,7 +547,7 @@ class MockApi:
             if not self.session_open:
                 return 401, {"error": "missing or invalid credentials", "code": "UNAUTHENTICATED"}
             return 200, {"approvals_enabled": self.approvals_enabled, "execution_enabled": self.execution_enabled,
-                         "remotes": REMOTES, "version": "0.1.0", "csrf": self.CSRF, "outdated": self.outdated}
+                         "remotes": self.remotes, "version": "0.1.0", "csrf": self.CSRF, "outdated": self.outdated}
         if (method, path) == ("GET", "/v1/tree/roots"):
             return 200, {"roots": self.roots()}
         if (method, path) == ("GET", "/v1/tree"):
@@ -599,16 +624,25 @@ class MockApi:
                     return 403, {"error": "the code does not match"}
                 return 200, {"ok": True}
             self.job_polls = 0
+            self.apply_draft_on_done = m.group(1) == "7"       # a plan of the Plans view does not close the draft
+            if m.group(1) != "7" and int(m.group(1)) in self.plans:
+                self.plans[int(m.group(1))]["status"] = "approved"
             return 202, {"job_id": "job-1"}
         if (method, path) == ("POST", "/v1/ui/rescan"):
             return 202, {"job_id": "job-2"}
         m = re.fullmatch(r"/v1/jobs/(job-\d)", path)
         if m:
+            if m.group(1) == "job-3":
+                self.bridge_polls += 1
+                done = self.bridge_polls >= 3
+                return 200, {"id": "job-3", "kind": "bridge", "status": "done" if done else "running",
+                             "progress": {"bridged": min(3, self.bridge_polls), "failed": 0, "total": 3},
+                             "result": {"bridged": 3, "failed": [], "groups": {}} if done else None, "error": None}
             if m.group(1) == "job-2":
                 return 200, {"id": "job-2", "kind": "rescan", "status": "done", "progress": {}, "result": {}, "error": None}
             self.job_polls += 1
             done = self.job_polls >= 3
-            if done:
+            if done and self.apply_draft_on_done:
                 self.draft["status"] = "applied"
             return 200, {"id": "job-1", "kind": "execute", "status": "done" if done else "running", "progress": {},
                          "result": {"status": "executed"} if done else None, "error": None}
@@ -618,7 +652,205 @@ class MockApi:
                          "current": None if n == 4 else {"op": "copy", "src": {"remote": "gdrive", "path": "研究/資料/survey.csv"},
                                                          "dst": {"remote": "dropbox", "path": "學校/資料/survey.csv"}},
                          "recent_journal": []}
+        planned = self.plan_routes(method, path, q, body)
+        if planned is not None:
+            return planned
         return 404, {"error": f"unmocked {method} {path}"}
+
+
+    # ------------------------------------------------------------------ Plans (docs/PLANS.md section C)
+    def add_plan(self, *, kind: str = "dedupe", status: str = "simulated", created_by: str = "api", ok: bool | None = True,
+                 problems: int = 0, ops: int = 4, params: dict | None = None, title: str | None = None, outdated: bool = False,
+                 violations: list | None = None, draft_id: int | None = None, op_rows: list | None = None) -> int:
+        pid = self.next_plan_id
+        self.next_plan_id += 1
+        rows = op_rows if op_rows is not None else [
+            {"seq": i + 1, "op": "delete", "src_remote_id": 1, "src_path": f"Backup/copy {i}.jpg", "src_entry_id": 300 + i,
+             "witness_remote_id": 1, "witness_path": f"Photos/copy {i}.jpg", "expect_size": 1_000_000, "reason": "duplicate of gdrive:Photos"}
+            for i in range(ops)]
+        self.plans[pid] = {
+            "id": pid, "kind": kind, "title": title or f"{kind} test", "status": status, "created_by": created_by,
+            "created_at": "2024-03-01T10:00:00Z", "simulated_at": "2024-03-01T10:00:05Z" if ok is not None else None,
+            "approved_at": None, "finished_at": "2024-03-01T11:00:00Z" if status in ("done", "failed", "cancelled") else None,
+            "ops": ops, "ok": ok, "problems": problems, "params": params or {}, "draft_id": draft_id, "outdated": outdated,
+            "_ops": rows, "_violations": violations or []}
+        return pid
+
+    def summaries(self, q: dict) -> list[dict]:
+        rows = [{k: v for k, v in p.items() if not k.startswith("_")} for p in sorted(self.plans.values(), key=lambda p: -p["id"])]
+        return [r for r in rows if not q.get("status") or r["status"] == q["status"]][: int(q.get("limit", 100))]
+
+    def simulation(self, p: dict) -> dict:
+        violations = p["_violations"]
+        deletes = sum(1 for o in p["_ops"] if o["op"] == "delete")
+        return {"plan_id": p["id"], "ok": not violations and p["ok"] is not False, "violations": violations, "warnings": [],
+                "violations_total": len(violations),
+                "remotes": [{"remote_id": 1, "remote": "gdrive", "files_before": 6 + deletes, "bytes_before": 6_603_000 + deletes * 1_000_000, "files_after": 6,
+                             "bytes_after": 6_603_000, "bytes_in": 0, "files_quarantined": deletes,
+                             "bytes_quarantined": deletes * 1_000_000}],
+                "contents_before": 9, "contents_after": 9, "contents_lost": 0, "bytes_cross_remote": p.get("_cross", 0),
+                "op_counts": {k: sum(1 for o in p["_ops"] if o["op"] == k) for k in ("copy", "move", "delete") if any(o["op"] == k for o in p["_ops"])},
+                "sample": []}
+
+    def plan_json(self, p: dict, limit: int = 200) -> dict:
+        d = {k: v for k, v in p.items() if not k.startswith("_") and k not in ("ok", "problems", "outdated", "ops")}
+        d["ops_total"] = len(p["_ops"])
+        d["ops"] = p["_ops"][:limit]
+        d["simulation"] = self.simulation(p) if p["ok"] is not None else None
+        return d
+
+    def plan_routes(self, method: str, path: str, q: dict, body: Any) -> tuple[int, Any] | None:
+        if (method, path) == ("GET", "/v1/plans/summaries"):
+            return 200, {"plans": self.summaries(q)}
+        if (method, path) == ("POST", "/v1/plans/estimate"):
+            return self.estimate(body["kind"], body.get("params", {}))
+        if (method, path) == ("POST", "/v1/plans"):
+            status, est = self.estimate(body["kind"], body.get("params", {}))
+            if status != 200:
+                return status, est
+            if not est["ops"]:
+                return 200, {"plan_id": None, "ops": 0, "message": "nothing to do", "code": "NOTHING_TO_DO", "skipped": [], "stats": est["stats"]}
+            params = {k: v for k, v in body["params"].items() if k not in ("group_offset", "group_limit")}
+            pid = self.add_plan(kind=body["kind"], created_by="ui", ops=est["ops"], params=params, status="simulated")
+            return 200, {"plan_id": pid, "ops": est["ops"], "status": "simulated", "simulation": {"ok": True, "violations": []}}
+        m = re.fullmatch(r"/v1/plans/(\d+)", path)
+        if m and method == "GET":
+            p = self.plans.get(int(m.group(1)))
+            return (200, self.plan_json(p)) if p else (404, {"error": "no plan", "code": "NOT_FOUND"})
+        m = re.fullmatch(r"/v1/ui/plans/(\d+)/(review|cancel)", path)
+        if m and method == "POST":
+            p = self.plans.get(int(m.group(1)))
+            if p is None:
+                return 404, {"error": "no plan", "code": "NOT_FOUND"}
+            if m.group(2) == "review":
+                if p["status"] not in ("draft", "simulated", "approved"):
+                    return 409, {"error": "closed", "code": "PLAN_CLOSED", "params": {"plan": p["id"], "plan_status": p["status"]}}
+                p["ok"] = not p["_violations"]
+                p["problems"] = len(p["_violations"])
+                d = self.plan_json(p)
+                if self.approvals_enabled and d["simulation"]["ok"]:
+                    d["approval_code"] = self.CODE
+                return 200, d
+            if p["status"] in ("done", "executing"):
+                return 409, {"error": "closed", "code": "PLAN_CLOSED", "params": {"plan": p["id"], "plan_status": p["status"]}}
+            p["status"] = "cancelled"
+            return 200, {"ok": True}
+        if (method, path) == ("GET", "/v1/ui/bridge/candidates"):
+            return 200, self.bridge_candidates
+        if (method, path) == ("POST", "/v1/ui/bridge"):
+            self.bridge_polls = 0
+            return 202, {"job_id": "job-3"}
+        return None
+
+    def estimate(self, kind: str, params: dict) -> tuple[int, dict]:
+        if self.estimate_delay is not None:
+            self.estimate_delay(params)
+        order = self._remote_names()
+        for key in ("remote", "target"):
+            name = params.get(key)
+            if name and name not in [r["name"] for r in self.remotes]:
+                return 400, {"error": f"unknown remote {name!r}", "code": "UNKNOWN_REMOTE", "params": {"remote": name}}
+        writable = {r["name"] for r in self.remotes if r.get("writable", True)}
+        return self._dedupe(params) if kind == "dedupe" else self._consolidate(params, order, writable)
+
+    def _dedupe(self, q: dict) -> tuple[int, dict]:
+        prefix = (q.get("path_prefix") or "").strip("/")
+        keep, skip = q.get("keep") or {}, set(q.get("skip_groups") or [])
+        across = bool(q.get("cross_remote"))
+        prefer = q.get("prefer_remotes") or []
+        shown, ops, reclaimed, skipped, by_reason = [], 0, 0, [], {}
+        keys = {g["key"] for g in self.dup_groups}
+        for key in skip:
+            if key not in keys:
+                return 400, {"error": f"{key} is not a duplicate group", "code": "BAD_GROUP", "params": {"group": key}}
+        for g in self.dup_groups:
+            if q.get("remote") and not any(c["remote"] == q["remote"] for c in g["copies"]):
+                continue
+            if g["size"] < (q.get("min_size") or 1):
+                continue
+            pools: dict[str, list[dict]] = {}
+            for c in g["copies"]:
+                if q.get("remote") and not across and c["remote"] != q["remote"]:
+                    continue
+                pools.setdefault("*" if across else c["remote"], []).append(c)
+            keepers: set[int] = set()
+            removed: set[int] = set()
+            for pool in pools.values():
+                usable = [c for c in pool if c["why_not"] is None]
+                forced = keep.get(g["key"])
+                if forced is not None and forced in [c["entry_id"] for c in g["copies"]]:
+                    if forced not in [c["entry_id"] for c in usable]:
+                        if any(c["entry_id"] == forced for c in pool):
+                            return 400, {"error": "cannot be kept", "code": "BAD_KEEPER", "params": {"group": g["key"], "entry_id": forced}}
+                        forced_here = None
+                    else:
+                        forced_here = forced
+                elif forced is not None:
+                    return 400, {"error": "cannot be kept", "code": "BAD_KEEPER", "params": {"group": g["key"], "entry_id": forced}}
+                else:
+                    forced_here = None
+                if len(usable) < 2:
+                    keepers.update(c["entry_id"] for c in usable)
+                    continue
+                best = next((c for c in usable if c["entry_id"] == forced_here), None) or sorted(
+                    usable, key=lambda c: (prefer.index(c["remote"]) if c["remote"] in prefer else 99, c["entry_id"]))[0]
+                keepers.add(best["entry_id"])
+                for c in usable:
+                    if c is not best and (not prefix or c["path"].startswith(prefix + "/")):
+                        removed.add(c["entry_id"])
+            for c in g["copies"]:
+                if c["why_not"] in ("AMBIGUOUS_PATH",):
+                    skipped.append({"entry_id": c["entry_id"], "location": f"{c['remote']}:{c['path']}", "code": c["why_not"], "reason": "ambiguous path"})
+                    by_reason[c["why_not"]] = by_reason.get(c["why_not"], 0) + 1
+            if not removed and g["key"] not in skip:
+                continue
+            is_skipped = g["key"] in skip
+            reclaim = 0 if is_skipped else g["size"] * len(removed)
+            shown.append({"key": g["key"], "size": g["size"], "skipped": is_skipped, "reclaim": reclaim,
+                          "copies": [{"entry_id": c["entry_id"], "remote": c["remote"], "path": c["path"], "mtime": c["mtime"],
+                                      "keep": (not is_skipped) and c["entry_id"] in keepers, "remove": (not is_skipped) and c["entry_id"] in removed,
+                                      "usable": c["why_not"] is None, "why_not": c["why_not"]} for c in g["copies"]]})
+            if not is_skipped:
+                ops += len(removed)
+                reclaimed += reclaim
+        offset, limit = int(q.get("group_offset", 0)), int(q.get("group_limit", 50))
+        stats = {"groups_examined": len(shown), "groups": sum(1 for g in shown if not g["skipped"]), "deletes": ops,
+                 "bytes_reclaimed": reclaimed, "skipped": len(skipped), "copies_considered": sum(len(g["copies"]) for g in shown),
+                 "skipped_by_reason": by_reason}
+        return 200, {"kind": "dedupe", "ops": ops, "stats": stats, "skipped": skipped, "sample": [], "nothing_to_do": ops == 0,
+                     "groups": shown[offset:offset + limit]}
+
+    def _consolidate(self, q: dict, order: list[str], writable: set[str]) -> tuple[int, dict]:
+        target = q["target"]
+        if target not in writable:
+            return 400, {"error": f"target {target!r} is read-only", "code": "READ_ONLY", "params": {"remote": target}}
+        sources = q.get("sources") or [r for r in order if r != target]
+        root = (q.get("target_root") or "").strip("/")
+        already = to_copy = bytes_copy = cross = deletes = 0
+        sample, skipped, by_reason = [], [], {}
+        for c in self.catalog:
+            where = {r for r, _ in c["copies"]}
+            if target in where:
+                already += 1
+            elif where & set(sources):
+                if not c["verified"]:
+                    skipped.append({"entry_id": 1, "location": f"{c['copies'][0][0]}:{c['copies'][0][1]}", "code": "PROBABLE_ONLY", "reason": "x"})
+                    by_reason["PROBABLE_ONLY"] = by_reason.get("PROBABLE_ONLY", 0) + 1
+                    continue
+                to_copy += 1
+                bytes_copy += c["size"]
+                src_remote, src_path = c["copies"][0]
+                cross += c["size"]
+                folder = {"pdf": "Documents", "photo": "Photos", "spreadsheet": "Documents", "archive": "Archives"}.get(c["category"], "Other")
+                sample.append({"op": "copy", "src": {"remote": src_remote, "path": src_path},
+                               "dst": {"remote": target, "path": "/".join(filter(None, [root, folder, c["name"]]))}, "size": c["size"], "reason": ""})
+            if q.get("delete_sources"):
+                deletes += sum(1 for r, _ in c["copies"] if r in sources)
+        stats = {"contents": already + to_copy, "already_on_target": already, "to_copy": to_copy, "bytes_to_copy": bytes_copy,
+                 "bytes_cross_remote": cross, "moves": 0, "moves_on_target": 0, "deletes": deletes, "skipped": len(skipped),
+                 "skipped_by_reason": by_reason}
+        ops = to_copy + deletes
+        return 200, {"kind": "consolidate", "ops": ops, "stats": stats, "skipped": skipped, "sample": sample[:50], "nothing_to_do": ops == 0}
 
     # ------------------------------------------------------------------ Overview, Explore and Compare (docs/EXPLORE.md)
     @staticmethod
@@ -3423,3 +3655,516 @@ def test_a_folder_of_identical_files_is_hidden_and_when_shown_it_is_closed(make_
     folder.click()
     expect(ui.tid("cmp-file-相同/a.txt")).to_have_attribute("data-status", "same")
     expect(folder.locator(".cmp-diff-count")).to_have_text("0")
+
+
+# =========================================================================== Plans (docs/PLANS.md)
+# The list, the review, the two forms and the bridge dialog, against the mocked routes of section C.
+
+def _ids(ui: Ui, testid: str = "plan-row") -> list[str]:
+    return ui.page.eval_on_selector_all(f'[data-testid="{testid}"]', "els => els.map(e => e.dataset.id)")
+
+
+def _query(ui: Ui) -> dict:
+    h = ui.page.evaluate("location.hash")
+    return dict(parse_qs(h.partition("?")[2]))
+
+
+def test_plans_sits_between_compare_and_the_workspace_and_alt_5_opens_it(make_ui):
+    ui = make_ui(locale="en-US").open()
+    order = ui.page.eval_on_selector_all('[data-testid="rail"] a', "els => els.map(e => e.dataset.testid)")
+    assert order == ["rail-overview", "rail-explore", "rail-compare", "rail-plans", "rail-workspace"]
+    ui.page.keyboard.press("Alt+5")
+    expect(ui.tid("rail-plans")).to_have_attribute("aria-current", "page")
+    expect(ui.tid("view-plans")).to_be_visible()
+    assert ui.page.evaluate("location.hash") == "#/plans"
+    ui.page.keyboard.press("Alt+4")                                  # Alt+1...4 keep their meaning
+    expect(ui.tid("rail-workspace")).to_have_attribute("aria-current", "page")
+    expect(ui.tid("rail-plans")).to_have_attribute("title", re.compile(r"\(Alt\+5\)"))
+
+
+def test_the_list_puts_plans_waiting_for_review_first_and_counts_them_on_the_rail(make_ui):
+    ui = make_ui(locale="en-US")
+    a = ui.mock.add_plan(kind="dedupe", status="simulated", created_by="api", ops=2310, params={"cross_remote": False})
+    b = ui.mock.add_plan(kind="consolidate", status="draft", created_by="mcp", ok=False, problems=2, outdated=True,
+                         params={"target": "gdrive", "target_root": "Archive", "sources": ["dropbox"]})
+    done = ui.mock.add_plan(kind="dedupe", status="done", created_by="cli", params={"cross_remote": True, "remote": "gdrive"})
+    ui.mock.add_plan(kind="dedupe", status="cancelled")
+    preview = ui.mock.add_plan(kind="workspace", status="simulated", created_by="workspace", draft_id=1)
+    ui.open()
+    expect(ui.tid("rail-plans-badge")).to_have_attribute("data-count", "2")        # the workspace preview is not a proposal
+    ui.tid("rail-plans").click()
+    waiting = ui.tid("plans-waiting")
+    expect(waiting.get_by_test_id("plan-row")).to_have_count(2)
+    expect(ui.tid("plans-waiting-count")).to_have_text("2")
+    first = waiting.get_by_test_id("plan-row").first
+    expect(first).to_have_attribute("data-id", str(b))                              # newest first
+    expect(first).to_contain_text("Gather onto gdrive:Archive (copy only) · from dropbox")
+    expect(first.get_by_test_id("claude-badge")).to_be_visible()
+    expect(first).to_contain_text("2 problems")
+    expect(first.get_by_test_id("plan-outdated")).to_be_visible()
+    second = waiting.get_by_test_id("plan-row").nth(1)
+    expect(second).to_contain_text("Remove redundant copies (within each cloud) · all clouds")
+    expect(second).to_contain_text("2,310 ops")
+    expect(second).to_contain_text("ok")
+    expect(ui.tid("plans-tab-done")).to_have_attribute("data-count", "1")
+    expect(ui.tid("plans-tab-cancelled")).to_have_attribute("data-count", "1")
+    ui.tid("plans-tab-done").click()
+    expect(ui.tid("plans-tabpanel").get_by_test_id("plan-row")).to_have_attribute("data-id", str(done))
+    expect(ui.tid("plans-tabpanel")).to_contain_text("across clouds")
+    expect(ui.tid("plans-workspace")).to_contain_text("Workspace previews (1)")
+    assert str(preview) not in _ids(ui)[:2]
+    waiting.get_by_test_id("plan-open").nth(1).click()
+    expect(ui.tid("view-plan-review")).to_have_attribute("data-id", str(a))
+
+
+def test_the_review_shows_the_shared_report_the_ops_and_a_filter(make_ui):
+    ui = make_ui(locale="en-US")
+    bad = [{"code": "DST_EXISTS", "seq": 1, "message": "'dropbox:學校/report.pdf' holds different or unproven content; never overwritten",
+            "params": {"variant": "different", "at": _loc("dropbox", "學校/report.pdf")}}]
+    pid = ui.mock.add_plan(kind="dedupe", status="draft", ok=False, problems=1, ops=120, violations=bad)
+    ui.open().go(f"#/plans/{pid}")
+    expect(ui.tid("sim-status")).to_have_attribute("data-ok", "false")
+    expect(ui.tid("violation")).to_have_attribute("data-code", "DST_EXISTS")
+    expect(ui.tid("violation")).to_contain_text("never")                          # the page's own sentence, plus the code pill
+    expect(ui.tid("cloud-row-gdrive")).to_be_visible()
+    expect(ui.tid("summary-ops")).to_contain_text("120")
+    expect(ui.tid("plan-cannot-approve")).to_be_visible()
+    expect(ui.tid("approval-area")).to_have_count(0)
+    assert ui.mock.last("POST", rf"/v1/ui/plans/{pid}/review")
+    groups = ui.tid("ops-groups")
+    expect(groups).to_contain_text("Quarantine")
+    expect(groups).to_contain_text("120")
+    expect(ui.tid("op-row")).to_have_count(50)
+    expect(ui.tid("op-witness").first).to_contain_text("witness: gdrive:Photos/copy 0.jpg")
+    ui.tid("ops-more").click()
+    expect(ui.tid("op-row")).to_have_count(100)
+    ui.tid("ops-filter").fill("copy 7")
+    expect(ui.tid("op-row")).to_have_count(11)                                    # copy 7, copy 70 ... copy 79
+    ui.tid("reveal-link").click()
+    expect(ui.tid("rail-workspace")).to_have_attribute("aria-current", "page")     # the reveal goes to the workspace
+
+
+def test_approving_with_the_typed_code_then_running_shows_progress_and_the_catalog_banner(make_ui):
+    ui = make_ui(locale="en-US")
+    pid = ui.mock.add_plan(kind="dedupe", status="simulated", ops=4)
+    ui.open().go(f"#/plans/{pid}")
+    expect(ui.tid("approval-code")).to_have_text(MockApi.CODE)                     # only the review response carries it
+    expect(ui.tid("approval-button")).to_be_disabled()
+    ui.tid("approval-input").fill("zzzz")
+    expect(ui.tid("approval-button")).to_be_disabled()
+    ui.tid("approval-input").fill(MockApi.CODE)
+    ui.tid("approval-button").click()
+    expect(ui.tid("plan-approved")).to_be_visible()
+    call = ui.mock.last("POST", rf"/v1/ui/plans/{pid}/approve")
+    assert call.body == {"code": MockApi.CODE} and call.headers["x-csrf-token"] == MockApi.CSRF
+    assert not ui.mock.calls_to("POST", rf"/v1/ui/plans/{pid}/execute")            # approving does not run it
+    ui.tid("plan-run").click()
+    expect(ui.tid("progress-current")).to_be_visible()
+    expect(ui.tid("progress")).to_have_attribute("data-phase", "done", timeout=10_000)
+    assert ui.mock.calls_to("POST", rf"/v1/ui/plans/{pid}/execute")
+    assert ui.mock.draft["status"] == "open"                                       # a plan of this view does not close the draft
+    expect(ui.tid("catalog-banner")).to_be_visible()
+    ui.tid("rescan-button").click()
+    expect(ui.tid("progress")).to_have_attribute("data-phase", "rescanned", timeout=10_000)
+    ui.tid("plan-back").click()
+    expect(ui.tid("view-plans")).to_be_visible()
+
+
+def test_without_approvals_the_review_shows_the_terminal_commands_and_no_form(make_ui):
+    ui = make_ui(locale="en-US", approvals_enabled=False)
+    pid = ui.mock.add_plan()
+    ui.open().go(f"#/plans/{pid}")
+    expect(ui.tid("approvals-banner")).to_be_visible()
+    expect(ui.tid("cli-approve")).to_have_text(f"drivemerge plan approve {pid}")
+    expect(ui.tid("cli-execute")).to_have_text(f"drivemerge plan execute {pid}")
+    expect(ui.tid("approval-area")).to_have_count(0)
+    expect(ui.tid("plan-run")).to_have_count(0)
+    assert "approval_code" not in json.dumps(ui.mock.plan_json(ui.mock.plans[pid]))
+
+
+def test_cancelling_a_plan_asks_first_and_moves_it_to_the_cancelled_tab(make_ui):
+    ui = make_ui(locale="en-US")
+    pid = ui.mock.add_plan()
+    ui.open().go(f"#/plans/{pid}")
+    ui.tid("plan-cancel").click()
+    ui.tid("dialog-cancel").click()
+    assert not ui.mock.calls_to("POST", rf"/v1/ui/plans/{pid}/cancel")
+    ui.tid("plan-cancel").click()
+    ui.tid("dialog-ok").click()
+    expect(ui.tid("view-plans")).to_be_visible()
+    assert ui.mock.plans[pid]["status"] == "cancelled"
+    expect(ui.tid("plans-tab-cancelled")).to_have_attribute("data-count", "1", timeout=12_000)
+
+
+def test_a_closed_plan_opens_read_only_with_its_state_in_words(make_ui):
+    ui = make_ui(locale="en-US")
+    pid = ui.mock.add_plan(status="done")
+    ui.open().go(f"#/plans/{pid}")
+    expect(ui.tid("plan-closed")).to_contain_text(f"Plan #{pid} is Done")
+    expect(ui.tid("op-row").first).to_be_visible()
+    expect(ui.tid("approval-area")).to_have_count(0)
+    expect(ui.tid("plan-cancel")).to_have_count(0)
+    ui.go("#/plans/9999")
+    expect(ui.tid("plan-error")).to_contain_text("There is no plan #9999")
+
+
+# --- dedupe
+
+def test_the_dedupe_form_lives_in_the_address_bar_and_the_estimate_follows_it(make_ui):
+    ui = make_ui(locale="en-US").open()
+    ui.go("#/plans/new/dedupe?remote=gdrive&across=1&path=Backup&min=1M&prefer=dropbox,gdrive")
+    expect(ui.tid("dd-remote")).to_have_value("gdrive")
+    expect(ui.tid("dd-mode-across")).to_be_checked()
+    expect(ui.tid("dd-across-warning")).to_be_visible()
+    expect(ui.tid("dd-path")).to_have_value("Backup")
+    expect(ui.tid("dd-min")).to_have_value("1M")
+    expect(ui.tid("prefer-list").locator("li").first).to_have_attribute("data-cloud", "dropbox")
+    expect(ui.tid("estimate-headline").or_(ui.tid("estimate-nothing"))).to_be_visible()
+    body = ui.mock.last("POST", "/v1/plans/estimate").body
+    assert body["kind"] == "dedupe"
+    assert body["params"] == {"cross_remote": True, "remote": "gdrive", "path_prefix": "Backup", "min_size": 1_048_576,
+                              "prefer_remotes": ["dropbox", "gdrive"], "group_offset": 0, "group_limit": 50}
+    ui.tid("dd-mode-each").check()                                                  # an edit is written back to the address
+    ui.page.wait_for_function("() => !location.hash.includes('across')")
+    assert _query(ui)["remote"] == ["gdrive"]
+    ui.tid("dd-min").fill("big")
+    expect(ui.tid("dd-min-error")).to_be_visible()
+    ui.go("#/plans/new/dedupe")                                                     # a link resets the form
+    expect(ui.tid("dd-path")).to_have_value("")
+
+
+def test_typing_is_debounced_into_one_estimate_and_a_stale_answer_is_dropped(make_ui):
+    ui = make_ui(locale="en-US").open()
+    ui.go("#/plans/new/dedupe")
+    expect(ui.tid("dd-group").first).to_be_visible()
+    before = len(ui.mock.calls_to("POST", "/v1/plans/estimate"))
+    ui.tid("dd-path").press_sequentially("Backup", delay=40)
+    expect(ui.tid("estimating")).to_have_count(0)
+    assert len(ui.mock.calls_to("POST", "/v1/plans/estimate")) - before == 1
+    # hold the answer of the next request back, then send a newer one: the old answer must not replace the new one
+    ui.page.evaluate("""() => {
+        const real = window.fetch; let n = 0;
+        window.fetch = (url, opts) => {
+            if (!String(url).includes('/v1/plans/estimate')) return real(url, opts);
+            n += 1; const mine = n;
+            return real(url, opts).then((r) => new Promise((done) => setTimeout(() => done(r), mine === 1 ? 1200 : 0)));
+        };
+    }""")
+    ui.tid("dd-path").fill("Old")                                                   # slow answer: only the Old/ report.pdf group
+    ui.page.wait_for_timeout(600)
+    ui.tid("dd-path").fill("Photos")                                                # newer: only the gdrive Photos group
+    expect(ui.tid("dd-group")).to_have_count(0)                                     # nothing to remove under Photos (single copy)
+    ui.page.wait_for_timeout(1300)
+    expect(ui.tid("dd-group")).to_have_count(0)                                     # the slow Old/ answer arrived and was ignored
+
+
+def test_the_estimate_lists_groups_with_the_policys_keeper_and_why_a_copy_cannot_stay(make_ui):
+    ui = make_ui(locale="en-US").open()
+    ui.go("#/plans/new/dedupe")
+    expect(ui.tid("estimate-headline")).to_contain_text("3 redundant copies in 3 groups")
+    g11 = ui.page.locator('[data-testid="dd-group"][data-key="g:11"]')
+    expect(g11.locator('[data-testid="dd-copy"][data-entry="201"]')).to_have_attribute("data-role", "keep")
+    expect(g11.locator('[data-testid="dd-copy"][data-entry="202"]')).to_have_attribute("data-role", "remove")
+    expect(g11.locator('[data-testid="dd-copy"][data-entry="203"]')).to_have_attribute("data-role", "keep")   # its own copy on dropbox
+    why = ui.page.locator('[data-testid="dd-group"][data-key="g:12"] [data-testid="dd-why"]')
+    expect(why).to_have_attribute("data-code", "AMBIGUOUS_PATH")
+    expect(why).to_have_text("several files share this path")
+    expect(ui.page.locator('[data-testid="dd-group"][data-key="g:13"] [data-testid="dd-why"]')).to_contain_text("quarantine")
+    expect(ui.tid("est-skipped")).to_contain_text("several files share this path")
+    ui.page.locator('[data-testid="dd-group"][data-key="g:12"] [data-testid="dd-copy"][data-entry="205"] button').click(force=True)
+    expect(ui.tid("dd-overrides")).to_have_count(0)                                 # a copy that cannot stay cannot be picked
+    ui.tid("dd-mode-across").check()
+    expect(g11.locator('[data-testid="dd-copy"][data-role="remove"]')).to_have_count(2)
+
+
+def test_a_keeper_override_and_a_skip_are_part_of_the_create_request(make_ui):
+    ui = make_ui(locale="en-US").open()
+    ui.go("#/plans/new/dedupe")
+    g11 = ui.page.locator('[data-testid="dd-group"][data-key="g:11"]')
+    g11.locator('[data-testid="dd-copy"][data-entry="202"] button').click()
+    expect(g11.locator('[data-testid="dd-copy"][data-entry="202"]')).to_have_attribute("data-role", "keep")
+    expect(g11.locator('[data-testid="dd-copy"][data-entry="201"]')).to_have_attribute("data-role", "remove")
+    expect(g11.get_by_test_id("dd-overridden")).to_be_visible()
+    ui.page.locator('[data-testid="dd-group"][data-key="g:12"]').get_by_test_id("dd-skip").click()
+    expect(ui.page.locator('[data-testid="dd-group"][data-key="g:12"]')).to_have_attribute("data-skipped", "true")
+    expect(ui.tid("dd-overrides")).to_contain_text("keepers changed: 1 · groups skipped: 1")
+    ui.page.wait_for_function("() => location.hash.includes('skip=')")
+    q = _query(ui)
+    assert q["skip"] == ["g:12"] and q["keep"] == ["g:11=202"]
+    expect(ui.tid("estimate-headline")).to_contain_text("2 redundant copies in 2 groups")
+    ui.page.reload()                                                                # Back / reload keep the choices
+    expect(ui.page.locator('[data-testid="dd-group"][data-key="g:11"] [data-testid="dd-copy"][data-entry="202"]')).to_have_attribute("data-role", "keep")
+    with ui.awaiting("POST", "/v1/plans"):
+        ui.tid("create-plan").click()
+    body = ui.mock.last("POST", "/v1/plans").body
+    assert body == {"kind": "dedupe", "params": {"cross_remote": False, "keep": {"g:11": 202}, "skip_groups": ["g:12"]}}
+    expect(ui.tid("view-plan-review")).to_be_visible()
+
+
+def test_a_stale_override_is_reported_in_words_and_can_be_reset(make_ui):
+    ui = make_ui(locale="en-US").open()
+    ui.go("#/plans/new/dedupe?keep=g:11%3D999")
+    expect(ui.tid("estimate-error")).to_contain_text("Entry 999 cannot be kept for group g:11")
+    ui.tid("estimate-error").get_by_role("button", name="Reset").click()
+    expect(ui.tid("estimate-headline")).to_be_visible()
+
+
+def test_the_groups_page_with_load_more(make_ui):
+    ui = make_ui(locale="en-US")
+    for i in range(60):
+        ui.mock.dup_groups.append({"key": f"g:{100 + i}", "size": 1_000 + i,
+                                   "copies": [_copy(1000 + 2 * i, "gdrive", f"Bulk/a{i}.bin"), _copy(1001 + 2 * i, "gdrive", f"Bulk/b{i}.bin")]})
+    ui.open().go("#/plans/new/dedupe")
+    expect(ui.tid("dd-group")).to_have_count(50)
+    ui.tid("dd-more").click()
+    expect(ui.tid("dd-group")).to_have_count(63)
+    assert ui.mock.last("POST", "/v1/plans/estimate").body["params"]["group_offset"] == 50
+    expect(ui.tid("dd-more")).to_have_count(0)
+
+
+def test_nothing_to_do_is_said_instead_of_offering_an_empty_plan(make_ui):
+    ui = make_ui(locale="en-US").open()
+    ui.go("#/plans/new/dedupe?path=Nowhere")
+    expect(ui.tid("estimate-nothing")).to_have_text("Nothing to do: with these settings no operation is needed.")
+    expect(ui.tid("create-plan")).to_be_disabled()
+
+
+def test_a_refused_build_is_worded_by_the_page_from_its_code(make_ui):
+    ui = make_ui(locale="en-US").open()
+    ui.go("#/plans/new/dedupe?remote=nowhere")
+    expect(ui.tid("estimate-error")).to_have_text("There is no cloud called nowhere.")
+    ui.go("#/plans/new/dedupe")
+    expect(ui.tid("estimate-headline")).to_be_visible()
+
+
+# --- consolidate
+
+def _with_read_only_cloud(ui: Ui) -> None:
+    ui.mock.remotes.append({"id": 3, "name": "onedrive", "provider": "onedrive", "writable": False, "case_insensitive": True})
+
+
+def test_consolidate_offers_only_writable_targets_and_defaults_to_copying_only(make_ui):
+    ui = make_ui(locale="en-US")
+    _with_read_only_cloud(ui)
+    ui.open().go("#/plans/new/consolidate")
+    options = ui.tid("cons-target").locator("option")
+    expect(options).to_have_count(2)
+    expect(options.nth(0)).to_have_text("gdrive")
+    expect(ui.tid("cons-source-dropbox")).to_be_checked()
+    expect(ui.tid("cons-source-onedrive")).to_be_checked()
+    expect(ui.tid("cons-delete")).not_to_be_checked()
+    expect(ui.tid("cons-stats")).to_contain_text("To copy")
+    expect(ui.tid("summary-copy")).to_contain_text("1")
+    expect(ui.tid("placement-folder")).to_have_attribute("data-dir", "gdrive:Archives")
+    expect(ui.tid("placements")).to_contain_text("Archive/old.zip")
+    ui.tid("cons-root").fill("Merged")
+    expect(ui.tid("placement-folder")).to_have_attribute("data-dir", "gdrive:Merged/Archives")
+    with ui.awaiting("POST", "/v1/plans"):
+        ui.tid("create-plan").click()
+    assert ui.mock.last("POST", "/v1/plans").body == {"kind": "consolidate", "params": {
+        "target": "gdrive", "target_root": "Merged", "reorganize_target": False, "include_probable": False, "delete_sources": False}}
+    expect(ui.tid("view-plan-review")).to_be_visible()
+
+
+def test_cleaning_up_sources_sits_behind_a_section_that_warns_while_content_is_not_on_the_target(make_ui):
+    ui = make_ui(locale="en-US").open()
+    ui.go("#/plans/new/consolidate")
+    expect(ui.tid("cons-delete")).to_be_hidden()                                    # closed by default
+    ui.tid("cons-cleanup").locator("summary").click()
+    expect(ui.tid("cons-missing")).to_have_attribute("data-contents", "1")           # old.zip exists on dropbox only
+    expect(ui.tid("cons-missing")).to_contain_text("are still not on gdrive")
+    expect(ui.tid("cons-delete-warning")).to_have_count(0)
+    ui.tid("cons-delete").check()
+    expect(ui.tid("cons-delete-warning")).to_contain_text("copy them and remove their sources in one go")
+    ui.page.wait_for_function("() => location.hash.includes('del=1')")
+    ui.page.wait_for_timeout(900)                                                   # the estimate follows after its debounce
+    assert ui.mock.last("POST", "/v1/plans/estimate").body["params"]["delete_sources"] is True
+    ui.go("#/plans/new/consolidate?target=dropbox&src=gdrive")                       # everything gdrive holds is not on dropbox
+    ui.tid("cons-cleanup").locator("summary").click()
+    expect(ui.tid("cons-missing")).to_have_attribute("data-contents", "3")
+
+
+def test_probable_matches_are_explained_when_turned_on(make_ui):
+    ui = make_ui(locale="en-US").open()
+    ui.go("#/plans/new/consolidate")
+    expect(ui.tid("cons-probable-warning")).to_have_count(0)
+    ui.tid("cons-probable").check()
+    expect(ui.tid("cons-probable-warning")).to_contain_text("without proof")
+
+
+def test_a_read_only_target_in_the_address_falls_back_to_a_writable_one(make_ui):
+    ui = make_ui(locale="en-US")
+    _with_read_only_cloud(ui)
+    ui.open().go("#/plans/new/consolidate?target=onedrive")
+    expect(ui.tid("cons-target")).to_have_value("gdrive")
+    expect(ui.tid("cons-stats")).to_be_visible()
+    assert ui.mock.last("POST", "/v1/plans/estimate").body["params"]["target"] == "gdrive"
+
+
+# --- polling, the toast, the bridge, the links
+
+def test_a_plan_claude_proposes_while_the_page_is_open_raises_the_toast_and_the_badge(make_ui):
+    ui = make_ui(locale="en-US")
+    ui.mock.add_plan(created_by="api")
+    ui.open()
+    ui.page.clock.install()
+    ui.page.reload()
+    expect(ui.tid("rail-plans-badge")).to_have_attribute("data-count", "1")
+    assert not ui.tid("toast").count()                                              # what was there when the page opened is not news
+    pid = ui.mock.add_plan(created_by="mcp", kind="consolidate", params={"target": "gdrive"}, title="Gather onto gdrive")
+    ui.page.clock.fast_forward(10_500)
+    toast = ui.tid("toast").filter(has_text=f"Claude proposed plan #{pid}")
+    expect(toast).to_be_visible()
+    expect(ui.tid("rail-plans-badge")).to_have_attribute("data-count", "2")
+    toast.get_by_test_id("toast-action").click()
+    expect(ui.tid("view-plan-review")).to_have_attribute("data-id", str(pid))
+
+
+def test_a_hidden_page_does_not_poll_the_plan_list(make_ui):
+    ui = make_ui(locale="en-US").open()
+    ui.page.clock.install()
+    ui.page.reload()
+    expect(ui.tid("rail")).to_be_visible()
+    n = len(ui.mock.calls_to("GET", "/v1/plans/summaries"))
+    ui.page.evaluate("""() => { Object.defineProperty(document, 'hidden', { get: () => true, configurable: true }); }""")
+    ui.page.clock.fast_forward(35_000)
+    assert len(ui.mock.calls_to("GET", "/v1/plans/summaries")) == n
+
+
+def test_the_bridge_dialog_counts_candidates_runs_the_job_and_refreshes_the_overview(make_ui):
+    ui = make_ui(locale="en-US").open()
+    ui.go("#/overview")
+    expect(ui.tid("cloud-undercount-gdrive")).to_be_visible()
+    reads = len(ui.mock.calls_to("GET", "/v1/coverage"))
+    ui.tid("bridge-open-gdrive").click()
+    expect(ui.tid("bridge-candidates")).to_contain_text("Candidates: 3 files")
+    assert ui.mock.last("GET", "/v1/ui/bridge/candidates").query == {"max_bytes": str(5 * 1024 ** 3), "limit": "500"}
+    ui.tid("bridge-limit").fill("abc")
+    expect(ui.tid("bridge-start")).to_be_disabled()
+    ui.tid("bridge-limit").fill("20")
+    expect(ui.tid("bridge-start")).to_be_enabled()
+    ui.tid("bridge-start").click()
+    expect(ui.tid("bridge-nums")).to_contain_text("Done: 3 bridged, 0 failed", timeout=10_000)
+    assert ui.mock.last("POST", "/v1/ui/bridge").body == {"max_bytes": 5 * 1024 ** 3, "limit": 20}
+    assert len(ui.mock.calls_to("GET", "/v1/coverage")) > reads
+    ui.tid("bridge-close").click()
+    expect(ui.tid("bridge-dialog")).to_have_count(0)
+
+
+def test_the_bridge_button_needs_approvals(make_ui):
+    ui = make_ui(locale="en-US", approvals_enabled=False).open()
+    ui.go("#/overview")
+    expect(ui.tid("cloud-undercount-gdrive")).to_be_visible()
+    expect(ui.tid("bridge-open-gdrive")).to_have_count(0)
+
+
+def test_the_overview_links_into_both_flows(make_ui):
+    ui = make_ui(locale="en-US").open()
+    ui.go("#/overview")
+    ui.tid("ov-dedupe").click()
+    expect(ui.tid("view-plan-new")).to_have_attribute("data-kind", "dedupe")
+    ui.page.go_back()
+    ui.tid("cloud-consolidate-dropbox").click()
+    expect(ui.tid("view-plan-new")).to_have_attribute("data-kind", "consolidate")
+    expect(ui.tid("cons-target")).to_have_value("gdrive")                            # the first writable other cloud
+    expect(ui.tid("cons-source-dropbox")).to_be_checked()
+    ui.page.go_back()
+    ui.tid("cloud-consolidate-gdrive").click()
+    expect(ui.tid("cons-target")).to_have_value("dropbox")
+
+
+def test_explore_offers_a_dedupe_scoped_to_a_cloud_and_folder_with_several_copies(make_ui):
+    ui = make_ui(locale="en-US")
+    ui.mock.catalog.append({"key": "g:7", "name": "dup.bin", "size": 5_000, "category": "other", "ext": "bin", "mtime": "2023-02-01T10:00:00Z",
+                            "verified": True, "copies": [("gdrive", "Archive/a/dup.bin"), ("gdrive", "Archive/a/b/dup.bin"), ("dropbox", "x/dup.bin")]})
+    ui.open().go("#/explore?q=dup.bin")
+    ui.tid("ex-expand").first.click()
+    expect(ui.tid("ex-dedupe-dropbox")).to_have_count(0)                              # only one copy there
+    ui.tid("ex-dedupe-gdrive").click()
+    assert _query(ui) == {"remote": ["gdrive"], "path": ["Archive/a"]}
+    expect(ui.tid("dd-remote")).to_have_value("gdrive")
+    expect(ui.tid("dd-path")).to_have_value("Archive/a")
+
+
+def test_the_plans_view_speaks_both_languages_and_switches_without_a_reload(make_ui):
+    ui = make_ui(locale="zh-TW")
+    pid = ui.mock.add_plan(kind="consolidate", created_by="mcp", params={"target": "gdrive"})
+    ui.open().go("#/plans")
+    expect(ui.tid("rail-plans")).to_contain_text("計畫")
+    expect(ui.tid("plans-waiting")).to_contain_text("等待審閱")
+    expect(ui.tid("plans-waiting")).to_contain_text("整併到 gdrive:（只複製）")
+    ui.go(f"#/plans/{pid}")
+    expect(ui.tid("approval-button")).to_contain_text("核准")
+    expect(ui.tid("plan-resimulate")).to_contain_text("重新模擬")
+    ui.tid("view-lang").click()
+    expect(ui.tid("approval-button")).to_contain_text("Approve")
+    ui.go("#/plans/new/dedupe")
+    expect(ui.tid("dd-group").first).to_be_visible()
+    expect(ui.tid("estimate-headline")).to_contain_text("redundant copies")
+    ui.tid("view-lang").click()
+    expect(ui.tid("estimate-headline")).to_contain_text("多餘副本")
+    expect(ui.page.locator('[data-testid="dd-group"][data-key="g:12"] [data-testid="dd-why"]')).to_have_text("有多個檔案共用同一個路徑")
+    ui.go("#/plans/new/consolidate")
+    expect(ui.tid("cons-stats")).to_contain_text("要複製")
+
+
+def test_the_keys_the_plans_view_builds_at_run_time_exist_in_both_languages(make_ui):
+    ui = make_ui(locale="en-US")
+    ui.page.goto(f"{ui.base}/ui/#token={MockApi.TOKEN}")
+    dicts = ui.page.evaluate("import('/ui/static/i18n.js').then(m => m.dictionaries)")
+    keys = [f"pstatus.{s}" for s in "draft simulated approved executing done failed cancelled".split()]
+    keys += [f"kind.{k}" for k in "dedupe consolidate reorganize manual workspace".split()]
+    keys += [f"plans.op.{o}" for o in ("copy", "move", "delete")] + [f"plans.by.{b}" for b in "ui api cli workspace".split()]
+    keys += [f"build.{c}" for c in "BAD_LOCATION UNKNOWN_REMOTE READ_ONLY BAD_OP MISSING_SRC MISSING_DST BAD_PARAM BAD_KEEPER BAD_GROUP BUILD_ERROR".split()]
+    keys += [f"skip.{c}" for c in "READ_ONLY AMBIGUOUS_PATH NATIVE_DOC SIZE_UNKNOWN PROBABLE_ONLY LAYOUT_BLOCKED LAYOUT_TAKEN QUARANTINE OTHER_CLOUD".split()]
+    keys += ["err.PLAN_CLOSED", "plans.NOTHING_TO_DO", "ago.now", "ago.min", "ago.hour", "ago.day"]
+    for lang in ("zh-TW", "en"):
+        for key in keys:
+            assert key in dicts[lang], (lang, key)
+    used = set()
+    for f in WEB.glob("*.js"):
+        if f.name != "i18n.js":
+            used |= set(re.findall(r"""['"`]((?:plans|dedupe|cons|bridge|skip|build)\.[A-Za-z_.]+)['"`]""", f.read_text(encoding="utf-8")))
+    assert not {k for k in used if not k.endswith(".")} - set(dicts["en"]), sorted({k for k in used if not k.endswith(".")} - set(dicts["en"]))
+
+
+@pytest.mark.parametrize("scheme, locale, width", [("light", "en-US", 1440), ("dark", "en-US", 1440), ("light", "zh-TW", 1440), ("dark", "zh-TW", 900)])
+def test_screenshots_of_the_plans_view(make_ui, scheme, locale, width):
+    SHOTS.mkdir(parents=True, exist_ok=True)
+    ui = make_ui(color_scheme=scheme, locale=locale, width=width, height=860)
+    _with_read_only_cloud(ui)
+    bad = [{"code": "DST_EXISTS", "seq": 1, "message": "x", "params": {"variant": "different", "at": _loc("dropbox", "學校/report.pdf")}}]
+    ui.mock.add_plan(kind="consolidate", status="simulated", created_by="mcp", ops=8120, params={"target": "gdrive", "target_root": "Archive", "sources": ["dropbox"]})
+    ui.mock.add_plan(kind="dedupe", status="draft", created_by="ui", ops=2310, ok=False, problems=2, outdated=True)
+    ui.mock.add_plan(kind="dedupe", status="simulated", created_by="cli", ops=40, params={"remote": "gdrive", "path_prefix": "Photos"})
+    ui.mock.add_plan(kind="dedupe", status="done", created_by="cli")
+    review = ui.mock.add_plan(kind="dedupe", status="simulated", ops=120, violations=bad)
+    ok = ui.mock.add_plan(kind="dedupe", status="simulated", ops=60)
+    ui.open()
+    tag = f"{scheme}-{locale}-{width}"
+    ui.go("#/plans")
+    expect(ui.tid("plan-row").first).to_be_visible()
+    ui.page.screenshot(path=str(SHOTS / f"plans-list-{tag}.png"))
+    ui.go(f"#/plans/{review}")
+    expect(ui.tid("violation")).to_be_visible()
+    ui.page.screenshot(path=str(SHOTS / f"plans-review-bad-{tag}.png"))
+    ui.go(f"#/plans/{ok}")
+    expect(ui.tid("approval-input")).to_be_visible()
+    ui.tid("approval-input").fill(MockApi.CODE)
+    ui.page.screenshot(path=str(SHOTS / f"plans-review-ok-{tag}.png"))
+    ui.go("#/plans/new/dedupe?across=1")
+    expect(ui.tid("dd-group").first).to_be_visible()
+    ui.page.locator('[data-testid="dd-group"][data-key="g:11"] [data-testid="dd-copy"][data-entry="202"] button').click()
+    ui.page.wait_for_timeout(700)
+    ui.page.screenshot(path=str(SHOTS / f"plans-dedupe-{tag}.png"))
+    ui.go("#/plans/new/consolidate")
+    expect(ui.tid("placements")).to_be_visible()
+    ui.tid("cons-cleanup").locator("summary").click()
+    ui.tid("cons-delete").check()
+    ui.page.wait_for_timeout(700)
+    ui.page.screenshot(path=str(SHOTS / f"plans-consolidate-{tag}.png"))
+    ui.go("#/overview")
+    ui.tid("bridge-open-gdrive").click()
+    expect(ui.tid("bridge-candidates")).to_contain_text("3")
+    ui.page.screenshot(path=str(SHOTS / f"plans-bridge-{tag}.png"))
+    assert (SHOTS / f"plans-list-{tag}.png").stat().st_size > 5_000

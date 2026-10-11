@@ -14,12 +14,14 @@ import { DialogHost, Toasts } from './ui.js';
 import {
   Rail, ViewHost, currentView, navigate, useRoute, useShortcuts,
 } from './shell.js';
-import { compareHash } from './query.js';
+import { compareHash, plansHash } from './query.js';
+import { isWaiting } from './plans.js';
 import {
   baseName, errorText, fmtBytes, fmtLoc, fmtNum, keepBothName, lastMove, parentOf, safeStorage, todayStamp, wordParams,
 } from './util.js';
 
 const POLL_MS = 3000;
+const PLANS_POLL_MS = 10000;
 const TOAST_MS = 6000;
 const TOAST_ACTION_MS = 12000;
 const SPLIT_KEY = 'dm-split';
@@ -59,6 +61,10 @@ function App() {
   const [dialog, setDialog] = useState(null);
   // The clouds the last run changed while the catalog still shows what they held before ({remotes}); null once rescanned.
   const [outdated, setOutdated] = useState(null);
+  // The plan list (docs/PLANS.md section 7): polled while the page is visible, for the rail badge, the list view and
+  // the "proposed by Claude" toast. `seen` holds the ids the page already knows, so only a new plan raises the toast.
+  const [plansState, setPlansState] = useState({ list: [], loaded: false, error: null });
+  const seenPlans = useRef(null);
   const [frac, setFrac] = useState(() => {
     const v = parseFloat(safeStorage('get', SPLIT_KEY));
     return v >= 0.25 && v <= 0.75 ? v : 0.5;
@@ -366,6 +372,14 @@ function App() {
     return reveal('left', loc);
   };
 
+  /** A workspace preview listed among the plans: open the workspace on its draft with the preview dialog. */
+  async function openWorkspacePreview(draftId) {
+    navigate('#/workspace');
+    if (draftId && draftRef.current && draftRef.current.id !== draftId) await selectDraft(draftId);
+    setToasts([]);
+    setPreviewOpen(true);
+  }
+
   // ---------------------------------------------------------------- start up
   useEffect(() => {
     (async () => {
@@ -436,6 +450,39 @@ function App() {
     return () => clearInterval(timer);
   }, [draftId]);
 
+  async function refreshPlans() {
+    try {
+      const list = await api.planSummaries({ limit: 100 });
+      setPlansState({ list, loaded: true, error: null });
+      if (seenPlans.current === null) {
+        seenPlans.current = new Set(list.map((p) => p.id));
+        return list;
+      }
+      list.filter((p) => !seenPlans.current.has(p.id)).forEach((p) => {
+        seenPlans.current.add(p.id);
+        if (p.created_by === 'mcp' && isWaiting(p)) {
+          toast('claude', t('plans.fromClaude', { id: p.id, title: p.title || '' }),
+            { label: t('plans.review'), run: () => navigate(plansHash(`/${p.id}`)) });
+        }
+      });
+      return list;
+    } catch (e) {
+      setPlansState((s) => ({ ...s, loaded: true, error: e }));  // the next poll tries again
+      return null;
+    }
+  }
+  const refreshPlansRef = useRef(refreshPlans);
+  refreshPlansRef.current = refreshPlans;
+  const ready = !!config && !!draft;
+  useEffect(() => {
+    if (!ready) return undefined;
+    refreshPlansRef.current();
+    const tick = () => { if (!document.hidden) refreshPlansRef.current(); };
+    const timer = setInterval(tick, PLANS_POLL_MS);
+    document.addEventListener('visibilitychange', tick);
+    return () => { clearInterval(timer); document.removeEventListener('visibilitychange', tick); };
+  }, [ready]);
+
   // Undo / redo from the keyboard, unless the user is typing in a field or a dialog is open.
   useEffect(() => {
     const onKey = (e) => {
@@ -471,6 +518,7 @@ function App() {
     config, draft, toast, confirm: confirmDialog, prompt: promptDialog, reveal,
     stageMove, stageMkdir, stageMany, rename: renameItem, afterExecution, resolveClash,
     outdated, markOutdated, catalogRefreshed,
+    plans: plansState, refreshPlans, openWorkspacePreview,
     nav: navigate, lang, switchLang, revealInWorkspace, openWorkspace: () => navigate('#/workspace'),
     compare: (a, b) => navigate(compareHash({ remote: a.remote, path: a.path }, { remote: b.remote, path: b.path })),
     compareWith: (a) => navigate(compareHash({ remote: a.remote, path: a.path }, null)),
@@ -480,7 +528,7 @@ function App() {
 
   return html`<${AppCtx.Provider} value=${ctx}>
     <div class="app" data-lang=${lang} data-drawer=${onWorkspace ? drawer || undefined : undefined} data-view=${route.view}>
-      <${Rail} route=${route} />
+      <${Rail} route=${route} waiting=${plansState.list.filter(isWaiting).length} />
       <div class="shell-main">
       ${config.approvals_enabled === false && html`<div class="banner banner-info" role="note" data-testid="approvals-banner">
         <${Icon} name="info" size=${17} />

@@ -1,5 +1,6 @@
 // The rail and the router (docs/EXPLORE.md section F). The route lives in location.hash:
 //   #/overview   #/explore?q=...   #/compare?l=remote:path&r=remote:path   #/workspace
+//   #/plans   #/plans/<id>   #/plans/new/dedupe?...   #/plans/new/consolidate?...   (docs/PLANS.md)
 // No route (or the token exchange's #token=) means the workspace, so a page opened as before shows the workspace.
 import { html, useEffect, useState } from './vendor/htm-preact-standalone.mjs';
 import { t } from './i18n.js';
@@ -8,16 +9,32 @@ import { pending } from './ctx.js';
 import { Overview } from './overview.js';
 import { Explore } from './explore.js';
 import { Compare } from './compare.js';
+import { Plans } from './plans.js';
 
-export const VIEWS = ['overview', 'explore', 'compare', 'workspace'];
-const VIEW_ICON = { overview: 'chart', explore: 'search', compare: 'swap', workspace: 'columns' };
+// The keys Alt+1 ... Alt+5 select, in order; the rail shows Plans between Compare and the workspace.
+export const VIEWS = ['overview', 'explore', 'compare', 'workspace', 'plans'];
+export const RAIL = ['overview', 'explore', 'compare', 'plans', 'workspace'];
+const VIEW_ICON = { overview: 'chart', explore: 'search', compare: 'swap', workspace: 'columns', plans: 'plans' };
 const ROUTE = /^\/(overview|explore|compare|workspace)(?:\?(.*))?$/;
+const PLANS_ROUTE = /^\/plans((?:\/[^?]*)?)(?:\?(.*))?$/;
+
+/** Where a plans route points: the list, one plan's review, or a form that creates a plan. */
+function plansPage(sub) {
+  const path = sub.replace(/\/+$/, '');
+  const id = /^\/(\d+)$/.exec(path);
+  if (id) return { page: 'review', id: Number(id[1]) };
+  const form = /^\/new\/(dedupe|consolidate)$/.exec(path);
+  if (form) return { page: 'new', kind: form[1] };
+  return { page: 'list' };
+}
 
 export function parseHash(hash) {
   const h = String(hash || '').replace(/^#/, '');
   const m = ROUTE.exec(h);
-  if (!m) return { view: 'workspace', params: new URLSearchParams(), hash: '', explicit: false };
-  return { view: m[1], params: new URLSearchParams(m[2] || ''), hash: `#${h}`, explicit: true };
+  if (m) return { view: m[1], params: new URLSearchParams(m[2] || ''), hash: `#${h}`, explicit: true };
+  const p = PLANS_ROUTE.exec(h);
+  if (p) return { view: 'plans', params: new URLSearchParams(p[2] || ''), hash: `#${h}`, explicit: true, ...plansPage(p[1] || '') };
+  return { view: 'workspace', params: new URLSearchParams(), hash: '', explicit: false };
 }
 
 /** The view the address bar shows right now (read by code that must stay quiet while another view is on top). */
@@ -55,12 +72,12 @@ export function useRoute() {
 
 const isTyping = (el) => !!el && (['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName) || el.isContentEditable);
 
-/** Alt+1 ... Alt+4 switch views; "/" jumps to the Explore box unless a text field has the keyboard. */
+/** Alt+1 ... Alt+5 switch views; "/" jumps to the Explore box unless a text field has the keyboard. */
 export function useShortcuts(route) {
   useEffect(() => {
     const onKey = (e) => {
       if (document.querySelector('.modal-backdrop')) return;
-      if (e.altKey && !e.ctrlKey && !e.metaKey && /^Digit[1-4]$/.test(e.code)) {
+      if (e.altKey && !e.ctrlKey && !e.metaKey && /^Digit[1-5]$/.test(e.code)) {
         e.preventDefault();
         const view = VIEWS[Number(e.code.slice(5)) - 1];
         navigate(remembered[view] || `#/${view}`);
@@ -79,13 +96,17 @@ export function useShortcuts(route) {
   }, [route.view]);
 }
 
-export function Rail({ route }) {
+/** `waiting`: how many plans wait for a review (a badge on the Plans item, read by assistive technology as well). */
+export function Rail({ route, waiting = 0 }) {
   return html`<nav class="rail" aria-label=${t('nav.label')} data-testid="rail">
-    ${VIEWS.map((view, i) => html`<a key=${view} class=${'rail-item' + (route.view === view ? ' on' : '')} href=${`#/${view}`}
+    ${RAIL.map((view) => html`<a key=${view} class=${'rail-item' + (route.view === view ? ' on' : '')} href=${`#/${view}`}
       data-testid=${'rail-' + view} aria-current=${route.view === view ? 'page' : undefined}
-      title=${`${t(`nav.${view}Tip`)} (Alt+${i + 1})`}
+      title=${`${t(`nav.${view}Tip`)} (Alt+${VIEWS.indexOf(view) + 1})`}
       onClick=${(e) => { if (e.ctrlKey || e.metaKey || e.shiftKey || e.button) return; e.preventDefault(); navigate(remembered[view] || `#/${view}`); }}>
-      <${Icon} name=${VIEW_ICON[view]} size=${20} /><span class="rail-label">${t(`nav.${view}`)}</span></a>`)}
+      <${Icon} name=${VIEW_ICON[view]} size=${20} /><span class="rail-label">${t(`nav.${view}`)}</span>
+      ${view === 'plans' && waiting > 0 && html`<span class="rail-badge" data-testid="rail-plans-badge" data-count=${waiting}
+        title=${t('plans.waitingTip', { n: waiting })}><span aria-hidden="true">${waiting > 99 ? '99+' : waiting}</span>
+        <span class="visually-hidden">${t('plans.waitingTip', { n: waiting })}</span></span>`}</a>`)}
   </nav>`;
 }
 
@@ -94,5 +115,6 @@ export function ViewHost({ route }) {
   if (route.view === 'overview') return html`<${Overview} />`;
   if (route.view === 'explore') return html`<${Explore} params=${route.params} />`;
   if (route.view === 'compare') return html`<${Compare} params=${route.params} />`;
+  if (route.view === 'plans') return html`<${Plans} route=${route} />`;
   return null;
 }

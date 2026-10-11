@@ -60,6 +60,8 @@ export function wordParams(ns, params) {
   }
   // Which side of a comparison a refusal is about ("left" | "right").
   if (out.side === 'left' || out.side === 'right') out.side = t(`cmp.side.${out.side}`);
+  // The state a plan is in ('done', 'cancelled'), as a word of the page's language.
+  if (typeof out.plan_status === 'string') out.plan_status = t(`pstatus.${out.plan_status}`, null, out.plan_status);
   if (typeof out.files === 'number') out.files = fmtNum(out.files);
   if (typeof out.limit === 'number') out.limit = fmtNum(out.limit);
   return out;
@@ -238,3 +240,24 @@ export function suggestionText(s) {
 export const fmtDay = (iso) => (iso ? String(iso).slice(0, 10) : '');
 /** "2024-03-01T10:00:00Z" -> "2024-03-01 10:00" (as the catalog wrote it, not converted). */
 export const fmtDateTime = (iso) => (iso ? String(iso).slice(0, 16).replace('T', ' ') : '');
+
+/** A refusal of a plan builder (`build.<CODE>`, worded from its params), else the usual refusal text. */
+export function buildText(err) {
+  if (err && err.code) {
+    const known = t(`build.${err.code}`, wordParams('build', err.params), '');
+    if (known) return known;
+  }
+  return errorText(err);
+}
+
+/** "3 min ago", "5 h ago", "2 d ago" for a catalog time ("2024-03-01T10:00:00Z"); "" when there is none. */
+export function ago(iso, now = Date.now()) {
+  if (!iso) return '';
+  const then = Date.parse(String(iso).endsWith('Z') || /[+-]\d\d:?\d\d$/.test(String(iso)) ? iso : `${iso}Z`);
+  if (Number.isNaN(then)) return '';
+  const min = Math.max(0, Math.round((now - then) / 60000));
+  if (min < 1) return t('ago.now');
+  if (min < 60) return t('ago.min', { n: min });
+  if (min < 2880) return t('ago.hour', { n: Math.round(min / 60) });
+  return t('ago.day', { n: Math.round(min / 1440) });
+}

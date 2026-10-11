@@ -376,7 +376,7 @@ def test_cross_remote_dedupe_keeps_one_overall_and_skips_read_only(w):
     assert all((o.witness_remote_id, o.witness_path) == (w.rid["gdrive"], "Photos/p.jpg") for o in r.ops)
     assert r.skipped == [{"entry_id": w.cat.conn.execute(
         "SELECT id FROM entries WHERE path = 'p.jpg'").fetchone()[0], "location": "archive:p.jpg",
-        "reason": "read-only remote"}]
+        "code": "READ_ONLY", "reason": "read-only remote"}]
     run(w, r)
     assert ("archive", "p.jpg") in w.after(r.ops) and ("gdrive", "Photos/p.jpg") in w.after(r.ops)
 
@@ -529,7 +529,8 @@ def test_consolidate_copy_only_puts_every_content_on_the_target(w):
     assert by_dst["Archive/Documents/2020/report.pdf"] == "dropbox"
     assert by_dst["Archive/Unsorted/icloud/Misc/lonely.bin"] == "icloud"
     assert r.stats == {"contents": 6, "already_on_target": 1, "to_copy": 5, "bytes_to_copy": sum(
-        o.expect_size for o in r.ops), "moves": 0, "deletes": 0, "skipped": 0}
+        o.expect_size for o in r.ops), "bytes_cross_remote": sum(o.expect_size for o in r.ops), "moves": 0, "moves_on_target": 0, "deletes": 0,
+        "skipped": 0, "skipped_by_reason": {}}
     rep = run(w, r)
     assert rep.op_counts == {"copy": 5, "move": 0, "delete": 0}
     after = w.after(r.ops)
@@ -611,7 +612,7 @@ def test_unhashed_icloud_file_with_probable_match_needs_bridging(w):
     r = build_consolidate(w.conn, target="gdrive")
     assert r.ops == []
     assert r.skipped == [{"entry_id": r.skipped[0]["entry_id"], "location": "icloud:Docs/report.pdf",
-                          "reason": "needs bridging: run drivemerge bridge"}]
+                          "code": "PROBABLE_ONLY", "reason": "needs bridging: run drivemerge bridge"}]
     assert r.stats["skipped"] == 1 and r.stats["to_copy"] == 0
     # include_probable trusts the name+size match: nothing is copied
     r = build_consolidate(w.conn, target="gdrive", include_probable=True)
@@ -799,7 +800,7 @@ def test_read_only_sources_are_copied_from_but_never_deleted(w):
     assert [(o.op, w.names()[o.src_remote_id]) for o in r.ops] == [
         ("copy", "dropbox"), ("delete", "dropbox")]
     assert r.skipped == [{"entry_id": r.skipped[0]["entry_id"], "location": "archive:old/r.pdf",
-                          "reason": "read-only remote"}]
+                          "code": "READ_ONLY", "reason": "read-only remote"}]
     run(w, r)
 
 
@@ -1296,3 +1297,217 @@ def test_applied_consolidate_leaves_nothing_to_do(w, seed, root, flags):
     w.apply(r.ops)
     again = build_consolidate(w.conn, target="gdrive", target_root=root, **flags)
     assert [(o.op, o.src_path, o.dst_path or o.witness_path) for o in again.ops] == [], f"seed={seed} {flags}"
+
+
+# =============================================================================
+# Plans view: keep / skip_groups overrides, coded BuildError, new stats and skip codes
+# =============================================================================
+
+def _same(a, b):
+    return [(o.op, o.src_remote_id, o.src_path, o.dst_path, o.witness_path, o.reason) for o in a.ops] == \
+           [(o.op, o.src_remote_id, o.src_path, o.dst_path, o.witness_path, o.reason) for o in b.ops]
+
+
+def _group_key(w, label):
+    return f"g:{w.groups[label]}"
+
+
+def test_build_error_defaults_and_carries_code_and_params():
+    e = BuildError("boom")
+    assert (e.code, e.params, str(e)) == ("BUILD_ERROR", {}, "boom")
+    e = BuildError("x", "READ_ONLY", remote="a")
+    assert (e.code, e.params) == ("READ_ONLY", {"remote": "a"})
+    assert isinstance(e, ValueError)
+
+
+def test_every_raise_site_is_coded(w, catalog):
+    def err(fn, *a, **kw):
+        with pytest.raises(BuildError) as ei:
+            fn(*a, **kw)
+        return ei.value.code, ei.value.params
+
+    ro = w.remote("ro", "drive", writable=False)
+    assert err(build_manual, w.conn, [{"op": "copy", "src": "nowhere"}]) == ("BAD_LOCATION", {"location": "nowhere"})
+    assert err(build_manual, w.conn, [{"op": "copy", "src": "zzz:a", "dst": "gdrive:b"}]) == (
+        "UNKNOWN_REMOTE", {"remote": "zzz"})
+    assert err(build_manual, w.conn, [{"op": "nope", "src": "gdrive:a"}]) == ("BAD_OP", {"index": 1})
+    assert err(build_manual, w.conn, [{"op": "move"}]) == ("MISSING_SRC", {"index": 1})
+    assert err(build_manual, w.conn, [{"op": "copy", "src": "gdrive:a"}]) == ("MISSING_DST", {"index": 1, "op": "copy"})
+    assert err(build_dedupe, w.conn, remote="zzz") == ("UNKNOWN_REMOTE", {"remote": "zzz"})
+    assert err(build_consolidate, w.conn, target="ro") == ("READ_ONLY", {"remote": "ro"})
+    assert err(build_consolidate, w.conn, target="gdrive", sources=["zzz"]) == ("UNKNOWN_REMOTE", {"remote": "zzz"})
+    assert err(build_reorganize, w.conn, remote="ro") == ("READ_ONLY", {"remote": "ro"})
+    assert err(build_dedupe, w.conn, keep=[1]) == ("BAD_PARAM", {"param": "keep"})
+    assert err(build_dedupe, w.conn, skip_groups="g:1") == ("BAD_PARAM", {"param": "skip_groups"})
+    assert err(build_dedupe, w.conn, keep={"g:1": "x"})[0] == "BAD_KEEPER"
+    assert err(build_dedupe, w.conn, skip_groups=["g:999"]) == ("BAD_GROUP", {"group": "g:999"})
+    assert err(build_dedupe, w.conn, keep={"g:999": 1}) == ("BAD_GROUP", {"group": "g:999"})
+    assert ro
+
+
+def _three(w):
+    a = w.put("gdrive", "Docs/report.pdf", "R")
+    b = w.put("gdrive", "Docs/Copy of report.pdf", "R")
+    c = w.put("gdrive", "Archive/old/report.pdf", "R")
+    return a, b, c
+
+
+def test_dedupe_without_overrides_is_unchanged(w):
+    _three(w)
+    w.put("dropbox", "r.pdf", "R")
+    base = build_dedupe(w.conn)
+    assert _same(base, build_dedupe(w.conn, keep={}, skip_groups=()))
+    assert _same(base, build_dedupe(w.conn, keep=None, skip_groups=[]))
+    assert _same(base, build_dedupe(w.conn, group_window=(0, 10)))
+
+
+def test_keep_override_changes_the_keeper_of_that_group_only(w):
+    a, b, c = _three(w)
+    w.put("gdrive", "x/u.txt", "U")
+    w.put("gdrive", "x/v.txt", "U")
+    key = _group_key(w, "R")
+    r = build_dedupe(w.conn, remote="gdrive", keep={key: c})
+    assert sorted(o.src_path for o in r.ops if o.src_entry_id != c) == sorted(
+        ["Docs/report.pdf", "Docs/Copy of report.pdf"] + ["x/v.txt"])
+    assert all(o.witness_path == "Archive/old/report.pdf" for o in r.ops if "report" in o.src_path)
+    assert any(o.src_path == "x/v.txt" for o in r.ops)                           # the other group follows the policy
+    run(w, r)
+
+
+def test_keep_applies_to_its_own_cloud_pool_in_per_cloud_mode(w):
+    g1 = w.put("gdrive", "a/r.pdf", "R")
+    g2 = w.put("gdrive", "b/r (1).pdf", "R")
+    d1 = w.put("dropbox", "a/r.pdf", "R")
+    d2 = w.put("dropbox", "b/r (1).pdf", "R")
+    r = build_dedupe(w.conn, keep={_group_key(w, "R"): g2})
+    got = {(w.names()[o.src_remote_id], o.src_path) for o in r.ops}
+    assert got == {("gdrive", "a/r.pdf"), ("dropbox", "b/r (1).pdf")}           # gdrive overridden, dropbox by policy
+    assert (g1, d1, d2) and run(w, r)
+
+
+def test_keep_across_clouds_may_pick_any_cloud(w):
+    w.put("gdrive", "r.pdf", "R")
+    d = w.put("dropbox", "r.pdf", "R")
+    r = build_dedupe(w.conn, cross_remote=True, keep={_group_key(w, "R"): d})
+    assert [(w.names()[o.src_remote_id], o.src_path) for o in r.ops] == [("gdrive", "r.pdf")]
+    assert r.ops[0].witness_remote_id == w.rid["dropbox"]
+
+
+def test_bad_keeper_cases(w):
+    w.put("gdrive", "a/r.pdf", "R")
+    w.put("gdrive", "b/r (1).pdf", "R")
+    d = w.put("dropbox", "r.pdf", "R")
+    q = w.put("gdrive", ".drive-merge-quarantine/r.pdf", "R")
+    nd = w.put("gdrive", "native.gdoc", "R", native_doc=True)
+    w.put("gdrive", "amb.pdf", "R", provider_id="i1")
+    amb = w.put("gdrive", "amb.pdf", "Z", provider_id="i2")
+    other = w.put("gdrive", "o/other.pdf", "O1")
+    w.put("gdrive", "o/other2.pdf", "O1")
+    key = _group_key(w, "R")
+
+    def bad(**kw):
+        with pytest.raises(BuildError) as ei:
+            build_dedupe(w.conn, **kw)
+        assert ei.value.code == "BAD_KEEPER"
+        return ei.value.params
+
+    assert bad(remote="gdrive", keep={key: d}) == {"group": key, "entry_id": d}          # other cloud, per-cloud mode
+    assert bad(keep={key: q}) == {"group": key, "entry_id": q}                            # quarantined
+    assert bad(keep={key: nd}) == {"group": key, "entry_id": nd}                          # native doc
+    assert bad(keep={key: other}) == {"group": key, "entry_id": other}                    # copy of another group
+    assert bad(keep={key: 10 ** 6}) == {"group": key, "entry_id": 10 ** 6}                # not an entry at all
+    assert amb
+    # an ambiguous path: both Drive files at amb.pdf are in different groups; make one share the group
+    w.put("gdrive", "amb.pdf", "R", provider_id="i3")
+    amb_r = w.conn.execute("SELECT id FROM entries WHERE provider_id = 'i3'").fetchone()[0]
+    assert bad(keep={key: amb_r}) == {"group": key, "entry_id": amb_r}
+    # cross-cloud mode accepts the dropbox copy
+    assert build_dedupe(w.conn, cross_remote=True, keep={key: d}).ops
+
+
+def test_skip_groups_produce_no_ops_and_no_skips(w):
+    _three(w)
+    w.put("gdrive", "x/u.txt", "U")
+    w.put("gdrive", "x/v.txt", "U")
+    r = build_dedupe(w.conn, skip_groups=[_group_key(w, "R")])
+    assert [o.src_path for o in r.ops] == ["x/v.txt"]
+    assert r.stats["groups"] == 1 and r.stats["groups_examined"] == 2
+    assert build_dedupe(w.conn, skip_groups=[_group_key(w, "R"), _group_key(w, "U")]).ops == []
+
+
+def test_group_window_describes_groups_in_build_order(w):
+    a, b, c = _three(w)
+    w.put("gdrive", "x/u.txt", "U")
+    w.put("gdrive", "x/v.txt", "U")
+    w.put("gdrive", "custom-q/u.txt", "U")        # quarantined for this build only (the catalog's own dir differs)
+    r = build_dedupe(w.conn, group_window=(0, 10), skip_groups=[_group_key(w, "U")], quarantine_dir="custom-q")
+    assert [g["key"] for g in r.groups] == [_group_key(w, "R"), _group_key(w, "U")]   # biggest reclaimable first
+    big, small = r.groups
+    assert (big["skipped"], big["reclaim"]) == (False, 2 * (10 + 1))
+    kept = [x for x in big["copies"] if x["keep"]]
+    assert [x["path"] for x in kept] == ["Docs/report.pdf"]
+    assert {x["entry_id"] for x in big["copies"] if x["remove"]} == {b, c}
+    assert all(x["usable"] and x["why_not"] is None for x in big["copies"])
+    assert small["skipped"] and small["reclaim"] == 0
+    assert not any(x["keep"] or x["remove"] for x in small["copies"])
+    why = {x["path"]: x["why_not"] for x in small["copies"]}
+    assert why["custom-q/u.txt"] == "QUARANTINE" and why["x/u.txt"] is None
+    assert build_dedupe(w.conn, group_window=(1, 1)).groups[0]["key"] == _group_key(w, "U")
+    assert build_dedupe(w.conn, group_window=(5, 5)).groups == []
+
+
+def test_dedupe_stats_report_copies_considered_and_skip_codes(w):
+    w.put("gdrive", "a.txt", "X", provider_id="id1")
+    w.put("gdrive", "a.txt", "Y", provider_id="id2")
+    w.put("gdrive", "b/a.txt", "X")
+    w.put("gdrive", "deep/er/a.txt", "X")
+    w.put("gdrive", "custom-q/a.txt", "X")
+    r = build_dedupe(w.conn, quarantine_dir="custom-q")
+    assert r.stats["copies_considered"] == 3                                    # quarantine excluded
+    assert r.stats["skipped_by_reason"] == {"AMBIGUOUS_PATH": 1}
+    assert r.skipped[0]["code"] == "AMBIGUOUS_PATH" and r.skipped[0]["reason"] == "ambiguous path"
+
+
+def test_every_skip_has_a_known_code(w):
+    w.put("gdrive", "keep/r.pdf", "R")
+    w.put("icloud", "Docs/r.pdf", None, size=10 + len("R"))                       # probable only
+    w.put("gdrive", "n.gdoc", "N", native_doc=True)
+    w.put("dropbox", "nosize", "Q", size=None)
+    w.put("dropbox", "amb", "A", provider_id="p1")
+    w.put("dropbox", "amb", "B", provider_id="p2")
+    w.remote("archive", "local", writable=False)
+    w.put("archive", "ro/r.pdf", "R")
+    r = build_consolidate(w.conn, target="gdrive", delete_sources=True)
+    codes = {s["code"] for s in r.skipped}
+    assert codes <= set(builders.SKIP_CODES) and all(set(s) <= {"entry_id", "location", "code", "reason", "dest"}
+                                                     for s in r.skipped)
+    assert set(builders.NOT_KEEPABLE_CODES) <= set(builders.SKIP_CODES)
+    assert {"PROBABLE_ONLY", "AMBIGUOUS_PATH", "READ_ONLY"} <= codes
+    assert r.stats["skipped_by_reason"] == {c: sum(s["code"] == c for s in r.skipped) for c in codes}
+    assert sum(r.stats["skipped_by_reason"].values()) == r.stats["skipped"]
+
+
+def test_unplaceable_destinations_carry_layout_codes(w):
+    w.put("gdrive", "Documents", "F")                                           # a FILE where a layout folder must go
+    w.put("dropbox", "r.pdf", "R")
+    r = build_consolidate(w.conn, target="gdrive")
+    layout = [s for s in r.skipped if s["code"].startswith("LAYOUT_")]
+    assert layout and layout[0]["code"] == "LAYOUT_BLOCKED" and layout[0]["dest"].startswith("gdrive:")
+
+
+def test_consolidate_stats_for_the_estimate(w):
+    w.put("gdrive", "Documents/2020/there.pdf", "T")
+    w.put("dropbox", "Docs/there.pdf", "T")
+    a = w.put("dropbox", "Docs/new.pdf", "N")
+    w.put("onedrive", "Docs/other.pdf", "O")
+    w.put("dropbox", "n.gdoc", "G", native_doc=True)
+    r = build_consolidate(w.conn, target="gdrive")
+    assert r.stats["already_on_target"] == 1 and r.stats["to_copy"] == 2
+    assert r.stats["bytes_to_copy"] == r.stats["bytes_cross_remote"] == sum(o.expect_size for o in r.ops)
+    assert r.stats["moves_on_target"] == 0 and r.stats["deletes"] == 0
+    assert r.stats["skipped_by_reason"] == {"NATIVE_DOC": 1}
+    assert a
+    r = build_consolidate(w.conn, target="gdrive", delete_sources=True)
+    assert r.stats["deletes"] == len(kinds(r, "delete")) > 0
+    r = build_consolidate(w.conn, target="gdrive", reorganize_target=True, target_root="Z")
+    assert r.stats["moves_on_target"] == r.stats["moves"] == len(kinds(r, "move")) > 0

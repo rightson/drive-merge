@@ -5,7 +5,7 @@ Two kinds of caller reach this app, and they are not equal:
 * normal routes (catalog, drafts, trees, suggestions, previews) accept the API
   bearer token or the UI session cookie, so scripts and Claude can stage and
   preview changes alongside the person using the browser;
-* the human channel (approve, execute, rescan) accepts only the session cookie
+* the human channel (approve, execute, rescan, bridge) accepts only the session cookie
   plus a CSRF header, a same-origin check, and a server that was started from an
   interactive terminal. A bearer token never reaches it: whatever an LLM can do
   here ends in a proposal that a person still has to approve.
@@ -33,10 +33,10 @@ from pathlib import Path
 from typing import Any
 
 import uvicorn
-from fastapi import APIRouter, Body, Depends, FastAPI, Request, Response
+from fastapi import APIRouter, Body, Depends, FastAPI, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from . import __version__, plans
 from .api import LOOPBACK_HOSTS, bearer_ok, build_router, install_error_handlers, scrub_secrets
@@ -88,6 +88,11 @@ class ApproveBody(_Body):
 
 class RescanBody(_Body):
     remotes: list[str] | None = None
+
+
+class BridgeBody(_Body):
+    max_bytes: int | None = Field(default=None, ge=0)
+    limit: int = Field(default=100, ge=1, le=100000)
 
 
 def _refusal(status: int, payload: dict, headers: dict[str, str] | None = None) -> JSONResponse:
@@ -296,9 +301,11 @@ def _disabled_message(request: Request) -> str:
         cli = f"`drivemerge plan approve {plan_id}`"
     elif path.endswith("/execute"):
         cli = f"`drivemerge plan execute {plan_id}`"
+    elif path.endswith("/bridge"):
+        cli = "`drivemerge bridge`"
     else:
         cli = "`drivemerge scan --all`"
-    return ("approving, executing and rescanning from the browser is off: `drivemerge ui` must be started from "
+    return ("approving, executing, rescanning and bridging from the browser is off: `drivemerge ui` must be started from "
             "an interactive terminal, outside an AI agent. In your own terminal run "
             f"{cli} (plans are approved with `drivemerge plan approve ID` and run with `drivemerge plan execute ID`)")
 
@@ -591,6 +598,54 @@ def create_ui_app(service: Service, *, config: Config, api_token: str, ui_token:
                                 "detail": scrub_secrets(_json_detail(r[5]))} for r in reversed(rows)],
         }
 
+    @router.post("/v1/ui/plans/{plan_id}/review")
+    def review_plan(plan_id: int, request: Request, ops_limit: int = Query(default=200, ge=0, le=1000),
+                    auth: _Auth = Depends(require_auth)) -> dict:
+        """Simulate the plan against the catalog as it is now and return it for a person to read.
+
+        The approval code is added for a browser session of a server that may approve, when the simulation is ok
+        and the plan is not a stale workspace preview; no other caller ever gets it, or the digest, at any depth.
+        A plan that is approved and still current is not simulated again (that would withdraw the approval)."""
+        with lock:
+            plan = plans.get_plan(service.conn, plan_id, with_ops=False)
+            if plan.status not in ("draft", "simulated", "approved"):
+                raise UiError(409, "PLAN_CLOSED", f"plan {plan_id} is {plan.status} and can no longer be reviewed",
+                              plan=plan_id, plan_status=plan.status)
+            if plan.status == "approved" and plans.current_digest(service.conn, plan_id) == plan.digest:
+                report = None
+            else:
+                report = service.simulate(plan_id)
+            data = service.plan(plan_id, ops_limit=ops_limit)
+            stale = _stale_reason(service.conn, plans.get_plan(service.conn, plan_id, with_ops=False))
+        sim = data.get("simulation")
+        code = None
+        if report is not None:
+            code = report.get("approval_code")
+            sim = report
+        out = scrub_secrets(data)
+        out["simulation"] = scrub_secrets(sim)
+        out["stale_reason"] = stale
+        if (auth.session is not None and approvals_enabled and code and not stale and report is not None
+                and report.get("ok") and data["status"] == "simulated"):
+            out["approval_code"] = code
+        return out
+
+    @router.post("/v1/ui/plans/{plan_id}/cancel")
+    def cancel_plan(plan_id: int) -> dict:
+        with lock:
+            plan = plans.get_plan(service.conn, plan_id, with_ops=False)
+            if plan.status in ("executing", "done", "failed"):
+                raise UiError(409, "PLAN_CLOSED", f"plan {plan_id} is {plan.status} and can no longer be cancelled",
+                              plan=plan_id, plan_status=plan.status)
+            service.cancel(plan_id)
+        return {"ok": True}
+
+    @router.get("/v1/ui/bridge/candidates")
+    def bridge_candidates(max_bytes: int | None = Query(default=None, ge=0),
+                          limit: int = Query(default=100, ge=1, le=100000)) -> dict:
+        with lock:
+            return service.bridge_candidates(max_bytes=max_bytes, limit=limit)
+
     @router.get("/v1/jobs/{job_id}")
     def get_job(job_id: str) -> dict:
         return jobs.view(job_id)
@@ -639,6 +694,23 @@ def create_ui_app(service: Service, *, config: Config, api_token: str, ui_token:
 
         return {"job_id": jobs.start("execute", work, plan_id=plan_id).id}
 
+    @human.post("/v1/ui/bridge", status_code=202)
+    def bridge(body: BridgeBody = BridgeBody()) -> dict:
+        """Download and hash the files that settle the most doubt about duplicates (reads clouds, writes the
+        catalog). Progress is {bridged, failed, total}; the result is Service.bridge's."""
+        def work(job: _Job) -> tuple[Any, str | None]:
+            svc = Service(config)
+            try:
+                result = svc.bridge(
+                    max_bytes=body.max_bytes, limit=body.limit,
+                    started=lambda total: jobs.update(job, total=total),
+                    progress=lambda done, failed: jobs.update(job, bridged=done, failed=failed))
+                return result, None
+            finally:
+                svc.conn.close()
+
+        return {"job_id": jobs.start("bridge", work, bridged=0, failed=0, total=None).id}
+
     @human.post("/v1/ui/rescan", status_code=202)
     def rescan(body: RescanBody = RescanBody()) -> dict:
         names = list(dict.fromkeys(body.remotes or [r.name for r in config.remotes]))
@@ -670,7 +742,8 @@ def create_ui_app(service: Service, *, config: Config, api_token: str, ui_token:
 
         return {"job_id": jobs.start("rescan", work, remotes=names, remotes_total=len(names)).id}
 
-    app.include_router(build_router(service, lock, dependencies=normal))
+    app.include_router(build_router(service, lock, dependencies=normal,
+                                    created_by=lambda request: "ui" if session_of(request) is not None else "api"))
     app.include_router(router)
     app.include_router(human)
     return app

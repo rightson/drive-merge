@@ -1414,3 +1414,34 @@ def test_the_new_tools_are_read_only_and_call_only_read_methods(cmp_fx, monkeypa
     ok(server, "compare_folders", left_remote="gdrive", left_path="L", right_remote="dropbox", right_path="R")
     ok(server, "coverage")
     assert cmp_fx.conn.total_changes == before
+
+
+# --------------------------------------------------------------------------- Plans view: what MCP sees of it
+
+def test_a_dedupe_proposed_over_mcp_is_attributed_coded_and_never_shows_a_secret(fx, server):
+    fx.conn.execute("UPDATE entries SET content_group = ? WHERE id = ?", (fx.photo_g, fx.photo_d))
+    fx.conn.execute("UPDATE entries SET md5 = 'aa', size = 100 WHERE id = ?", (fx.photo_d,))
+    nothing = ok(server, "propose_plan", kind="dedupe", params={"remote": "dropbox"})["data"]
+    assert nothing["plan_id"] is None and nothing["code"] == "NOTHING_TO_DO" and nothing["message"] == "nothing to do"
+    made = ok(server, "propose_plan", kind="dedupe", params={"cross_remote": True, "prefer_remotes": ["gdrive"]})
+    plan_id = made["data"]["plan_id"]
+    assert plan_id and plans.get_plan(fx.conn, plan_id, with_ops=False).created_by == "mcp"
+    outputs = [json.dumps(made), json.dumps(ok(server, "get_plan", plan_id=plan_id)),
+               json.dumps(ok(server, "list_plans")), json.dumps(ok(server, "simulate_plan", plan_id=plan_id))]
+    digest = plans.get_plan(fx.conn, plan_id, with_ops=False).digest
+    for raw in outputs:
+        assert "approval_code" not in raw and '"digest"' not in raw and '"snapshot"' not in raw
+        assert digest not in raw and plans.short_code(digest) not in raw
+
+
+def test_an_mcp_proposal_with_a_bad_override_is_a_clean_error(fx, server):
+    text = err(server, "propose_plan", kind="dedupe", params={"skip_groups": ["g:424242"]})
+    assert "g:424242" in text
+
+
+def test_the_plans_view_adds_no_mcp_tool():
+    assert ALLOWED_TOOLS == {"catalog_stats", "search_files", "file_locations", "find_duplicates", "folder_profiles",
+                             "validate_rules", "preview_layout", "propose_plan", "simulate_plan", "get_plan",
+                             "list_plans", "list_drafts", "get_draft", "create_draft", "browse_tree",
+                             "suggest_reorganization", "stage_moves", "undo_last", "remove_staged", "preview_draft",
+                             "compare_folders", "coverage"}
