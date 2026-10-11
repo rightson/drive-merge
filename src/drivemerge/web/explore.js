@@ -10,7 +10,7 @@ import { AppCtx, pending } from './ctx.js';
 import { CloudDot, PresenceCells, PresenceHeads } from './clouds.js';
 import { Modal, ViewHeader } from './ui.js';
 import {
-  compareHash, exploreHash, hasToken, parseQuery, removeChip, setToken, toggleToken,
+  compareHash, exploreHash, hasToken, parseQuery, plansHash, removeChip, setToken, toggleToken,
 } from './query.js';
 import {
   errorText, fmtBytes, fmtDay, fmtNum, parentOf,
@@ -56,15 +56,32 @@ function FacetBox({ label, count, checked, onChange, testid, dot }) {
     ${dot}<span class="facet-label">${label}</span><span class="facet-count">${fmtNum(count)}</span></label>`;
 }
 
-function Copies({ r, remotes, onReveal, onCompare }) {
+/** The folder that holds every path (their longest common parent). */
+function commonFolder(paths) {
+  const split = paths.map((p) => parentOf(p).split('/').filter(Boolean));
+  const out = [];
+  for (let i = 0; i < Math.min(...split.map((s) => s.length)); i += 1) {
+    if (!split.every((s) => s[i] === split[0][i])) break;
+    out.push(split[0][i]);
+  }
+  return out.join('/');
+}
+
+function Copies({ r, remotes, onReveal, onCompare, onDedupe }) {
   const folders = [];
   for (const c of r.copies) {
     const where = { remote: c.remote, path: parentOf(c.path) };
     if (!folders.some((f) => f.remote === where.remote && f.path === where.path)) folders.push(where);
   }
+  // Several copies on one cloud: a dedupe plan scoped to that cloud and the folder that holds them.
+  const crowded = remotes.map((x) => x.name).filter((n) => r.copies.filter((c) => c.remote === n).length >= 2);
   return html`<div class="ex-copies" role="rowgroup" data-testid="ex-copies">
-    ${folders.length >= 2 && html`<div class="ex-copies-head"><button class="btn btn-small" data-testid="ex-compare-folders"
-      onClick=${() => onCompare(folders[0], folders[1])}><${Icon} name="swap" size=${14} /> ${t('ex.compareFolders')}</button></div>`}
+    ${(folders.length >= 2 || crowded.length > 0) && html`<div class="ex-copies-head">
+      ${folders.length >= 2 && html`<button class="btn btn-small" data-testid="ex-compare-folders"
+        onClick=${() => onCompare(folders[0], folders[1])}><${Icon} name="swap" size=${14} /> ${t('ex.compareFolders')}</button>`}
+      ${crowded.map((n) => html`<button key=${n} class="btn btn-small" data-testid=${'ex-dedupe-' + n}
+        onClick=${() => onDedupe({ remote: n, path: commonFolder(r.copies.filter((c) => c.remote === n).map((c) => c.path)) })}>
+        <${Icon} name="copy" size=${14} /> ${t('ex.dedupeHere', { cloud: n })}</button>`)}</div>`}
     ${r.copies.map((c) => html`<div class=${'ex-copy' + (c.matched ? '' : ' unmatched')} role="row" key=${c.entry_id} data-testid="ex-copy" data-matched=${c.matched ? 'true' : 'false'}>
       <span class="ex-copy-path" role="cell"><${CloudDot} remotes=${remotes} name=${c.remote} size=${8} />
         <span class="mono" title=${`${c.remote}:${c.path}`}>${c.remote}:${c.path}</span>
@@ -76,7 +93,7 @@ function Copies({ r, remotes, onReveal, onCompare }) {
   </div>`;
 }
 
-function ResultRow({ r, remotes, open, onToggle, onReveal, onCompare }) {
+function ResultRow({ r, remotes, open, onToggle, onReveal, onCompare, onDedupe }) {
   const counts = {};
   r.copies.forEach((c) => { counts[c.remote] = (counts[c.remote] || 0) + 1; });
   const cat = iconFor({ is_dir: false, category: r.category });
@@ -93,7 +110,7 @@ function ResultRow({ r, remotes, open, onToggle, onReveal, onCompare }) {
       <span class="ex-size num" role="cell">${fmtBytes(r.size)}</span>
       <span class="ex-mtime muted" role="cell">${fmtDay(r.mtime)}</span>
     </div>
-    ${open && html`<${Copies} r=${r} remotes=${remotes} onReveal=${onReveal} onCompare=${onCompare} />`}
+    ${open && html`<${Copies} r=${r} remotes=${remotes} onReveal=${onReveal} onCompare=${onCompare} onDedupe=${onDedupe} />`}
   </div>`;
 }
 
@@ -184,6 +201,7 @@ export function Explore({ params }) {
   const toggleSingle = (key, current, value) => commit(setToken(text, names, key, current === value ? null : value));
   const reveal = (loc) => ctx.revealInWorkspace(loc);
   const compare = (a, b) => ctx.nav(compareHash(a, b));
+  const dedupe = ({ remote, path }) => ctx.nav(plansHash('/new/dedupe', { remote, path }));
 
   const order = (list) => [...list].sort((a, b) => names.indexOf(a.name) - names.indexOf(b.name));
 
@@ -254,7 +272,7 @@ export function Explore({ params }) {
             <span role="columnheader">${t('ex.col.modified')}</span>
           </div>
           ${state.results.map((r) => html`<${ResultRow} key=${r.key} r=${r} remotes=${remotes} open=${!!open[r.key]}
-            onToggle=${() => setOpen((o) => ({ ...o, [r.key]: !o[r.key] }))} onReveal=${reveal} onCompare=${compare} />`)}
+            onToggle=${() => setOpen((o) => ({ ...o, [r.key]: !o[r.key] }))} onReveal=${reveal} onCompare=${compare} onDedupe=${dedupe} />`)}
         </div>
         ${!state.loading && !state.error && data && shown === 0 && html`<p class="empty-hint" data-testid="ex-none">${t('ex.none')}</p>`}
         ${data && shown < total && html`<div class="ex-more"><button class="btn" data-testid="ex-load-more" disabled=${more}

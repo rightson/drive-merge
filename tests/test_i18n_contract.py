@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 
 import drivemerge
-from drivemerge import simulate
+from drivemerge import builders, simulate
 
 SRC = Path(drivemerge.__file__).parent
 CJK = re.compile("[぀-ヿ㐀-䶿一-鿿豈-﫿가-힯]")
@@ -240,6 +240,67 @@ def test_the_jobs_and_staged_step_codes_have_sentences():
     codes = {const(v) for n in ast.walk(ast.parse((SRC / "workspace.py").read_text(encoding="utf-8")))
              if isinstance(n, ast.Dict) for k, v in zip(n.keys, n.values) if const(k) == "code" and const(v)}
     assert {"SRC_NOT_FOUND", "DST_NOT_DIR"} <= codes
+
+
+# --------------------------------------------------------------------------- the Plans view: build errors, skips
+
+def build_error_sites() -> dict[str, list[set[str]]]:
+    """{code: [parameter names of each raise site]} of every `BuildError(message, code, **params)` in builders.py."""
+    sites: dict[str, list[set[str]]] = {}
+    for call in calls("builders.py", "BuildError"):
+        code = const(call.args[1]) if len(call.args) > 1 else next(
+            (const(k.value) for k in call.keywords if k.arg == "code"), None)
+        assert code is not None, f"builders.py:{call.lineno}: a BuildError without a literal code"
+        sites.setdefault(code, []).append(keyword_names(call) - {"code"})
+    return sites
+
+
+def test_every_build_error_code_has_a_sentence_that_uses_only_what_every_site_sends():
+    """A BuildError is answered as 400 {error, code, params}; the page words build.<CODE> from the params."""
+    sites = build_error_sites()
+    assert set(sites) == {"BAD_LOCATION", "UNKNOWN_REMOTE", "BAD_OP", "MISSING_SRC", "MISSING_DST", "READ_ONLY",
+                          "BAD_PARAM", "BAD_KEEPER", "BAD_GROUP"}, sorted(sites)
+    sites["BUILD_ERROR"] = [set()]                         # the default code of a BuildError raised without one
+    for code, per_site in sites.items():
+        need(f"build.{code}")
+        usable = set.intersection(*per_site)
+        for lang, d in DICTS.items():
+            assert placeholders(d[f"build.{code}"]) <= usable, f"{lang} build.{code}: {placeholders(d[f'build.{code}']) - usable}"
+    assert keys_of(r"build\.[A-Z_]+") == {f"build.{c}" for c in sites}
+
+
+def test_every_skip_code_has_a_sentence():
+    """A skipped file and a copy a dedupe group cannot keep (`why_not`) are worded from skip.<CODE>. The sentence
+    sits next to the file's location, so it takes no parameter, except the destination of a layout skip."""
+    emitted = set()
+    tree = ast.parse((SRC / "builders.py").read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Dict):
+            emitted |= {const(v) for k, v in zip(node.keys, node.values) if const(k) == "code" and const(v)}
+        if isinstance(node, ast.Call) and (getattr(node.func, "id", None) or getattr(node.func, "attr", None)) in (
+                "_skip", "_skip_unplaceable"):
+            emitted |= {const(a) for a in node.args if isinstance(const(a), str) and const(a).isupper()}
+    emitted |= {"LAYOUT_BLOCKED", "LAYOUT_TAKEN"}          # _skip_unplaceable picks one of them
+    assert emitted <= set(builders.SKIP_CODES), emitted - set(builders.SKIP_CODES)
+    assert set(builders.NOT_KEEPABLE_CODES) <= set(builders.SKIP_CODES)
+    assert set(builders.SKIP_CODES) == emitted | set(builders.NOT_KEEPABLE_CODES)
+    for code in builders.SKIP_CODES:
+        need(f"skip.{code}")
+        usable = {"dest"} if code.startswith("LAYOUT_") else set()
+        for lang, d in DICTS.items():
+            assert placeholders(d[f"skip.{code}"]) <= usable, f"{lang} skip.{code}"
+    assert keys_of(r"skip\.[A-Z_]+") == {f"skip.{c}" for c in builders.SKIP_CODES}
+
+
+def test_the_plan_codes_the_server_sends_have_sentences():
+    for key in ("err.PLAN_CLOSED", "plans.NOTHING_TO_DO"):
+        need(key)
+    for lang, d in DICTS.items():
+        assert placeholders(d["err.PLAN_CLOSED"]) <= {"plan", "plan_status"}, lang
+        assert not placeholders(d["plans.NOTHING_TO_DO"]), lang
+    assert '"NOTHING_TO_DO"' in (SRC / "service.py").read_text(encoding="utf-8")
+    sites = [keyword_names(c) for c in calls("ui_api.py", "UiError") if const(c.args[1]) == "PLAN_CLOSED"]
+    assert len(sites) == 2 and all({"plan", "plan_status"} <= s for s in sites)
 
 
 # --------------------------------------------------------------------------- suggestions

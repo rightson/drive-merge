@@ -22,6 +22,12 @@ export function compareHash(left, right) {
   return '#/compare' + (s ? '?' + s : '');
 }
 
+/** `#/plans`, `#/plans/14`, `#/plans/new/dedupe?...` (docs/PLANS.md section E); `sub` is the part after `/plans`. */
+export function plansHash(sub = '', obj = {}) {
+  const s = pairs(obj);
+  return '#/plans' + sub + (s ? '?' + s : '');
+}
+
 /** "remote:path" -> {remote, path}; null when it names no remote. Remote names cannot contain ':'. */
 export function parsePlace(text) {
   if (!text) return null;
@@ -56,7 +62,7 @@ const wrap = (s) => (/[\s"]/.test(s) ? `"${s.replace(/"/g, '')}"` : s);
 const UNIT = { '': 0, k: 1, m: 2, g: 3, t: 4 };
 const UNIT_LETTER = ['', 'K', 'M', 'G', 'T'];
 
-function parseSize(s) {
+export function parseSize(s) {
   const m = /^(\d+(?:\.\d+)?)\s*([kmgt]?)b?$/i.exec(s.trim());
   if (!m) return null;
   return Math.round(Number(m[1]) * 1024 ** UNIT[m[2].toLowerCase()]);

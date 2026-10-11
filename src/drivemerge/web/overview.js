@@ -8,14 +8,14 @@ import * as api from './api.js';
 import { Icon } from './icons.js';
 import { AppCtx } from './ctx.js';
 import { CloudDot, CloudName, cloudColor } from './clouds.js';
-import { ViewHeader } from './ui.js';
-import { compareHash, exploreHash } from './query.js';
-import { errorText, fmtBytes, fmtDateTime, fmtLoc, fmtNum, suggestionText } from './util.js';
+import { Modal, ViewHeader } from './ui.js';
+import { compareHash, exploreHash, parseSize, plansHash } from './query.js';
+import { errorText, fmtBytes, fmtDateTime, fmtLoc, fmtNum, sleep, suggestionText } from './util.js';
 
 const CATEGORIES = ['photo', 'video', 'audio', 'document', 'pdf', 'spreadsheet', 'presentation', 'archive', 'code', 'design', 'other'];
 const MAX_BARS = 24;
 
-function CloudCard({ remote, remotes, category, onOpen }) {
+function CloudCard({ remote, remotes, category, onOpen, onBridge, onConsolidate }) {
   const only = remote.only_here || { contents: 0, bytes: 0 };
   const unverified = remote.unverified_files || 0;
   const scan = remote.last_scan;
@@ -33,10 +33,13 @@ function CloudCard({ remote, remotes, category, onOpen }) {
       <span class="cloud-only-label">${t('ov.onlyHere')}</span>
       <span><strong>${fmtNum(only.contents)}</strong> · ${fmtBytes(only.bytes)}</span>
     </button>
+    ${onConsolidate && only.contents > 0 && html`<button class="link cloud-gather" data-testid=${'cloud-consolidate-' + remote.name}
+      title=${t('ov.gatherTip')} onClick=${() => onConsolidate(remote.name)}>${t('ov.gather')}</button>`}
     <p class=${'cloud-unverified' + (unverified > 0 ? ' warn' : '')} data-testid=${'cloud-unverified-' + remote.name}>
       ${t('ov.noHash')}: <strong>${fmtNum(unverified)}</strong></p>
     ${unverified > 0 && html`<p class="cloud-undercount" data-testid=${'cloud-undercount-' + remote.name}>
-      <${Icon} name="alert" size=${13} /> <span>${t('ov.underCounted')} <code>drivemerge bridge</code></span></p>`}
+      <${Icon} name="alert" size=${13} /> <span>${t('ov.underCounted')} <code>drivemerge bridge</code></span>
+      ${onBridge && html`<button class="btn btn-tiny" data-testid=${'bridge-open-' + remote.name} onClick=${onBridge}>${t('bridge.button')}</button>`}</p>`}
   </article>`;
 }
 
@@ -170,6 +173,98 @@ function Similar({ items, state, remotes, onCompare }) {
   </section>`;
 }
 
+/** Download and hash the files that have no comparable hash (docs/PLANS.md section 6). Reads clouds, writes only the catalog. */
+function BridgeDialog({ onClose, onDone }) {
+  const [budget, setBudget] = useState('5 GB');
+  const [limit, setLimit] = useState('500');
+  const [cand, setCand] = useState({ loading: true, data: null, error: null });
+  const [phase, setPhase] = useState('form');   // form | running | done | failed
+  const [job, setJob] = useState(null);
+  const [error, setError] = useState('');
+  const alive = useRef(true);
+  useEffect(() => () => { alive.current = false; }, []);
+  const bytes = parseSize(budget);
+  const count = /^\d+$/.test(limit.trim()) ? Number(limit) : null;
+  const valid = bytes !== null && bytes > 0 && count !== null && count > 0;
+
+  useEffect(() => {
+    if (!valid) { setCand({ loading: false, data: null, error: null }); return undefined; }
+    let live = true;
+    setCand((c) => ({ ...c, loading: true }));
+    const timer = setTimeout(() => {
+      api.bridgeCandidates({ maxBytes: bytes, limit: count }).then(
+        (data) => { if (live) setCand({ loading: false, data, error: null }); },
+        (e) => { if (live) setCand({ loading: false, data: null, error: e }); },
+      );
+    }, 300);
+    return () => { live = false; clearTimeout(timer); };
+  }, [bytes, count]);
+
+  async function start() {
+    setError('');
+    let id;
+    try {
+      id = (await api.startBridge({ maxBytes: bytes, limit: count })).job_id;
+    } catch (e) {
+      setError(errorText(e));
+      return;
+    }
+    setPhase('running');
+    let failures = 0;
+    for (;;) {
+      if (!alive.current) return;
+      try {
+        const j = await api.job(id);
+        if (!alive.current) return;
+        setJob(j);
+        failures = 0;
+        if (j.status === 'done') { setPhase('done'); onDone(); return; }
+        if (j.status === 'failed') { setError(j.error || t('bridge.failed')); setPhase('failed'); return; }
+      } catch (e) {
+        failures += 1;
+        if (failures > 10) { setError(errorText(e)); setPhase('failed'); return; }
+      }
+      await sleep(700);
+    }
+  }
+
+  const p = (job && job.progress) || {};
+  const result = (job && job.result) || {};
+  const failedCount = Array.isArray(result.failed) ? result.failed.length : (p.failed || 0);
+  const total = p.total || (cand.data && cand.data.count) || 0;
+  const done = phase === 'done' ? (result.bridged !== undefined ? result.bridged : p.bridged || 0) : p.bridged || 0;
+  const pct = phase === 'done' ? 100 : total ? Math.min(100, Math.round(((done + (p.failed || 0)) / total) * 100)) : 0;
+  return html`<${Modal} label=${t('bridge.title')} onClose=${onClose} testid="bridge-dialog" dismissable=${phase !== 'running'}>
+    <div class="dialog">
+      <h2 class="dialog-title">${t('bridge.title')}</h2>
+      <p class="dialog-message">${t('bridge.text')}</p>
+      ${phase === 'form' && html`
+        <label class="field"><span>${t('bridge.budget')}</span>
+          <input type="text" data-testid="bridge-budget" value=${budget} autocomplete="off" spellcheck="false" aria-invalid=${bytes === null}
+            onInput=${(e) => setBudget(e.target.value)} /></label>
+        <label class="field"><span>${t('bridge.limit')}</span>
+          <input type="text" data-testid="bridge-limit" value=${limit} autocomplete="off" spellcheck="false" inputmode="numeric"
+            aria-invalid=${count === null} onInput=${(e) => setLimit(e.target.value)} /></label>
+        <p class="pl-help" data-testid="bridge-candidates" aria-live="polite">${!valid ? t('bridge.bad')
+    : cand.error ? errorText(cand.error)
+      : cand.data ? (cand.data.count > 0 ? t('bridge.candidates', { n: fmtNum(cand.data.count), bytes: fmtBytes(cand.data.bytes) }) : t('bridge.none'))
+        : t('common.loading')}</p>`}
+      ${phase !== 'form' && html`<div data-testid="bridge-progress" data-phase=${phase}>
+        <div class="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow=${pct} aria-label=${t('bridge.progress')}><span style=${{ width: `${pct}%` }}></span></div>
+        <p class="progress-nums" data-testid="bridge-nums">${phase === 'done' ? t('bridge.done', { bridged: fmtNum(done), failed: fmtNum(failedCount) })
+    : phase === 'failed' ? t('bridge.failed') : t('bridge.running', { bridged: fmtNum(p.bridged || 0), failed: fmtNum(p.failed || 0), total: fmtNum(total) })}</p>
+        ${phase === 'done' && html`<p class="note">${t('bridge.doneHelp')}</p>`}</div>`}
+      ${error && html`<p class="note error" role="alert" data-testid="bridge-error">${error}</p>`}
+      <div class="dialog-actions">
+        <button type="button" class="btn" data-testid="bridge-close" onClick=${onClose} disabled=${phase === 'running'}>${phase === 'form' ? t('common.cancel') : t('common.close')}</button>
+        ${phase === 'form' && html`<button type="button" class="btn btn-primary" data-testid="bridge-start" disabled=${!valid || !(cand.data && cand.data.count > 0)}
+          onClick=${start}>${t('bridge.start')}</button>`}
+        ${phase === 'running' && html`<span class="spinner" aria-hidden="true"></span>`}
+      </div>
+    </div>
+  <//>`;
+}
+
 export function Overview() {
   const ctx = useContext(AppCtx);
   const remotes = ctx.config.remotes || [];
@@ -178,6 +273,8 @@ export function Overview() {
   const [cov, setCov] = useState({ loading: true, data: null, error: '' });
   const [sims, setSims] = useState({ loading: true, items: [], error: '' });
   const seq = useRef(0);
+  const [bridge, setBridge] = useState(false);
+  const [reload, setReload] = useState(0);
 
   useEffect(() => {
     const mine = (seq.current += 1);
@@ -186,7 +283,7 @@ export function Overview() {
       (data) => { if (mine === seq.current) setCov({ loading: false, data, error: '' }); },
       (e) => { if (mine === seq.current) setCov({ loading: false, data: null, error: e }); },
     );
-  }, [category]);
+  }, [category, reload]);
 
   useEffect(() => {
     let alive = true;
@@ -200,6 +297,11 @@ export function Overview() {
   const data = cov.data;
   const totals = (data && data.totals) || {};
   const openExplore = (text) => ctx.nav(exploreHash(text));
+  /** "Only here" on a cloud: gather it onto the first other cloud that can be written to. */
+  const openConsolidate = (name) => {
+    const target = remotes.find((o) => o.name !== name && o.writable !== false);
+    if (target) ctx.nav(plansHash('/new/consolidate', { target: target.name, src: name }));
+  };
   const hasBars = data && ((data.intersections || []).length > 0 || data.other);
 
   return html`<main class="view view-overview" data-testid="view-overview" aria-label=${t('nav.overview')}>
@@ -208,7 +310,9 @@ export function Overview() {
       ${cov.error && html`<p class="view-error" role="alert" data-testid="ov-error">${errorText(cov.error)}</p>`}
       ${!data && cov.loading && html`<p class="empty-hint">${t('common.loading')}</p>`}
       ${data && html`<div class="cloud-cards" data-testid="cloud-cards">
-        ${(data.remotes || []).map((r) => html`<${CloudCard} key=${r.name} remote=${r} remotes=${remotes} category=${category} onOpen=${openExplore} />`)}
+        ${(data.remotes || []).map((r) => html`<${CloudCard} key=${r.name} remote=${r} remotes=${remotes} category=${category} onOpen=${openExplore}
+          onBridge=${ctx.config.approvals_enabled ? () => setBridge(true) : undefined}
+          onConsolidate=${(remotes.some((o) => o.name !== r.name && o.writable !== false) ? (name) => openConsolidate(name) : undefined)} />`)}
       </div>`}
       ${data && html`<section class="ov-panel" aria-labelledby="ov-chart-h">
         <div class="ov-panel-head">
@@ -217,6 +321,7 @@ export function Overview() {
             <span>${t('ov.unique')} <strong>${fmtBytes(totals.bytes)}</strong></span>
             <span>${t('ov.stored')} <strong>${fmtBytes(totals.stored_bytes)}</strong></span>
             <span>${t('ov.redundant')} <strong>${fmtBytes(totals.redundant_bytes)}</strong></span>
+            ${totals.redundant_bytes > 0 && html`<button class="link" data-testid="ov-dedupe" onClick=${() => ctx.nav(plansHash('/new/dedupe'))}>${t('ov.dedupeLink')}</button>`}
             <span class="muted">${t('ov.contents', { n: fmtNum(totals.contents) })}</span>
           </p>
           <span class="spacer"></span>
@@ -239,5 +344,6 @@ export function Overview() {
       <${Similar} items=${sims.items} state=${sims} remotes=${remotes}
         onCompare=${(a, b) => ctx.nav(compareHash({ remote: a.remote, path: a.path }, { remote: b.remote, path: b.path }))} />
     </div>
+    ${bridge && html`<${BridgeDialog} onClose=${() => setBridge(false)} onDone=${() => setReload((n) => n + 1)} />`}
   </main>`;
 }

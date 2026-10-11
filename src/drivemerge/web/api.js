@@ -110,3 +110,14 @@ export const explore = (params) => {
   }
   return call('GET', '/v1/explore', { query });
 };
+
+// Plans (docs/PLANS.md section C).
+export const plan = (id) => call('GET', `/v1/plans/${id}`);
+export const planSummaries = async ({ status, limit = 100 } = {}) =>
+  list(await call('GET', '/v1/plans/summaries', { query: { status, limit } }), 'plans');
+export const estimatePlan = (kind, params, sample = 50) => call('POST', '/v1/plans/estimate', { body: { kind, params, sample } });
+export const createPlan = (body) => call('POST', '/v1/plans', { body });
+export const reviewPlan = (id) => call('POST', `/v1/ui/plans/${id}/review`);
+export const cancelPlan = (id) => call('POST', `/v1/ui/plans/${id}/cancel`);
+export const bridgeCandidates = ({ maxBytes, limit } = {}) => call('GET', '/v1/ui/bridge/candidates', { query: { max_bytes: maxBytes, limit } });
+export const startBridge = ({ maxBytes, limit } = {}) => call('POST', '/v1/ui/bridge', { body: { max_bytes: maxBytes, limit } });
