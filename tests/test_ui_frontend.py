@@ -16,7 +16,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, NamedTuple
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import pytest
 
@@ -146,6 +146,24 @@ CATEGORY = {"pdf": "pdf", "docx": "document", "txt": "document", "csv": "spreads
             "jpg": "photo", "zip": "archive"}
 
 
+# The catalog as the Explore and Overview views see it: one entry per content, with every live copy.
+CATALOG = [
+    {"key": "g:1", "name": "thesis_final.pdf", "size": 4_212_331, "category": "pdf", "ext": "pdf", "mtime": "2023-06-01T10:00:00Z",
+     "verified": True, "copies": [("gdrive", "研究/論文/thesis_final.pdf"), ("dropbox", "學校/thesis_final.pdf"),
+                                  ("dropbox", "Archive/thesis-v9.pdf")]},
+    {"key": "g:2", "name": "survey.csv", "size": 120_000, "category": "spreadsheet", "ext": "csv", "mtime": "2022-11-12T08:00:00Z",
+     "verified": True, "copies": [("gdrive", "研究/資料/survey.csv")]},
+    {"key": "g:3", "name": "trip.jpg", "size": 3_000_000, "category": "photo", "ext": "jpg", "mtime": "2021-08-01T09:00:00Z",
+     "verified": True, "copies": [("gdrive", "Photos/trip.jpg")]},
+    {"key": "g:4", "name": "old.zip", "size": 9_000_000, "category": "archive", "ext": "zip", "mtime": "2019-01-01T00:00:00Z",
+     "verified": True, "copies": [("dropbox", "Archive/old.zip")]},
+    {"key": "g:5", "name": "report.pdf", "size": 52_000, "category": "pdf", "ext": "pdf", "mtime": "2024-02-01T12:00:00Z",
+     "verified": True, "copies": [("gdrive", "學校/report.pdf"), ("dropbox", "學校/report.pdf")]},
+    {"key": "e:9", "name": "notes.txt", "size": 3_000, "category": "document", "ext": "txt", "mtime": "2024-03-01T10:00:00Z",
+     "verified": False, "copies": [("gdrive", "研究/資料/notes.txt")]},
+]
+
+
 def _join(base: str, name: str) -> str:
     return f"{base}/{name}" if base else name
 
@@ -203,6 +221,12 @@ class MockApi:
         self.violations_extra: list[dict] = []
         self.outdated: list[str] = []          # what /v1/ui/config reports as changed since the last completed scan
         self.job_polls = 0
+        self.catalog = copy.deepcopy(CATALOG)
+        self.coverage_override: dict | None = None   # a canned /v1/coverage answer
+        self.compare_limit: int | None = None        # files per side above which /v1/compare refuses
+        self.unproven: set[str] = set()              # relative paths /v1/compare reports as `unverified`
+        self.unique_names: set[str] = {"figure3.png"}  # one-side files whose content exists nowhere else
+        self.explore_fail: tuple[str, dict] | None = None  # (code, params): /v1/explore refuses with a 400
         self.session_open = False
         self.next_draft_id = 1
         self.next_action_id = 1
@@ -550,6 +574,12 @@ class MockApi:
                 return 200, {"draft_version": d["version"], "removed": [int(m2.group(1))]}
             if method == "POST" and rest == "/preview":
                 return 200, self.preview()
+        if (method, path) == ("GET", "/v1/coverage"):
+            return 200, self.coverage(q)
+        if (method, path) == ("GET", "/v1/explore"):
+            return self.explore(q)
+        if (method, path) == ("GET", "/v1/compare"):
+            return self.compare(q)
         if (method, path) == ("GET", "/v1/search"):
             needle = q.get("q", "").lower()
             hits = []
@@ -589,6 +619,204 @@ class MockApi:
                                                          "dst": {"remote": "dropbox", "path": "學校/資料/survey.csv"}},
                          "recent_journal": []}
         return 404, {"error": f"unmocked {method} {path}"}
+
+    # ------------------------------------------------------------------ Overview, Explore and Compare (docs/EXPLORE.md)
+    @staticmethod
+    def _remote_names() -> list[str]:
+        return [r["name"] for r in REMOTES]
+
+    def coverage(self, q: dict) -> dict:
+        if self.coverage_override is not None:
+            return self.coverage_override
+        order = self._remote_names()
+        items = [c for c in self.catalog if c["size"] > 0 and (not q.get("category") or c["category"] == q["category"])]
+        sets: dict[tuple, dict] = {}
+        for c in items:
+            names = tuple(sorted({r for r, _ in c["copies"]}, key=order.index))
+            b = sets.setdefault(names, {"remotes": list(names), "contents": 0, "bytes": 0, "copies": 0, "stored_bytes": 0})
+            b["contents"] += 1
+            b["bytes"] += c["size"]
+            b["copies"] += len(c["copies"])
+            b["stored_bytes"] += c["size"] * len(c["copies"])
+        bars = sorted(sets.values(), key=lambda b: (-b["bytes"], -b["contents"], b["remotes"]))
+        remotes = []
+        for r in REMOTES:
+            mine = [c for c in items if any(x == r["name"] for x, _ in c["copies"])]
+            only = [c for c in mine if {x for x, _ in c["copies"]} == {r["name"]}]
+            remotes.append({
+                "name": r["name"], "provider": r["provider"], "writable": r["writable"],
+                "files": sum(1 for c in mine for x, _ in c["copies"] if x == r["name"]),
+                "bytes": sum(c["size"] for c in mine for x, _ in c["copies"] if x == r["name"]),
+                "only_here": {"contents": len(only), "bytes": sum(c["size"] for c in only)},
+                "unverified_files": sum(1 for c in mine if not c["verified"]),
+                "last_scan": {"id": 3, "status": "done", "finished_at": "2024-03-01T10:00:00Z"}})
+        total = sum(c["size"] for c in items)
+        stored = sum(c["size"] * len(c["copies"]) for c in items)
+        return {"remotes": remotes,
+                "totals": {"contents": len(items), "bytes": total, "stored_bytes": stored, "redundant_bytes": stored - total,
+                           "copies": sum(len(c["copies"]) for c in items)},
+                "intersections": bars, "other": None}
+
+    def explore(self, q: dict) -> tuple[int, dict]:
+        order = self._remote_names()
+        if self.explore_fail:
+            code, params = self.explore_fail
+            return 400, {"error": "the parameter is not valid", "code": code, "params": params}
+
+        def lst(key: str) -> list[str]:
+            return [x for x in q.get(key, "").split(",") if x]
+
+        for key in ("in", "on", "not_on", "only_on"):
+            for name in ([q[key]] if key == "in" and key in q else lst(key)):
+                if name not in order:
+                    return 404, {"error": f"no remote {name}", "code": "NOT_FOUND", "params": {"remote": name}}
+        if q.get("min_size") and not q["min_size"].isdigit():
+            return 400, {"error": "bad min_size", "code": "BAD_QUERY", "params": {"param": "min_size"}}
+        words = q.get("q", "").lower().split()
+        on, not_on, only_on = lst("on"), lst("not_on"), lst("only_on")
+        found = []
+        for c in self.catalog:
+            remotes = {r for r, _ in c["copies"]}
+            hits = []
+            for r, path in c["copies"]:
+                text = (path + " " + path.rpartition("/")[2]).lower()
+                if not all(w in text for w in words):
+                    continue
+                if q.get("in") and r != q["in"]:
+                    continue
+                if q.get("path_prefix") and not (path.startswith(q["path_prefix"] + "/") or path == q["path_prefix"]):
+                    continue
+                hits.append((r, path))
+            if not hits:
+                continue
+            if q.get("category") and c["category"] != q["category"]:
+                continue
+            if q.get("ext") and c["ext"] != q["ext"]:
+                continue
+            if q.get("min_size") and c["size"] < int(q["min_size"]):
+                continue
+            if q.get("max_size") and c["size"] > int(q["max_size"]):
+                continue
+            if q.get("modified_after") and c["mtime"] < q["modified_after"]:
+                continue
+            if q.get("modified_before") and c["mtime"] >= q["modified_before"]:
+                continue
+            if any(r not in remotes for r in on) or any(r in remotes for r in not_on):
+                continue
+            if only_on and remotes != set(only_on):
+                continue
+            n = len(c["copies"])
+            if q.get("copies_min") and n < int(q["copies_min"]):
+                continue
+            if q.get("copies_max") and n > int(q["copies_max"]):
+                continue
+            found.append((c, set(hits)))
+        sort = q.get("sort", "relevance")
+        keyf = {"size": lambda t: (-t[0]["size"], t[0]["name"]), "mtime": lambda t: (t[0]["mtime"], t[0]["name"]),
+                "copies": lambda t: (-len(t[0]["copies"]), t[0]["name"])}.get(sort, lambda t: (t[0]["name"], t[0]["key"]))
+        found.sort(key=keyf, reverse=sort == "mtime")
+        limit, offset = int(q.get("limit", 50)), int(q.get("offset", 0))
+        cats: dict[str, int] = {}
+        exts: dict[str, int] = {}
+        per_remote: dict[str, int] = {}
+        copies = {"1": 0, "2": 0, "3+": 0}
+        for c, _ in found:
+            cats[c["category"]] = cats.get(c["category"], 0) + 1
+            exts[c["ext"]] = exts.get(c["ext"], 0) + 1
+            for r in {r for r, _ in c["copies"]}:
+                per_remote[r] = per_remote.get(r, 0) + 1
+            copies["1" if len(c["copies"]) == 1 else "2" if len(c["copies"]) == 2 else "3+"] += 1
+        results = [{"key": c["key"], "name": c["name"], "size": c["size"], "category": c["category"], "ext": c["ext"],
+                    "mtime": c["mtime"], "verified": c["verified"], "remotes": sorted({r for r, _ in c["copies"]}, key=order.index),
+                    "copies_count": len(c["copies"]),
+                    "copies": [{"entry_id": 100 + i, "remote": r, "path": p, "name": p.rpartition("/")[2], "mtime": c["mtime"],
+                                "matched": (r, p) in hits} for i, (r, p) in enumerate(c["copies"])]}
+                   for c, hits in found[offset:offset + limit]]
+        return 200, {"total": len(found), "truncated": False, "results": results,
+                     "facets": {"remotes": [{"name": n, "contents": per_remote[n]} for n in order if n in per_remote],
+                                "copies": {k: v for k, v in copies.items() if v},
+                                "categories": [{"category": k, "contents": v} for k, v in sorted(cats.items())],
+                                "exts": [{"ext": k, "contents": v} for k, v in sorted(exts.items())][:12]}}
+
+    def compare(self, q: dict) -> tuple[int, dict]:
+        sides = {}
+        for side in ("left", "right"):
+            remote, path = q[f"{side}_remote"], q[f"{side}_path"].strip("/")
+            if remote not in self._remote_names():
+                return 404, {"error": f"no remote {remote}", "code": "NOT_FOUND", "params": {"remote": remote}}
+            node = _get(self.fs, remote, path)
+            if path == QUARANTINE or path.startswith(QUARANTINE + "/"):
+                return 409, {"error": "quarantine", "code": "QUARANTINE", "params": {"item": _loc(remote, path)}}
+            if not isinstance(node, dict):
+                return 409, {"error": "not a folder", "code": "NOT_A_FOLDER", "params": {"remote": remote, "path": path}}
+            sides[side] = (remote, path, node)
+        (lr, lp, ln), (rr, rp, rn) = sides["left"], sides["right"]
+        if lr == rr and (lp == rp or lp.startswith(rp + "/") or rp.startswith(lp + "/") or lp == "" or rp == ""):
+            return 409, {"error": "nested", "code": "COMPARE_NESTED", "params": {"left": _loc(lr, lp), "right": _loc(rr, rp)}}
+
+        def flat(node: dict, base: str = "") -> dict[str, int]:
+            out: dict[str, int] = {}
+            for name, child in node.items():
+                rel = _join(base, name)
+                out.update(flat(child, rel) if isinstance(child, dict) else {rel: child})
+            return out
+
+        lf, rf = flat(ln), flat(rn)
+        for side, files, limit_side in (("left", lf, self.compare_limit), ("right", rf, self.compare_limit)):
+            if limit_side is not None and len(files) > limit_side:
+                return 409, {"error": "too large", "code": "COMPARE_TOO_LARGE",
+                             "params": {"side": side, "files": len(files), "limit": limit_side}}
+
+        def entry(remote: str, root: str, rel: str, size: int, n: int) -> dict:
+            name = rel.rpartition("/")[2]
+            return {"entry_id": n, "path": _join(root, rel), "name": name, "size": size, "mtime": "2024-03-01T10:00:00Z",
+                    "category": CATEGORY.get(name.rpartition(".")[2], "other"), "content_group": n, "hashes": {"md5": "0" * 32}}
+
+        rows: list[dict] = []
+        eid = [0]
+
+        def mk(rel: str, status: str, left_rel: str | None, right_rel: str | None, **extra: Any) -> None:
+            eid[0] += 2
+            left = entry(lr, lp, left_rel, lf[left_rel], eid[0]) if left_rel is not None else None
+            right = entry(rr, rp, right_rel, rf[right_rel], eid[0] + 1) if right_rel is not None else None
+            rows.append({"rel": rel, "status": status, "rel_right": None, "left": left, "right": right, "evidence": None,
+                         "elsewhere": None, "unique": None, **extra})
+
+        for rel in sorted(set(lf) & set(rf)):
+            if rel in self.unproven:
+                mk(rel, "unverified", rel, rel, evidence={"kind": "none"})
+            elif lf[rel] == rf[rel]:
+                mk(rel, "same", rel, rel, evidence={"kind": "group"})
+            else:
+                mk(rel, "differs", rel, rel, evidence={"kind": "size"})
+        left_rest = sorted(set(lf) - set(rf))
+        right_rest = sorted(set(rf) - set(lf))
+        for rel in list(left_rest):
+            twin = next((o for o in right_rest if o.rpartition("/")[2] == rel.rpartition("/")[2] and rf[o] == lf[rel]), None)
+            if twin:
+                mk(rel, "moved", rel, twin, rel_right=twin, evidence={"kind": "group"})
+                left_rest.remove(rel)
+                right_rest.remove(twin)
+        for rel in left_rest:
+            name = rel.rpartition("/")[2]
+            uniq = name in self.unique_names
+            mk(rel, "left_only", rel, None, unique=uniq,
+               elsewhere={"count": 0 if uniq else 2, "examples": [] if uniq else [_loc("onedrive", "Backup/" + name)]})
+        for rel in right_rest:
+            mk(rel, "right_only", None, rel, unique=False, elsewhere={"count": 1, "examples": [_loc("gdrive", "Backup/" + rel)]})
+        rows.sort(key=lambda r: r["rel"].lower())
+
+        def stat(status: str) -> dict:
+            mine = [r for r in rows if r["status"] == status]
+            return {"files": len(mine), "bytes": sum((r["right"] if status == "right_only" else r["left"])["size"] for r in mine)}
+
+        summary = {s: stat(s) for s in ("same", "unverified", "differs", "moved", "left_only", "right_only")}
+        total = sum(v["files"] for v in summary.values())
+        summary["unique"] = sum(1 for r in rows if r["unique"])
+        summary["similarity"] = (summary["same"]["files"] + summary["moved"]["files"]) / total if total else 1.0
+        return 200, {"left": {"remote": lr, "path": lp, "files": len(lf), "bytes": sum(lf.values())},
+                     "right": {"remote": rr, "path": rp, "files": len(rf), "bytes": sum(rf.values())},
+                     "summary": summary, "rows": rows}
 
     def _walk(self, remote: str, base: str, node: dict, needle: str, hits: list) -> None:
         for name, child in node.items():
@@ -642,6 +870,13 @@ class Ui:
 
     def pane(self, side: str):
         return self.page.locator(f'[data-testid="pane-{side}"]')
+
+    def go(self, route: str) -> None:
+        """Change the route the way a link or the address bar does."""
+        self.page.evaluate("(h) => { window.location.hash = h; }", route)
+
+    def tid(self, testid: str):
+        return self.page.get_by_test_id(testid)
 
     def node(self, side: str, key: str):
         return self.pane(side).locator(f'[data-testid="node-{key}"]')
@@ -2314,3 +2549,877 @@ def test_the_page_works_against_the_real_backend(browser, real_server):
     finally:
         ctx.close()
     assert not errors, errors
+
+
+# =========================================================================== Overview, Explore and Compare
+# (docs/EXPLORE.md): the rail, the router, the three read-only views and their links into the workspace.
+
+def _rich_pair(mock: MockApi) -> None:
+    """gdrive:學校 against dropbox:學校 with every status: same, unverified, differs, moved, left only (a unique one), right only."""
+    mock.fs["dropbox"]["學校"]["課程"] = {"syllabus.pdf": 80_000}
+    mock.fs["dropbox"]["學校"]["舊檔"] = {"week1.pptx": 900_000}
+    mock.fs["dropbox"]["學校"]["notes.md"] = 4_000
+    mock.fs["gdrive"]["學校"]["notes.md"] = 4_000
+    mock.fs["gdrive"]["學校"]["課程"]["figure3.png"] = 20_000
+    mock.unproven = {"notes.md"}
+
+
+PAIR = "#/compare?l=gdrive:學校&r=dropbox:學校"
+
+
+def _wait_explore(ui: Ui, n: int = 1):
+    """Wait until the page has sent `n` more /v1/explore requests (typing is debounced) and return the last one."""
+    before = len(ui.mock.calls_to("GET", "/v1/explore"))
+    ui.page.wait_for_function("() => true")
+    for _ in range(100):
+        if len(ui.mock.calls_to("GET", "/v1/explore")) >= before + n:
+            break
+        ui.page.wait_for_timeout(40)
+    return ui.mock.last("GET", "/v1/explore")
+
+
+def test_the_rail_switches_views_and_marks_the_current_one(make_ui):
+    ui = make_ui(locale="en-US").open()
+    expect(ui.tid("rail")).to_be_visible()
+    expect(ui.tid("rail")).to_have_attribute("aria-label", "Views")
+    expect(ui.tid("rail-workspace")).to_have_attribute("aria-current", "page")     # no route: the workspace, as always
+    assert ui.page.evaluate("location.hash") == ""
+    for view in ("overview", "explore", "compare", "workspace"):
+        ui.tid(f"rail-{view}").click()
+        expect(ui.tid(f"rail-{view}")).to_have_attribute("aria-current", "page")
+        expect(ui.tid("rail").locator('[aria-current="page"]')).to_have_count(1)
+        assert ui.page.evaluate("location.hash") == f"#/{view}"
+        if view == "workspace":
+            expect(ui.tid("workspace-host")).to_be_visible()
+            expect(ui.tid("pane-left")).to_be_visible()
+        else:
+            expect(ui.tid(f"view-{view}")).to_be_visible()
+            expect(ui.tid("workspace-host")).to_be_hidden()
+            expect(ui.tid("workspace-host")).to_have_attribute("hidden", "")
+
+
+def test_routes_come_from_the_hash_and_back_returns(make_ui):
+    ui = make_ui(locale="en-US").open()
+    ui.go("#/overview")
+    expect(ui.tid("view-overview")).to_be_visible()
+    ui.go("#/explore?q=thesis")
+    expect(ui.tid("explore-input")).to_have_value("thesis")
+    ui.page.go_back()
+    expect(ui.tid("view-overview")).to_be_visible()
+    expect(ui.tid("rail-overview")).to_have_attribute("aria-current", "page")
+    ui.page.go_forward()
+    expect(ui.tid("explore-input")).to_have_value("thesis")
+    ui.page.reload()                                  # the route survives a reload (the session cookie is still good)
+    expect(ui.tid("view-explore")).to_be_visible()
+    expect(ui.tid("explore-input")).to_have_value("thesis")
+    ui.go("#/compare?l=gdrive:學校&r=dropbox:學校")
+    expect(ui.tid("rail-compare")).to_have_attribute("aria-current", "page")
+    expect(ui.tid("cmp-summary")).to_be_visible()
+    assert [c.query["left_remote"] for c in ui.mock.calls_to("GET", "/v1/compare")] == ["gdrive"]
+
+
+def test_the_workspace_stays_mounted_and_keeps_its_state_while_another_view_shows(make_ui):
+    ui = make_ui(locale="en-US").open()
+    ui.expand_all()
+    ui.drag(("left", "gdrive:研究/資料"), ("right", "dropbox:學校"))
+    expect(ui.tid("staged-count")).to_have_text("1")
+    expect(ui.node("right", "dropbox:學校/資料")).to_be_visible()
+    reads = len(ui.mock.calls_to("GET", "/v1/tree/roots"))
+    ui.tid("rail-overview").click()
+    expect(ui.tid("pane-left")).to_be_hidden()
+    ui.tid("rail-explore").click()
+    ui.tid("rail-workspace").click()
+    expect(ui.tid("pane-left")).to_be_visible()
+    expect(ui.tid("staged-count")).to_have_text("1")                       # the draft, the open folders: all still there
+    expect(ui.node("right", "dropbox:學校/資料")).to_be_visible()
+    expect(ui.node("left", "gdrive:學校")).to_be_visible()
+    assert len(ui.mock.calls_to("GET", "/v1/tree/roots")) == reads            # nothing was reloaded by switching
+    assert not ui.mock.calls_to("POST", "/v1/drafts")
+
+
+def test_alt_digits_switch_views_and_the_slash_key_jumps_to_the_explore_box(make_ui):
+    ui = make_ui(locale="en-US").open()
+    for digit, view in ((2, "explore"), (1, "overview"), (3, "compare"), (4, "workspace")):
+        ui.page.keyboard.press(f"Alt+{digit}")
+        expect(ui.tid(f"rail-{view}")).to_have_attribute("aria-current", "page")
+    ui.page.keyboard.press("/")                                           # nothing is being typed into: the box gets the keyboard
+    expect(ui.tid("rail-explore")).to_have_attribute("aria-current", "page")
+    expect(ui.tid("explore-input")).to_be_focused()
+    ui.page.keyboard.type("a/b")                                          # inside a text field "/" is just a character
+    expect(ui.tid("explore-input")).to_have_value("a/b")
+    ui.page.keyboard.press("Escape")
+    expect(ui.tid("explore-input")).to_have_value("")
+
+
+def test_ctrl_z_does_not_undo_the_draft_while_another_view_is_on_top(make_ui):
+    ui = make_ui(locale="en-US").open()
+    ui.expand_all()
+    ui.drag(("left", "gdrive:研究/資料"), ("right", "dropbox:學校"))
+    expect(ui.tid("staged-count")).to_have_text("1")
+    ui.tid("rail-overview").click()
+    ui.page.keyboard.press("Control+z")
+    ui.tid("rail-workspace").click()
+    expect(ui.tid("staged-count")).to_have_text("1")
+    assert not ui.mock.calls_to("POST", r"/v1/drafts/1/undo")
+
+
+# --------------------------------------------------------------------------- the query language
+
+QUERY_NAMES = ["gdrive", "dropbox", "onedrive"]
+
+
+def _parse(ui: Ui, texts: list[str]) -> list[dict]:
+    return ui.page.evaluate("""async ([texts, names]) => {
+        const q = await import('/ui/static/query.js');
+        return texts.map((text) => {
+            const a = q.parseQuery(text, names);
+            const b = q.parseQuery(q.formatQuery(a.params), names);
+            return { text, params: a.params, again: b.params, formatted: q.formatQuery(a.params), errors: a.errors.map((e) => e.code),
+                     chips: a.chips.map((c) => [c.key, c.value, c.error && c.error.code]) };
+        });
+    }""", [texts, QUERY_NAMES])
+
+
+def test_parse_query_reads_every_token_of_the_table(make_ui):
+    ui = make_ui(locale="en-US").open()
+    cases = {
+        'thesis "final draft" in:gdrive': {"q": "thesis final draft", "in": "gdrive"},
+        "on:gdrive on:dropbox not:onedrive": {"on": ["gdrive", "dropbox"], "not_on": ["onedrive"]},
+        "only:onedrive,gdrive": {"only_on": ["gdrive", "onedrive"]},
+        "copies:1": {"copies_min": 1, "copies_max": 1},
+        "copies:>2": {"copies_min": 3},
+        "copies:2..4": {"copies_min": 2, "copies_max": 4},
+        "type:PDF": {"ext": "pdf"},
+        "cat:photo": {"category": "photo"},
+        "size:>10MB": {"min_size": 10 * 1024 ** 2 + 1},
+        "size:<1k": {"max_size": 1023},
+        "size:1M..1G": {"min_size": 1024 ** 2, "max_size": 1024 ** 3},
+        "size:2.5KB": {"min_size": 2560, "max_size": 2560},
+        "modified:2023": {"modified_after": "2023-01-01", "modified_before": "2024-01-01"},
+        "modified:2023-06": {"modified_after": "2023-06-01", "modified_before": "2023-07-01"},
+        "modified:2023-12-31": {"modified_after": "2023-12-31", "modified_before": "2024-01-01"},
+        "modified:>2024-01-01": {"modified_after": "2024-01-02"},
+        "modified:<2020": {"modified_before": "2020-01-01"},
+        "modified:2021..2022": {"modified_after": "2021-01-01", "modified_before": "2023-01-01"},
+        "path:School/Thesis": {"path_prefix": "School/Thesis"},
+        "報告 type:docx 學校": {"q": "報告 學校", "ext": "docx"},
+        "": {},
+    }
+    got = _parse(ui, list(cases))
+    for row in got:
+        assert row["params"] == cases[row["text"]], row
+        assert row["errors"] == [], row
+        assert row["again"] == row["params"], f"round trip of {row['text']!r} through {row['formatted']!r}: {row}"
+
+
+def test_format_query_round_trips_every_parameter_it_can_hold(make_ui):
+    ui = make_ui(locale="en-US").open()
+    params = ui.page.evaluate("""async (names) => {
+        const q = await import('/ui/static/query.js');
+        const all = { q: 'thesis draft', in: 'dropbox', on: ['gdrive', 'dropbox'], not_on: ['onedrive'], only_on: ['gdrive', 'dropbox'],
+            copies_min: 2, copies_max: 5, ext: 'pdf', category: 'photo', min_size: 1048576, max_size: 1572864,
+            modified_after: '2021-01-01', modified_before: '2023-01-01', path_prefix: 'School/My Thesis' };
+        const half = { copies_min: 3, min_size: 10485761, modified_after: '2024-01-02' };
+        const other = { copies_max: 1, max_size: 1023, modified_before: '2020-03-01' };
+        const spans = { modified_after: '2023-06-01', modified_before: '2023-07-01' };
+        return [all, half, other, spans, {}].map((p) => ({ p, text: q.formatQuery(p), back: q.parseQuery(q.formatQuery(p), names).params }));
+    }""", QUERY_NAMES)
+    for row in params:
+        assert row["back"] == row["p"], row
+    assert params[0]["text"].startswith('thesis draft in:dropbox on:gdrive,dropbox not:onedrive only:gdrive,dropbox copies:2..5 type:pdf')
+    assert 'path:"School/My Thesis"' in params[0]["text"]
+    assert "size:1M..1536K" in params[0]["text"] and "modified:2021-01-01..2022-12-31" in params[0]["text"]
+    assert "modified:2023-06" in params[3]["text"]
+
+
+def test_malformed_tokens_stay_visible_as_red_chips_and_are_not_sent(make_ui):
+    ui = make_ui(locale="en-US").open()
+    got = _parse(ui, ["thesis foo:bar in:nowhere size:big copies:x modified:2023-13 type: on:gdrive,nowhere"])[0]
+    assert got["params"] == {"q": "thesis"}
+    assert got["errors"] == ["unknownKey", "unknownCloud", "badValue", "badValue", "badValue", "empty", "unknownCloud"]
+    ui.go("#/explore")
+    ui.tid("explore-input").fill("thesis foo:bar size:big type:pdf")
+    sent = _wait_explore(ui, 2).query
+    assert sent.get("q") == "thesis" and sent.get("ext") == "pdf" and "min_size" not in sent and "foo" not in sent
+    chips = ui.tid("query-chip")
+    expect(chips).to_have_count(3)
+    bad = ui.page.locator('[data-testid="query-chip"][data-error]')
+    expect(bad).to_have_count(2)
+    expect(bad.first).to_have_attribute("data-error", "unknownKey")
+    expect(bad.first).to_have_attribute("title", 'Unknown filter "foo:"')
+    expect(ui.tid("query-errors")).to_contain_text("2 filters were not understood")
+    bad.first.get_by_test_id("query-chip-remove").click()                       # removing a chip edits the text
+    expect(ui.tid("explore-input")).to_have_value("thesis size:big type:pdf")
+
+
+def test_the_help_button_shows_the_query_syntax(make_ui):
+    ui = make_ui(locale="en-US").open()
+    ui.go("#/explore")
+    ui.tid("explore-help").click()
+    dialog = ui.tid("query-help")
+    expect(dialog).to_be_visible()
+    for token in ("in:gdrive", "only:gdrive,dropbox", "copies:2..4", "size:1M..1G", "path:School/Thesis"):
+        expect(dialog).to_contain_text(token)
+    ui.page.keyboard.press("Escape")
+    expect(dialog).to_have_count(0)
+    expect(ui.tid("explore-help")).to_be_focused()
+
+
+# --------------------------------------------------------------------------- Explore
+
+def test_explore_groups_results_by_content_with_a_presence_cell_per_cloud(make_ui):
+    ui = make_ui(locale="en-US").open()
+    ui.go("#/explore?q=final")
+    row = ui.page.locator('[data-testid="ex-result"][data-key="g:1"]')
+    expect(row).to_be_visible()
+    expect(ui.tid("ex-count")).to_have_text("1 of 1")
+    gd, db, = row.locator('[data-cloud="gdrive"]'), row.locator('[data-cloud="dropbox"]')
+    expect(gd).to_have_attribute("aria-label", "on gdrive, 1 copy")
+    expect(db).to_have_attribute("aria-label", "on dropbox, 2 copies")
+    expect(db).to_contain_text("2")                                         # the count is drawn when a cloud holds more than one
+    expect(gd).not_to_have_class(re.compile("unproven"))
+    # the request carries exactly the words
+    sent = ui.mock.last("GET", "/v1/explore")
+    assert sent.query["q"] == "final" and sent.query["limit"] == "50" and "sort" not in sent.query
+    # a copy whose name does not match is still listed under its content, marked
+    row.get_by_test_id("ex-expand").click()
+    copies = row.get_by_test_id("ex-copy")
+    expect(copies).to_have_count(3)
+    odd = row.locator('[data-testid="ex-copy"][data-matched="false"]')
+    expect(odd).to_have_count(1)
+    expect(odd).to_contain_text("name does not match")
+    expect(odd).to_contain_text("dropbox:Archive/thesis-v9.pdf")
+    expect(row.get_by_test_id("ex-expand")).to_have_attribute("aria-expanded", "true")
+
+
+def test_a_content_without_a_hash_group_is_drawn_dashed_with_its_caveat(make_ui):
+    ui = make_ui(locale="en-US").open()
+    ui.go("#/explore?q=notes")
+    row = ui.page.locator('[data-testid="ex-result"][data-key="e:9"]')
+    cell = row.locator('[data-cloud="gdrive"]')
+    expect(cell).to_have_class(re.compile("unproven"))
+    expect(cell).to_have_attribute("title", re.compile("identity not proven: copies elsewhere may exist under a different hash"))
+    expect(cell).to_have_attribute("aria-label", "on gdrive, 1 copy")
+    expect(row.locator('[data-cloud="dropbox"]')).to_have_attribute("aria-label", "not on dropbox")
+
+
+def test_facets_edit_the_query_text_and_the_request(make_ui):
+    ui = make_ui(locale="en-US").open()
+    ui.go("#/explore")
+    expect(ui.tid("ex-count")).to_have_text("6 of 6")
+    expect(ui.tid("facet-on-gdrive")).to_be_visible()
+    ui.tid("facet-on-gdrive").check()
+    expect(ui.tid("explore-input")).to_have_value("on:gdrive")
+    expect(ui.tid("ex-count")).to_have_text("5 of 5")
+    assert ui.mock.last("GET", "/v1/explore").query["on"] == "gdrive"
+    ui.tid("facet-copies-1").check()
+    expect(ui.tid("explore-input")).to_have_value("on:gdrive copies:1")
+    expect(ui.tid("ex-count")).to_have_text("3 of 3")
+    q = ui.mock.last("GET", "/v1/explore").query
+    assert (q["copies_min"], q["copies_max"]) == ("1", "1")
+    ui.tid("facet-cat-spreadsheet").check()
+    expect(ui.tid("explore-input")).to_have_value("on:gdrive copies:1 cat:spreadsheet")
+    expect(ui.tid("ex-count")).to_have_text("1 of 1")
+    expect(ui.tid("facet-cat-spreadsheet")).to_be_checked()
+    ui.tid("facet-on-gdrive").uncheck()                                       # the same box takes its token out again
+    expect(ui.tid("explore-input")).to_have_value("copies:1 cat:spreadsheet")
+    ui.tid("query-chip-remove").first.click()
+    expect(ui.tid("explore-input")).to_have_value("cat:spreadsheet")
+    assert unquote(ui.page.evaluate("location.hash")) == "#/explore?q=cat:spreadsheet"
+
+
+def test_typing_updates_the_address_and_back_undoes_a_facet(make_ui):
+    ui = make_ui(locale="en-US").open()
+    ui.go("#/explore")
+    ui.tid("explore-input").fill("survey type:csv")
+    ui.page.wait_for_function("() => location.hash.includes('survey')")
+    assert unquote(ui.page.evaluate("location.hash")) == "#/explore?q=survey type:csv"
+    expect(ui.tid("ex-count")).to_have_text("1 of 1")
+    ui.tid("explore-clear").click()
+    expect(ui.tid("explore-input")).to_have_value("")
+    expect(ui.tid("ex-count")).to_have_text("6 of 6")
+    ui.page.go_back()                                                         # the clear was a history entry of its own
+    expect(ui.tid("explore-input")).to_have_value("survey type:csv")
+    expect(ui.tid("ex-count")).to_have_text("1 of 1")
+
+
+def test_explore_sorts_and_loads_more_in_pages_of_fifty(make_ui):
+    ui = make_ui(locale="en-US").open()
+    ui.mock.catalog += [{"key": f"g:{100 + i}", "name": f"bulk{i:03}.txt", "size": 100 + i, "category": "document", "ext": "txt",
+                         "mtime": "2020-01-01T00:00:00Z", "verified": True, "copies": [("gdrive", f"Bulk/bulk{i:03}.txt")]}
+                        for i in range(60)]
+    ui.go("#/explore")
+    expect(ui.tid("ex-count")).to_have_text("50 of 66")
+    expect(ui.tid("ex-result")).to_have_count(50)
+    ui.tid("ex-load-more").click()
+    expect(ui.tid("ex-count")).to_have_text("66 of 66")
+    expect(ui.tid("ex-result")).to_have_count(66)
+    assert [c.query["offset"] for c in ui.mock.calls_to("GET", "/v1/explore")][-2:] == ["0", "50"]
+    expect(ui.tid("ex-load-more")).to_have_count(0)
+    ui.tid("explore-sort").select_option("size")
+    expect(ui.tid("ex-result").first).to_have_attribute("data-key", "g:4")
+    assert ui.mock.last("GET", "/v1/explore").query["sort"] == "size"
+    assert "sort=size" in ui.page.evaluate("location.hash")
+
+
+def test_a_slow_answer_to_an_earlier_query_is_ignored(make_ui):
+    ui = make_ui(locale="en-US").open()
+    ui.go("#/explore")
+    expect(ui.tid("ex-count")).to_have_text("6 of 6")
+    ui.page.evaluate("""() => {
+        const real = window.fetch; let n = 0;
+        window.fetch = (url, opts) => {
+            if (!String(url).includes('/v1/explore')) return real(url, opts);
+            n += 1; const mine = n;
+            return real(url, opts).then((r) => new Promise((done) => setTimeout(() => done(r), mine === 1 ? 900 : 0)));
+        };
+    }""")
+    ui.tid("explore-input").fill("survey")
+    ui.page.wait_for_timeout(380)                       # the first request is out (and held back) ...
+    ui.tid("explore-input").fill("trip")                # ... and a newer one is sent after it
+    expect(ui.tid("ex-result")).to_have_count(1)
+    expect(ui.tid("ex-result")).to_have_attribute("data-key", "g:3")
+    ui.page.wait_for_timeout(1100)                      # the old answer has arrived by now and must not replace the new one
+    expect(ui.tid("ex-result")).to_have_attribute("data-key", "g:3")
+
+
+def test_explore_shows_a_refusal_in_the_users_language_and_none_when_nothing_matches(make_ui):
+    ui = make_ui(locale="en-US").open()
+    ui.go("#/explore?q=zzzz")
+    expect(ui.tid("ex-none")).to_have_text("Nothing matches this query.")
+    ui.mock.explore_fail = ("BAD_QUERY", {"param": "min_size"})
+    ui.tid("explore-input").fill("size:>1k")
+    expect(ui.tid("ex-error")).to_have_text('The search parameter "min_size" is not valid.')
+    ui.tid("view-lang").click()
+    expect(ui.tid("ex-error")).to_have_text("搜尋參數「min_size」不正確。")
+
+
+def test_reveal_opens_the_workspace_with_the_item_selected_in_the_left_pane(make_ui):
+    ui = make_ui(locale="en-US").open()
+    ui.go("#/explore?q=survey")
+    ui.tid("ex-expand").click()
+    ui.tid("ex-reveal").click()
+    expect(ui.tid("workspace-host")).to_be_visible()
+    assert ui.page.evaluate("location.hash") == "#/workspace"
+    target = ui.node("left", "gdrive:研究/資料/survey.csv")
+    expect(target).to_be_visible()
+    expect(target).to_have_attribute("aria-selected", "true")
+    expect(ui.tid("rail-workspace")).to_have_attribute("aria-current", "page")
+
+
+def test_a_result_with_copies_in_two_folders_offers_to_compare_their_folders(make_ui):
+    ui = make_ui(locale="en-US").open()
+    ui.go("#/explore?q=report")
+    ui.tid("ex-expand").click()
+    ui.tid("ex-compare-folders").click()
+    expect(ui.tid("view-compare")).to_be_visible()
+    assert unquote(ui.page.evaluate("location.hash")) == "#/compare?l=gdrive:學校&r=dropbox:學校"
+    expect(ui.tid("cmp-summary")).to_be_visible()
+    expect(ui.tid("cmp-left-path")).to_have_value("學校")
+
+
+# --------------------------------------------------------------------------- Overview
+
+def test_overview_shows_the_cloud_cards_the_totals_and_the_undercount_warning(make_ui):
+    ui = make_ui(locale="en-US").open()
+    ui.go("#/overview")
+    gd, db = ui.tid("cloud-card-gdrive"), ui.tid("cloud-card-dropbox")
+    expect(gd).to_contain_text("Last scan 2024-03-01 10:00")
+    expect(gd.get_by_test_id("cloud-files")).to_have_text("5")
+    expect(ui.tid("cloud-only-gdrive")).to_contain_text("3")                    # survey, trip, notes exist on no other cloud
+    expect(ui.tid("cloud-only-dropbox")).to_contain_text("1")
+    expect(ui.tid("cloud-unverified-gdrive")).to_contain_text("1")
+    expect(ui.tid("cloud-undercount-gdrive")).to_contain_text("drivemerge bridge")
+    expect(ui.tid("cloud-undercount-dropbox")).to_have_count(0)                # nothing to warn about on dropbox
+    expect(db).to_contain_text("dropbox")
+    totals = ui.tid("ov-totals")
+    expect(totals).to_contain_text("Unique content")
+    expect(totals).to_contain_text("Redundant")
+    assert ui.mock.last("GET", "/v1/coverage").query == {"max_bars": "24"}
+
+
+def test_a_read_only_cloud_is_badged(make_ui):
+    ui = make_ui(locale="en-US").open()
+    ui.mock.coverage_override = {
+        "remotes": [{"name": "gdrive", "provider": "drive", "writable": True, "files": 1, "bytes": 5, "only_here": {"contents": 0, "bytes": 0},
+                     "unverified_files": 0, "last_scan": None},
+                    {"name": "dropbox", "provider": "dropbox", "writable": False, "files": 1, "bytes": 5, "only_here": {"contents": 0, "bytes": 0},
+                     "unverified_files": 0, "last_scan": None}],
+        "totals": {"contents": 1, "bytes": 5, "stored_bytes": 10, "redundant_bytes": 5, "copies": 2},
+        "intersections": [{"remotes": ["gdrive", "dropbox"], "contents": 1, "bytes": 5, "copies": 2, "stored_bytes": 10}], "other": None}
+    ui.go("#/overview")
+    expect(ui.tid("cloud-card-dropbox")).to_contain_text("read-only")
+    expect(ui.tid("cloud-card-gdrive")).not_to_contain_text("read-only")
+    expect(ui.tid("cloud-card-gdrive")).to_contain_text("Not scanned yet")
+    expect(ui.tid("cloud-only-gdrive")).to_be_disabled()
+
+
+def test_the_intersection_chart_has_a_bar_per_combination_and_toggles_its_measure(make_ui):
+    ui = make_ui(locale="en-US").open()
+    ui.go("#/overview")
+    bars = ui.tid("chart-bar")
+    expect(bars).to_have_count(3)
+    order = [b.get_attribute("data-remotes") for b in bars.all()]
+    assert order == ["gdrive", "gdrive,dropbox", "dropbox"]                    # by contents: 3, 2, 1
+    assert bars.first.get_attribute("data-contents") == "3"
+    expect(bars.nth(1)).to_have_attribute("role", "button")
+    expect(bars.nth(1)).to_have_attribute("tabindex", "0")
+    expect(bars.nth(1)).to_have_attribute("aria-label", re.compile(r"gdrive \+ dropbox: 2 contents, 4\.1 MB, 5 copies"))
+    bars.nth(1).hover()
+    expect(ui.tid("chart-readout")).to_contain_text("gdrive + dropbox: 2 contents")
+    ui.tid("measure-bytes").click()
+    assert [b.get_attribute("data-remotes") for b in bars.all()] == ["dropbox", "gdrive,dropbox", "gdrive"]    # by bytes: 9.0, 4.3, 3.1 MB
+    expect(ui.tid("measure-bytes")).to_have_attribute("aria-pressed", "true")
+    ui.tid("ov-category").select_option("pdf")
+    expect(bars).to_have_count(1)
+    assert ui.mock.last("GET", "/v1/coverage").query["category"] == "pdf"
+    expect(bars.first).to_have_attribute("data-remotes", "gdrive,dropbox")
+
+
+def test_a_bar_opens_explore_filtered_to_exactly_that_set_of_clouds(make_ui):
+    ui = make_ui(locale="en-US").open()
+    ui.go("#/overview")
+    ui.page.locator('[data-testid="chart-bar"][data-remotes="dropbox"]').click()
+    expect(ui.tid("view-explore")).to_be_visible()
+    expect(ui.tid("explore-input")).to_have_value("only:dropbox")
+    assert unquote(ui.page.evaluate("location.hash")) == "#/explore?q=only:dropbox"
+    assert _wait_explore(ui).query["only_on"] == "dropbox"
+    expect(ui.tid("ex-count")).to_have_text("1 of 1")
+    ui.page.go_back()
+    expect(ui.tid("view-overview")).to_be_visible()
+    # the keyboard does the same: Enter on a focused bar
+    ui.page.locator('[data-testid="chart-bar"][data-remotes="gdrive,dropbox"]').focus()
+    ui.page.keyboard.press("Enter")
+    expect(ui.tid("explore-input")).to_have_value("only:gdrive,dropbox")
+    assert _wait_explore(ui).query["only_on"] == "gdrive,dropbox"
+    expect(ui.tid("ex-count")).to_have_text("2 of 2")
+
+
+def test_a_cloud_cards_only_here_number_opens_explore_and_other_combinations_are_not_a_link(make_ui):
+    ui = make_ui(locale="en-US").open()
+    ui.go("#/overview")
+    ui.tid("cloud-only-gdrive").click()
+    expect(ui.tid("explore-input")).to_have_value("only:gdrive")
+    base = ui.mock.coverage({})
+    base["other"] = {"combinations": 5, "contents": 7, "bytes": 1234, "copies": 9, "stored_bytes": 2000}
+    ui.mock.coverage_override = base
+    ui.go("#/overview")
+    other = ui.tid("chart-other")
+    expect(other).to_have_count(1)
+    expect(other).to_have_attribute("aria-label", re.compile(r"Other combinations \(5\): 7 contents"))
+    assert other.get_attribute("role") == "img" and other.get_attribute("tabindex") is None
+    other.click(force=True)
+    expect(ui.tid("view-overview")).to_be_visible()
+
+
+def test_similar_folders_are_listed_with_a_compare_button(make_ui):
+    ui = make_ui(locale="en-US").open()
+    ui.go("#/overview")
+    rows = ui.tid("ov-similar")
+    expect(rows).to_have_count(2)
+    dup = ui.page.locator('[data-testid="ov-similar"][data-kind="duplicates"]')
+    expect(dup).to_contain_text("95%")
+    expect(dup).to_contain_text("gdrive:學校")
+    dup.get_by_test_id("ov-compare").click()
+    assert unquote(ui.page.evaluate("location.hash")) == "#/compare?l=gdrive:學校&r=dropbox:學校"
+    expect(ui.tid("cmp-summary")).to_be_visible()
+
+
+# --------------------------------------------------------------------------- Compare
+
+def test_compare_counts_every_status_and_draws_the_tree_with_a_row_per_file(make_ui):
+    ui = make_ui(locale="en-US")
+    _rich_pair(ui.mock)
+    ui.open().go(PAIR)
+    summary = ui.tid("cmp-summary")
+    expect(summary).to_be_visible()
+    for status in ("same", "unverified", "differs", "moved", "left_only", "right_only"):
+        expect(ui.tid(f"cmp-count-{status}")).to_have_attribute("data-count", "1")
+    expect(ui.tid("cmp-count-unique")).to_contain_text("1 file exists nowhere else")
+    expect(ui.tid("cmp-similarity")).to_contain_text("33%")
+    sent = ui.mock.last("GET", "/v1/compare").query
+    assert sent == {"left_remote": "gdrive", "left_path": "學校", "right_remote": "dropbox", "right_path": "學校"}
+    tree = ui.tid("cmp-tree")
+    expect(tree).to_have_attribute("role", "tree")
+    status = {r.get_attribute("data-testid"): r.get_attribute("data-status") for r in tree.locator('[role="treeitem"][data-status]').all()}
+    assert status == {"cmp-file-課程/figure3.png": "left_only", "cmp-file-課程/week1.pptx": "moved", "cmp-file-notes.md": "unverified",
+                      "cmp-file-report.pdf": "differs", "cmp-file-作業/hw1.docx": "right_only"}        # `same` is hidden by default
+    expect(ui.tid("cmp-file-課程/syllabus.pdf")).to_have_count(0)
+    moved = ui.tid("cmp-file-課程/week1.pptx")
+    expect(moved).to_contain_text("舊檔/week1.pptx")                                                      # where it is on the other side
+    expect(moved).to_contain_text("Moved")
+    uniq = ui.tid("cmp-file-課程/figure3.png")
+    expect(uniq).to_contain_text("Only left")
+    expect(uniq).to_contain_text("unique")
+    expect(ui.tid("cmp-file-作業/hw1.docx")).to_contain_text("⧉ 1")                                         # one copy elsewhere
+    expect(ui.tid("cmp-file-notes.md")).to_contain_text("Probably same")
+    folder = ui.tid("cmp-dir-課程")
+    expect(folder).to_have_attribute("aria-expanded", "true")
+    expect(folder.locator(".stackbar")).to_have_attribute("aria-label", re.compile("Same 1, Moved 1, Only left 1"))
+    expect(folder.locator(".cmp-diff-count")).to_have_text("2")                                           # files that are not the same
+
+
+def test_show_same_and_the_status_filters_narrow_the_tree_but_not_the_counts(make_ui):
+    ui = make_ui(locale="en-US")
+    _rich_pair(ui.mock)
+    ui.open().go(PAIR)
+    expect(ui.tid("cmp-file-report.pdf")).to_be_visible()
+    ui.tid("cmp-show-same").check()
+    expect(ui.tid("cmp-file-課程/syllabus.pdf")).to_have_attribute("data-status", "same")
+    ui.tid("cmp-filter-differs").click()                                    # a filter shows only what it names
+    expect(ui.page.locator('[role="treeitem"][data-status]')).to_have_count(1)
+    expect(ui.tid("cmp-file-report.pdf")).to_be_visible()
+    expect(ui.tid("cmp-filter-differs")).to_have_attribute("aria-pressed", "true")
+    ui.tid("cmp-filter-moved").click()
+    expect(ui.page.locator('[role="treeitem"][data-status]')).to_have_count(2)
+    expect(ui.tid("cmp-dir-課程")).to_be_visible()                          # its folder is opened to show the moved file
+    expect(ui.tid("cmp-file-課程/week1.pptx")).to_be_visible()
+    for status in ("same", "differs", "left_only"):                          # the header always counts the whole comparison
+        expect(ui.tid(f"cmp-count-{status}")).to_have_attribute("data-count", "1")
+    ui.tid("cmp-filter-differs").click()
+    ui.tid("cmp-filter-moved").click()
+    ui.tid("cmp-show-same").uncheck()
+    expect(ui.tid("cmp-file-課程/syllabus.pdf")).to_have_count(0)
+
+
+def test_the_tree_is_a_keyboard_tree_and_enter_opens_the_detail(make_ui):
+    ui = make_ui(locale="en-US")
+    _rich_pair(ui.mock)
+    ui.open().go(PAIR)
+    folder = ui.tid("cmp-dir-課程")
+    folder.focus()
+    ui.page.keyboard.press("ArrowLeft")                                      # collapse
+    expect(folder).to_have_attribute("aria-expanded", "false")
+    expect(ui.tid("cmp-file-課程/week1.pptx")).to_have_count(0)
+    ui.page.keyboard.press("ArrowRight")                                     # expand
+    expect(folder).to_have_attribute("aria-expanded", "true")
+    ui.page.keyboard.press("ArrowRight")                                     # on an open folder: into its first child
+    expect(ui.tid("cmp-file-課程/figure3.png")).to_be_focused()
+    ui.page.keyboard.press("ArrowDown")
+    expect(ui.tid("cmp-file-課程/week1.pptx")).to_be_focused()
+    ui.page.keyboard.press("ArrowLeft")                                      # on a file: back to its folder
+    expect(folder).to_be_focused()
+    ui.page.keyboard.press("ArrowDown")
+    ui.page.keyboard.press("ArrowDown")
+    ui.page.keyboard.press("Enter")
+    detail = ui.tid("cmp-detail")
+    expect(detail).to_have_attribute("data-kind", "file")
+    expect(detail).to_contain_text("week1.pptx")
+    expect(ui.tid("cmp-file-課程/week1.pptx")).to_have_attribute("aria-selected", "true")
+
+
+def test_the_detail_panel_shows_both_sides_the_evidence_and_where_else_the_content_lives(make_ui):
+    ui = make_ui(locale="en-US")
+    _rich_pair(ui.mock)
+    ui.open().go(PAIR)
+    ui.tid("cmp-file-report.pdf").click()
+    detail = ui.tid("cmp-detail")
+    expect(detail).to_contain_text("gdrive:學校/report.pdf")
+    expect(detail).to_contain_text("dropbox:學校/report.pdf")
+    expect(detail).to_contain_text("52,000 B")
+    expect(detail).to_contain_text("52,100 B")
+    expect(ui.tid("cmp-evidence")).to_have_text("Evidence: The sizes differ.")
+    ui.tid("cmp-file-notes.md").click()
+    expect(ui.tid("cmp-evidence")).to_contain_text("No comparable hash")
+    ui.tid("cmp-file-課程/week1.pptx").click()
+    expect(ui.tid("cmp-moved-to")).to_contain_text("課程/week1.pptx")
+    expect(ui.tid("cmp-moved-to")).to_contain_text("舊檔/week1.pptx")
+    expect(ui.tid("cmp-evidence")).to_contain_text("same content group")
+    ui.tid("cmp-file-課程/figure3.png").click()                              # the only copy anywhere: a warning
+    expect(ui.tid("cmp-unique")).to_contain_text("The only copy on any cloud")
+    ui.tid("cmp-file-作業/hw1.docx").click()
+    expect(ui.tid("cmp-elsewhere")).to_contain_text("1 other copy outside these folders")
+    expect(ui.tid("cmp-elsewhere")).to_contain_text("gdrive:Backup/作業/hw1.docx")
+    ui.tid("cmp-file-report.pdf").click()
+    ui.tid("cmp-reveal-right").click()                                       # Reveal leads into the workspace, left pane
+    expect(ui.tid("workspace-host")).to_be_visible()
+    expect(ui.node("left", "dropbox:學校/report.pdf")).to_have_attribute("aria-selected", "true")
+
+
+def test_merge_left_into_right_stages_one_move_of_the_whole_folder(make_ui):
+    ui = make_ui(locale="en-US")
+    _rich_pair(ui.mock)
+    ui.open().go(PAIR)
+    ui.tid("cmp-merge-lr").click()
+    post = ui.mock.last("POST", r"/v1/drafts/1/actions")
+    assert post.body == {"kind": "move", "items": [{"remote": "gdrive", "path": "學校"}], "dst": {"remote": "dropbox", "path": ""},
+                         "new_name": "學校"}
+    toast = ui.page.locator('[data-testid="toast"][data-kind="success"]')
+    expect(toast).to_contain_text("Staged: merge gdrive:學校 into dropbox:學校")
+    expect(ui.page.locator('[data-testid="toast"][data-kind="warn"]').first).to_be_visible()    # the staging warnings (a merge, a copy between clouds)
+    toast.get_by_test_id("toast-action").click()                              # "Open workspace"
+    expect(ui.tid("workspace-host")).to_be_visible()
+    expect(ui.tid("staged-count")).to_have_text("1")
+    ui.go(PAIR)
+    expect(ui.tid("cmp-draft-note")).to_contain_text("as last scanned")          # the comparison reads the catalog, not the draft
+
+
+def test_merge_right_into_left_and_the_parent_of_a_nested_folder(make_ui):
+    ui = make_ui(locale="en-US").open()
+    ui.go("#/compare?l=gdrive:研究/論文&r=dropbox:學校")
+    ui.tid("cmp-merge-rl").click()
+    assert ui.mock.last("POST", r"/v1/drafts/1/actions").body == {
+        "kind": "move", "items": [{"remote": "dropbox", "path": "學校"}], "dst": {"remote": "gdrive", "path": "研究"}, "new_name": "論文"}
+    ui.go("#/compare?l=dropbox:學校&r=gdrive:研究/論文")
+    ui.tid("cmp-merge-lr").click()
+    expect(ui.page.locator('[data-testid="toast"][data-kind="success"]').last).to_contain_text("Staged")
+    assert ui.mock.last("POST", r"/v1/drafts/1/actions").body["dst"] == {"remote": "gdrive", "path": "研究"}
+
+
+def test_merging_a_whole_cloud_is_not_offered(make_ui):
+    ui = make_ui(locale="en-US").open()
+    ui.go("#/compare?l=gdrive:Photos&r=dropbox:")
+    expect(ui.tid("cmp-summary")).to_be_visible()
+    expect(ui.tid("cmp-merge-lr")).to_be_disabled()
+    expect(ui.tid("cmp-merge-lr")).to_have_attribute("title", re.compile("choose a folder on each side"))
+    assert not ui.mock.calls_to("POST", r"/v1/drafts/1/actions")
+
+
+def test_move_to_the_other_side_stages_one_move_into_the_same_relative_folder(make_ui):
+    ui = make_ui(locale="en-US")
+    _rich_pair(ui.mock)
+    ui.open().go(PAIR)
+    ui.tid("cmp-file-課程/figure3.png").click()
+    ui.tid("cmp-move").click()
+    post = ui.mock.last("POST", r"/v1/drafts/1/actions")
+    assert post.body == {"kind": "move", "items": [{"remote": "gdrive", "path": "學校/課程/figure3.png"}],
+                         "dst": {"remote": "dropbox", "path": "學校/課程"}}
+    expect(ui.page.locator('[data-testid="toast"][data-kind="success"]')).to_contain_text("Staged: move gdrive:學校/課程/figure3.png")
+
+
+def test_move_to_the_other_side_explains_when_the_folder_is_missing_there(make_ui):
+    ui = make_ui(locale="en-US")
+    _rich_pair(ui.mock)
+    ui.mock.fs["gdrive"]["學校"]["新資料夾"] = {"x.txt": 5}
+    ui.open().go(PAIR)
+    ui.tid("cmp-file-新資料夾/x.txt").click()
+    before = len(ui.mock.calls_to("POST", r"/v1/drafts/1/actions"))
+    ui.tid("cmp-move").click()
+    toast = ui.page.locator('[data-testid="toast"][data-kind="error"]')
+    expect(toast).to_contain_text("The folder dropbox:學校/新資料夾 does not exist on the other side")
+    assert len(ui.mock.calls_to("POST", r"/v1/drafts/1/actions")) == before
+    # a whole folder that exists on one side only moves as one step
+    ui.tid("cmp-dir-作業").click()
+    expect(ui.tid("cmp-detail")).to_have_attribute("data-kind", "dir")
+    ui.tid("cmp-move").click()
+    assert ui.mock.last("POST", r"/v1/drafts/1/actions").body == {
+        "kind": "move", "items": [{"remote": "dropbox", "path": "學校/作業"}], "dst": {"remote": "gdrive", "path": "學校"}}
+
+
+def test_a_refusal_is_worded_by_the_page_from_the_code_and_params(make_ui):
+    ui = make_ui(locale="en-US").open()
+    ui.go("#/compare?l=gdrive:研究/論文/thesis.pdf&r=dropbox:學校")
+    err = ui.tid("cmp-error")
+    expect(err).to_have_text('"研究/論文/thesis.pdf" is not a folder on gdrive.')
+    expect(err).to_have_attribute("data-code", "NOT_A_FOLDER")
+    ui.go("#/compare?l=gdrive:研究&r=gdrive:研究/論文")
+    expect(err).to_contain_text("One folder contains the other (gdrive:研究 and gdrive:研究/論文)")
+    ui.mock.compare_limit = 1
+    ui.go("#/compare?l=gdrive:研究/資料&r=dropbox:學校")
+    expect(err).to_have_text("The left folder holds 2 files, more than the limit of 1. Choose a smaller folder.")
+    ui.mock.compare_limit = None
+    ui.go("#/compare?l=gdrive:.drive-merge-quarantine&r=dropbox:學校")
+    expect(err).to_have_attribute("data-code", "QUARANTINE")
+    ui.tid("view-lang").click()                                              # the same refusals, in Chinese, without a reload
+    ui.mock.compare_limit = 1
+    ui.go("#/compare?l=gdrive:研究/資料&r=dropbox:學校")
+    expect(err).to_have_text("左側資料夾有 2 個檔案，超過 1 個的上限。請選擇較小的資料夾。")
+    ui.go("#/compare?l=gdrive:研究/論文/thesis.pdf&r=dropbox:學校")
+    expect(err).to_have_text("gdrive 上的「研究/論文/thesis.pdf」不是資料夾。")
+
+
+def test_the_pickers_complete_folder_names_and_compare_runs_on_enter(make_ui):
+    ui = make_ui(locale="en-US").open()
+    ui.go("#/compare?l=gdrive:學校")
+    expect(ui.tid("cmp-right-remote")).to_be_focused()                         # one side set: the picker for the other is next
+    expect(ui.tid("cmp-pick-right")).to_be_visible()
+    ui.tid("cmp-right-remote").select_option("dropbox")
+    path = ui.tid("cmp-right-path")
+    path.click()
+    path.type("學")
+    options = ui.tid("cmp-right-option")
+    expect(options).to_have_count(1)
+    expect(options).to_contain_text("學校")
+    assert ui.mock.last("GET", "/v1/tree").query["remote"] == "dropbox"
+    path.press("ArrowDown")
+    path.press("Enter")                                                       # picks the folder
+    expect(path).to_have_value("學校")
+    assert not ui.mock.calls_to("GET", "/v1/compare")
+    path.press("Enter")                                                       # a second Enter runs the comparison
+    expect(ui.tid("cmp-summary")).to_be_visible()
+    assert unquote(ui.page.evaluate("location.hash")) == "#/compare?l=gdrive:學校&r=dropbox:學校"
+    with ui.awaiting("GET", "/v1/compare"):
+        ui.tid("cmp-swap").click()                                            # swapping flips the pair and compares again
+    assert unquote(ui.page.evaluate("location.hash")) == "#/compare?l=dropbox:學校&r=gdrive:學校"
+    expect(ui.tid("cmp-left-remote")).to_have_value("dropbox")
+    assert ui.mock.last("GET", "/v1/compare").query["left_remote"] == "dropbox"
+
+
+def test_compare_with_in_the_folder_row_menu_opens_compare_with_the_picker_on_the_right(make_ui):
+    ui = make_ui(locale="en-US").open()
+    ui.expand("left", "gdrive:")
+    ui.node("left", "gdrive:學校").click(button="right")
+    expect(ui.tid("row-menu")).to_be_visible()
+    ui.tid("menu-compare").click()
+    expect(ui.tid("view-compare")).to_be_visible()
+    assert unquote(ui.page.evaluate("location.hash")) == "#/compare?l=gdrive:學校"
+    expect(ui.tid("cmp-left-remote")).to_have_value("gdrive")
+    expect(ui.tid("cmp-left-path")).to_have_value("學校")
+    expect(ui.tid("cmp-right-remote")).to_be_focused()
+    # the button on the row and the keyboard open the same menu; a file has none
+    ui.tid("rail-workspace").click()
+    ui.node("left", "gdrive:學校").hover()
+    ui.tid("row-menu-gdrive:學校").click()
+    expect(ui.tid("menu-compare")).to_be_focused()
+    ui.page.keyboard.press("Escape")
+    expect(ui.tid("row-menu")).to_have_count(0)
+    ui.expand("left", "gdrive:學校")
+    ui.node("left", "gdrive:學校/report.pdf").click()
+    ui.page.keyboard.press("Shift+F10")
+    expect(ui.tid("row-menu")).to_have_count(0)
+    ui.node("left", "gdrive:學校").click()
+    ui.page.keyboard.press("ContextMenu")
+    expect(ui.tid("menu-compare")).to_be_focused()
+
+
+def test_a_suggestion_card_has_a_compare_button(make_ui):
+    ui = make_ui(locale="en-US").open()
+    ui.tid("suggestions-toggle").click()
+    card = ui.tid("suggestion-card").first
+    card.get_by_test_id("suggestion-compare").click()
+    expect(ui.tid("view-compare")).to_be_visible()
+    assert unquote(ui.page.evaluate("location.hash")) == "#/compare?l=gdrive:研究/論文&r=gdrive:研究/資料"
+    expect(ui.tid("cmp-summary")).to_be_visible()
+
+
+# --------------------------------------------------------------------------- both languages, colours, looks
+
+def test_the_new_views_speak_both_languages_and_a_switch_needs_no_reload(make_ui):
+    ui = make_ui(locale="zh-TW")
+    _rich_pair(ui.mock)
+    ui.open().go(PAIR)
+    expect(ui.tid("rail-explore")).to_contain_text("探索")
+    expect(ui.tid("cmp-count-left_only")).to_contain_text("僅左側")
+    expect(ui.tid("cmp-file-課程/week1.pptx")).to_contain_text("搬動過")
+    expect(ui.tid("cmp-merge-lr")).to_contain_text("左側併入右側")
+    ui.tid("cmp-file-report.pdf").click()
+    expect(ui.tid("cmp-evidence")).to_contain_text("大小不同")
+    ui.tid("view-lang").click()
+    expect(ui.tid("rail-explore")).to_contain_text("Explore")
+    expect(ui.tid("cmp-count-left_only")).to_contain_text("Only left")
+    expect(ui.tid("cmp-evidence")).to_contain_text("The sizes differ")
+    ui.go("#/overview")
+    expect(ui.tid("cloud-only-gdrive")).to_contain_text("Only here")
+    ui.tid("view-lang").click()
+    expect(ui.tid("cloud-only-gdrive")).to_contain_text("僅存在這裡")
+    ui.go("#/explore?q=final")
+    expect(ui.page.locator('[data-testid="ex-result"] [data-cloud="dropbox"]').first).to_have_attribute("aria-label", "在 dropbox，2 份")
+    assert ui.page.evaluate("document.documentElement.lang") == "zh-Hant-TW"
+
+
+def _luminance(color: str) -> float:
+    m = re.fullmatch(r"#([0-9a-f]{6})", color.strip().lower())
+    assert m, color
+    channels = [int(m.group(1)[i:i + 2], 16) / 255 for i in (0, 2, 4)]
+    lin = [c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4 for c in channels]
+    return 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2]
+
+
+@pytest.mark.parametrize("scheme", ["light", "dark"])
+def test_every_cloud_colour_has_at_least_three_to_one_against_the_surface(make_ui, scheme):
+    ui = make_ui(locale="en-US", color_scheme=scheme).open()
+    colors = ui.page.evaluate("""() => {
+        const cs = getComputedStyle(document.documentElement);
+        return { surface: cs.getPropertyValue('--surface'), surface2: cs.getPropertyValue('--surface-2'),
+                 clouds: [0, 1, 2, 3, 4, 5, 6, 7].map((i) => cs.getPropertyValue('--cloud-' + i)) };
+    }""")
+    assert len(set(c.strip().lower() for c in colors["clouds"])) == 8                      # eight distinct hues
+    for surface in (colors["surface"], colors["surface2"]):
+        sl = _luminance(surface)
+        for color in colors["clouds"]:
+            cl = _luminance(color)
+            ratio = (max(sl, cl) + 0.05) / (min(sl, cl) + 0.05)
+            assert ratio >= 3.0, f"{scheme}: {color} on {surface} is only {ratio:.2f}:1"
+
+
+def test_a_cloud_keeps_its_colour_in_every_view(make_ui):
+    ui = make_ui(locale="en-US").open()
+    ui.go("#/explore?q=final")
+    cell = ui.page.locator('[data-testid="ex-result"] [data-cloud="dropbox"] .presence-dot').first
+    expect(cell).to_be_visible()
+    explore_colour = cell.evaluate("el => getComputedStyle(el).backgroundColor")
+    ui.go("#/overview")
+    dot = ui.tid("cloud-card-dropbox").locator(".cloud-dot")
+    assert dot.evaluate("el => getComputedStyle(el).backgroundColor") == explore_colour
+    gd = ui.tid("cloud-card-gdrive").locator(".cloud-dot").evaluate("el => getComputedStyle(el).backgroundColor")
+    assert gd != explore_colour
+
+
+def test_screenshots_of_the_new_views(make_ui):
+    """overview/explore/compare in light and dark, English and Chinese, at 1440 and at the narrowest width (900)."""
+    SHOTS.mkdir(parents=True, exist_ok=True)
+    for scheme, locale, width in (("light", "en-US", 1440), ("dark", "en-US", 1440), ("light", "zh-TW", 1440), ("dark", "zh-TW", 900)):
+        ui = make_ui(color_scheme=scheme, locale=locale, width=width, height=860)
+        _rich_pair(ui.mock)
+        ui.mock.catalog.append({"key": "g:6", "name": "thesis-notes.docx", "size": 700_000, "category": "document", "ext": "docx",
+                                "mtime": "2023-02-01T10:00:00Z", "verified": True,
+                                "copies": [("dropbox", "學校/thesis-notes.docx"), ("gdrive", "研究/論文/thesis-notes.docx")]})
+        ui.open()
+        tag = f"{scheme}-{locale}-{width}"
+        ui.go("#/overview")
+        expect(ui.tid("chart-bar").first).to_be_visible()
+        ui.tid("chart-bar").nth(1).hover()
+        ui.page.screenshot(path=str(SHOTS / f"overview-{tag}.png"))
+        ui.go("#/explore?q=thesis cat:pdf not:onedrive")
+        expect(ui.tid("ex-result").first).to_be_visible()
+        ui.tid("ex-expand").first.click()
+        ui.page.screenshot(path=str(SHOTS / f"explore-{tag}.png"))
+        ui.go(PAIR)
+        expect(ui.tid("cmp-tree")).to_be_visible()
+        ui.tid("cmp-file-report.pdf").click()
+        ui.page.screenshot(path=str(SHOTS / f"compare-{tag}.png"))
+    assert (SHOTS / "compare-light-en-US-1440.png").stat().st_size > 5_000
+
+
+def test_the_keys_the_new_views_build_at_run_time_exist_in_both_languages_and_use_what_the_server_sends(make_ui):
+    """`t(`cmp.status.${s}`)` and friends cannot be found by scanning the sources, so they are listed here."""
+    ui = make_ui(locale="en-US")
+    ui.page.goto(f"{ui.base}/ui/#token={MockApi.TOKEN}")
+    dicts = ui.page.evaluate("import('/ui/static/i18n.js').then(m => m.dictionaries)")
+    statuses = ["same", "unverified", "differs", "moved", "left_only", "right_only"]
+    keys = [f"nav.{v}" for v in ("overview", "explore", "compare", "workspace")] + [f"nav.{v}Tip" for v in ("overview", "explore", "compare", "workspace")]
+    keys += [f"cmp.status.{s}" for s in statuses] + [f"cmp.statusTip.{s}" for s in statuses]
+    keys += [f"cmp.evidence.{k}" for k in ("group", "size", "hash", "none")] + ["cmp.side.left", "cmp.side.right"]
+    keys += [f"ex.sort.{s}" for s in ("relevance", "size", "mtime", "name", "copies")]
+    keys += [f"q.help.{k}" for k in "word in on not only copies type cat size modified path".split()]
+    keys += [f"q.err.{c}" for c in ("unknownKey", "empty", "unknownCloud", "repeated", "badValue", "summary")]
+    keys += [f"q.cat.{c}" for c in "photo video audio document pdf spreadsheet presentation archive code design other".split()]
+    keys += ["ex.expand", "ex.collapse", "sug.compare", "menu.compareWith", "cloud.column"]
+    for lang in ("zh-TW", "en"):
+        for key in keys:
+            assert key in dicts[lang], (lang, key)
+    # the refusals of the new views: the page words each from exactly the params the spec lists
+    sent = {"NOT_A_FOLDER": {"remote", "path"}, "COMPARE_NESTED": {"left", "right"}, "COMPARE_TOO_LARGE": {"side", "files", "limit"},
+            "BAD_QUERY": {"param"}}
+    for code, params in sent.items():
+        for lang in ("zh-TW", "en"):
+            used = set(re.findall(r"\{(\w+)\}", dicts[lang][f"err.{code}"]))
+            assert used and used <= params, (lang, code, used)
+        assert re.search(r"[一-鿿]", dicts["zh-TW"][f"err.{code}"]) and not re.search(r"[一-鿿]", dicts["en"][f"err.{code}"])
+
+
+def test_a_folder_of_identical_files_is_hidden_and_when_shown_it_is_closed(make_ui):
+    ui = make_ui(locale="en-US")
+    _rich_pair(ui.mock)
+    ui.mock.fs["gdrive"]["學校"]["相同"] = {"a.txt": 10, "b.txt": 20}
+    ui.mock.fs["dropbox"]["學校"]["相同"] = {"a.txt": 10, "b.txt": 20}
+    ui.open().go(PAIR)
+    expect(ui.tid("cmp-count-same")).to_have_attribute("data-count", "3")
+    expect(ui.tid("cmp-dir-相同")).to_have_count(0)                         # nothing to see in it: hidden by default
+    ui.tid("cmp-show-same").check()
+    folder = ui.tid("cmp-dir-相同")
+    expect(folder).to_have_attribute("aria-expanded", "false")             # and closed when it is shown
+    expect(ui.tid("cmp-file-相同/a.txt")).to_have_count(0)
+    folder.click()
+    expect(ui.tid("cmp-file-相同/a.txt")).to_have_attribute("data-status", "same")
+    expect(folder.locator(".cmp-diff-count")).to_have_text("0")

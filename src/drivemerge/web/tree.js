@@ -91,6 +91,7 @@ export function Pane({ side, draft, tick, handle }) {
   const spring = useRef({ key: null, timer: null });
   const [search, setSearch] = useState({ q: '', results: null, busy: false });
   const searchSeq = useRef(0);
+  const [menu, setMenu] = useState(null);  // the row menu of a folder: {key, x, y}
 
   const rows = useMemo(() => buildRows(s), [s.roots, s.expanded, s.cache, s.ghosts, s.view, s.root]);
   const nodeRows = useMemo(() => rows.filter((r) => r.kind === 'node'), [rows]);
@@ -361,10 +362,24 @@ export function Pane({ side, draft, tick, handle }) {
     if (ok) showLanded(target, items.map((i) => baseName(i.path)));
   }
 
+  /** The folder's row menu (right click, the "..." button, the Menu key or Shift+F10). */
+  function openMenu(key, at) {
+    const row = byKey.get(key);
+    if (!row || !row.node.is_dir || row.node.quarantine) return;
+    setMenu({ key, x: at.x, y: at.y });
+  }
+
   function onKeyDown(e) {
     if (e.target.tagName === 'INPUT') return;
     const cur = st.current;
     const row = byKey.get(cur.focus);
+    if (row && (e.key === 'ContextMenu' || (e.key === 'F10' && e.shiftKey))) {
+      e.preventDefault();
+      const el = [...box.current.querySelectorAll('[role="treeitem"]')].find((n) => n.dataset.key === row.key);
+      const r = el ? el.getBoundingClientRect() : { left: 0, bottom: 0 };
+      openMenu(row.key, { x: r.left + 40, y: r.bottom });
+      return;
+    }
     if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && (e.key === 'x' || e.key === 'v')) {
       e.preventDefault();
       if (e.key === 'x') cutSelection(); else pasteHere();
@@ -654,12 +669,32 @@ export function Pane({ side, draft, tick, handle }) {
       ${s.roots && rows.length === 0 && html`<div class="tree-msg">${t('pane.noClouds')}</div>`}
       ${rows.map((row) => html`<${Row} key=${row.key} row=${row} s=${s} tabbable=${row.key === (s.focus || (nodeRows[0] && nodeRows[0].key))}
         editable=${editable} onClick=${onRowClick} onFocus=${(key) => { if (st.current.focus !== key) dispatch({ type: 'set', patch: { focus: key } }); }}
-        onToggle=${toggle} dispatch=${dispatch}
+        onToggle=${toggle} dispatch=${dispatch} onMenu=${openMenu}
         onDragStart=${onDragStart} onDragOver=${onRowDragOver} onDrop=${onDrop}
         onRename=${commitRename} onBeginRename=${beginRename} onMore=${(dirKey) => { const { remote, path } = splitKey(dirKey); loadDir(remote, path, { append: true }); }}
         onGhost=${(g) => ctx.reveal(side === 'left' ? 'right' : 'left', g.moved_to)} />`)}
     </div>
+    ${menu && html`<${RowMenu} menu=${menu} node=${(byKey.get(menu.key) || {}).node} onClose=${() => setMenu(null)}
+      onCompare=${(node) => { setMenu(null); ctx.compareWith({ remote: node.remote, path: node.path }); }} />`}
   </section>`;
+}
+
+/** The little menu of a folder row: today one entry, "Compare with...", which opens the Compare view with this folder on the left. */
+function RowMenu({ menu, node, onClose, onCompare }) {
+  const box = useRef(null);
+  useEffect(() => {
+    const before = document.activeElement;
+    box.current.querySelector('button').focus();
+    const away = (e) => { if (!box.current.contains(e.target)) onClose(); };
+    document.addEventListener('mousedown', away);
+    return () => { document.removeEventListener('mousedown', away); if (before && before.focus && document.contains(before)) before.focus(); };
+  }, []);
+  if (!node) return null;
+  return html`<div class="row-menu" role="menu" ref=${box} data-testid="row-menu" style=${{ left: `${menu.x}px`, top: `${menu.y}px` }}
+    onKeyDown=${(e) => { if (e.key === 'Escape' || e.key === 'Tab') { e.preventDefault(); e.stopPropagation(); onClose(); } }}>
+    <button role="menuitem" data-testid="menu-compare" onClick=${() => onCompare(node)}>
+      <${Icon} name="swap" size=${14} /> ${t('menu.compareWith')}</button>
+  </div>`;
 }
 
 /** One badge: icon or dot, then the word. A narrow pane drops the word (CSS); the tooltip says what it means. */
@@ -682,7 +717,7 @@ function Badges({ node }) {
   </span>`;
 }
 
-function Row({ row, s, tabbable, editable, onClick, onFocus, onToggle, dispatch, onDragStart, onDragOver, onDrop, onRename, onBeginRename, onMore, onGhost }) {
+function Row({ row, s, tabbable, editable, onClick, onFocus, onToggle, dispatch, onMenu, onDragStart, onDragOver, onDrop, onRename, onBeginRename, onMore, onGhost }) {
   const indent = { paddingLeft: `${8 + row.level * 16}px` };
   if (row.kind === 'loading') return html`<div class="row row-msg" role="presentation" style=${indent}>${t('common.loading')}</div>`;
   if (row.kind === 'empty') return html`<div class="row row-msg" role="presentation" style=${indent}>${t('pane.empty')}</div>`;
@@ -730,7 +765,8 @@ function Row({ row, s, tabbable, editable, onClick, onFocus, onToggle, dispatch,
     data-droptarget=${isDir && !locked ? key : undefined} data-quarantine=${n.quarantine_root ? 'root' : locked ? 'inside' : undefined}
     title=${tip} draggable=${editable && !!n.path && !renaming && !locked}
     onClick=${(e) => onClick(e, row)} onFocus=${() => onFocus(key)} onDragStart=${(e) => onDragStart(e, row)}
-    onDragOver=${(e) => onDragOver(e, row)} onDrop=${(e) => onDrop(e, n)}>
+    onDragOver=${(e) => onDragOver(e, row)} onDrop=${(e) => onDrop(e, n)}
+    onContextMenu=${isDir && !locked ? (e) => { e.preventDefault(); onClick({}, row); onMenu(key, { x: e.clientX, y: e.clientY }); } : undefined}>
     ${isDir
     ? html`<button class=${'twisty' + (open ? ' open' : '')} tabindex="-1" aria-hidden="true" data-testid=${'toggle-' + key}
         onClick=${(e) => { e.stopPropagation(); onToggle(key); }}><${Icon} name="chevron" size=${12} /></button>`
@@ -770,5 +806,8 @@ function Row({ row, s, tabbable, editable, onClick, onFocus, onToggle, dispatch,
     : null}
       <span class="meta-size">${isDir ? (n.bytes > 0 ? fmtBytes(n.bytes) : '') : fmtBytes(n.size)}</span>
     </span>
+    ${isDir && !locked && html`<button class="row-menu-btn" tabindex="-1" aria-hidden="true" data-testid=${'row-menu-' + key} title=${t('menu.open')}
+      onClick=${(e) => { e.stopPropagation(); const r = e.currentTarget.getBoundingClientRect(); onMenu(key, { x: r.left - 120, y: r.bottom }); }}>
+      <${Icon} name="more" size=${14} /></button>`}
   </div>`;
 }

@@ -93,3 +93,20 @@ export const execute = (planId) => call('POST', `/v1/ui/plans/${planId}/execute`
 export const rescan = (remotes) => call('POST', '/v1/ui/rescan', { body: { remotes } });
 export const job = (id) => call('GET', `/v1/jobs/${id}`);
 export const progress = (planId) => call('GET', `/v1/plans/${planId}/progress`);
+
+// Read-only views (docs/EXPLORE.md section E).
+export const compare = ({ left, right, maxFiles }) => call('GET', '/v1/compare', {
+  query: {
+    left_remote: left.remote, left_path: left.path || '', right_remote: right.remote, right_path: right.path || '', max_files: maxFiles,
+  },
+});
+export const coverage = ({ category, maxBars } = {}) => call('GET', '/v1/coverage', { query: { category, max_bars: maxBars } });
+/** `params` are the request parameters of the query language; list parameters go comma-separated. */
+export const explore = (params) => {
+  const query = {};
+  for (const [k, v] of Object.entries(params)) {
+    if (v === undefined || v === null || v === '') continue;
+    query[k] = Array.isArray(v) ? v.join(',') : v;
+  }
+  return call('GET', '/v1/explore', { query });
+};

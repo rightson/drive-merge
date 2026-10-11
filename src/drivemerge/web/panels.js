@@ -80,7 +80,7 @@ const isStaged = (draft, s) => {
   return steps > 0 && steps >= (s.actions || []).length;
 };
 
-function SuggestionCard({ s, added, onAdd, onReveal }) {
+function SuggestionCard({ s, added, onAdd, onReveal, onCompare }) {
   const folders = s.folders || [];
   const text = suggestionText(s);
   return html`<article class=${'sug-card' + (added ? ' added' : '')} data-testid="suggestion-card" data-sid=${s.id}>
@@ -100,6 +100,8 @@ function SuggestionCard({ s, added, onAdd, onReveal }) {
     <div class="sug-actions">
       <button class="btn btn-small" data-testid="suggestion-show-left" onClick=${() => onReveal('left', folders)}>${t('sug.showLeft')}</button>
       <button class="btn btn-small" data-testid="suggestion-show-right" onClick=${() => onReveal('right', folders)}>${t('sug.showRight')}</button>
+      ${folders.length > 1 && html`<button class="btn btn-small" data-testid="suggestion-compare" onClick=${() => onCompare(folders[0], folders[1])}>
+        ${t('sug.compare')}</button>`}
       <button class="btn btn-small btn-primary" data-testid="suggestion-add" disabled=${added || !(s.actions || []).length}
         onClick=${onAdd}>${added ? t('sug.added') : t('sug.add')}</button>
     </div>
@@ -146,7 +148,7 @@ export function SuggestionsDrawer({ draft, onClose }) {
     ${!state.loading && !state.error && state.items.length === 0 && html`<p class="empty-hint">${t('sug.none')}</p>`}
     <div class="sug-list" data-testid="suggestion-list">
       ${state.items.map((s) => html`<${SuggestionCard} key=${s.id} s=${s} added=${isStaged(draft, s)}
-        onAdd=${() => add(s)} onReveal=${show} />`)}
+        onAdd=${() => add(s)} onReveal=${show} onCompare=${ctx.compare} />`)}
     </div>
   <//>`;
 }
