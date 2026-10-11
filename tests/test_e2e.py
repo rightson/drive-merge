@@ -158,3 +158,81 @@ def test_file_changed_after_scan_stops_execution(world):
     assert out["status"] == "failed"
     assert victim.exists(), "a file that changed since the scan must never be deleted"
     assert db.snapshot(svc.conn)  # catalog still readable
+
+
+# --------------------------------------------------------------------------- QuickXorHash is not proof
+
+def _quickxor_pair(seed: int = 7) -> tuple[bytes, bytes]:
+    """Different bytes, same size, same QuickXorHash: 160-byte rows swapped (see test_executor.collision_pair)."""
+    rnd = __import__("random").Random(seed)
+    x, y = rnd.randbytes(160), rnd.randbytes(160)
+    return x + y, y + x
+
+
+def _pair_world(tmp_path: Path, names: tuple[str, ...]):
+    roots = {n: tmp_path / n for n in names}
+    for r in roots.values():
+        r.mkdir()
+    cfg = parse_config({
+        "database": {"path": str(tmp_path / "catalog.db")},
+        "safety": {"execution_enabled": True},
+        "remotes": [{"name": n, "provider": "local", "read": str(roots[n]), "write": str(roots[n]),
+                     "hash_types": CLOUDS[n]} for n in names],
+    })
+    return Service(cfg), roots
+
+
+def _all_contents(roots: dict[str, Path]) -> set[bytes]:
+    return {data for r in roots.values() for data in _files(r).values()}
+
+
+@requires_rclone
+def test_a_onedrive_file_that_only_shares_a_quickxor_survives_the_documented_flow(tmp_path):
+    """Drive holds X+Y, OneDrive holds Y+X. scan -> identity -> bridge -> consolidate with delete_sources must
+    treat the OneDrive file as a content of its own: copied over, read back, and only then removed from OneDrive."""
+    a, b = _quickxor_pair()
+    svc, roots = _pair_world(tmp_path, ("gd", "od"))
+    _write(roots["gd"], "Archive/thesis.pdf", a)
+    _write(roots["od"], "Docs/thesis.pdf", b)
+    for name in roots:
+        svc.scan(name)
+    svc.rebuild_identity()
+    assert svc.bridge(max_bytes=10**7)["failed"] == []
+    assert svc.duplicates(cross_remote_only=True) == [], "different bytes must never be one exact group"
+
+    res = svc.propose_plan("consolidate", {"target": "gd", "delete_sources": True}, created_by="test")
+    assert res["simulation"]["ok"], res["simulation"]["violations"]
+    ops = [(o["op"], o["src_path"]) for o in svc.plan(res["plan_id"])["ops"]]
+    assert ops == [("copy", "Docs/thesis.pdf"), ("delete", "Docs/thesis.pdf")], "the content has to be copied first"
+    assert _approve_and_run(svc, res["plan_id"])["status"] == "done"
+    assert svc.purge(res["plan_id"], older_than_days=0)["status"] == "done"
+    assert _all_contents(roots) == {a, b}
+    assert _files(roots["gd"])["Archive/thesis.pdf"] == a
+    svc.conn.close()
+
+
+@requires_rclone
+def test_onedrive_files_that_share_a_quickxor_are_deduplicated_only_when_their_bytes_are_equal(tmp_path):
+    a, b = _quickxor_pair(8)
+    svc, roots = _pair_world(tmp_path, ("od",))
+    _write(roots["od"], "keep/report.bin", a)
+    _write(roots["od"], "other/report.bin", b)                   # same size and QuickXor, other bytes
+    _write(roots["od"], "keep/same.bin", a)
+    _write(roots["od"], "other/same.bin", a)                     # really the same bytes
+    svc.scan("od")
+    svc.rebuild_identity()
+    assert svc.duplicates() == [] and svc.propose_plan("dedupe", {"remote": "od"}, created_by="t")["plan_id"] is None
+
+    assert svc.bridge(max_bytes=10**7)["failed"] == []           # every candidate is read once
+    (group,) = svc.duplicates()
+    assert sorted(c["path"] for c in group["copies"]) == ["keep/report.bin", "keep/same.bin", "other/same.bin"]
+    res = svc.propose_plan("dedupe", {"remote": "od"}, created_by="test")
+    assert res["simulation"]["ok"], res["simulation"]["violations"]
+    ops = svc.plan(res["plan_id"])["ops"]
+    assert len(ops) == 2 and all(o["op"] == "delete" for o in ops)
+    assert {o["src_path"] for o in ops}.isdisjoint({"other/report.bin"}), "the file with other bytes is never a victim"
+    assert _approve_and_run(svc, res["plan_id"])["status"] == "done"
+    assert svc.purge(res["plan_id"], older_than_days=0)["status"] == "done"
+    assert _all_contents(roots) == {a, b}
+    assert _files(roots["od"])["other/report.bin"] == b
+    svc.conn.close()

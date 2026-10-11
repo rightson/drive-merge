@@ -1,5 +1,6 @@
-// UI strings. Traditional Chinese (zh-TW) is the default; English answers for any key zh-TW lacks and
-// can be chosen with ?lang=en or the language button. Placeholders look like {n}.
+// UI strings in English and Traditional Chinese (zh-TW). The language is the one the person chose (?lang= or the
+// language button, remembered), else the first language in the browser's own order of preference that we have
+// (English, or any Chinese as zh-TW), else English. English also answers for any key zh-TW lacks. Placeholders look like {n}.
 
 const zh = {
   'app.title': 'drive-merge 工作區',
@@ -14,6 +15,7 @@ const zh = {
   'common.refresh': '重新整理',
   'common.copy': '複製',
   'common.copied': '已複製',
+  'common.listSep': '、',
 
   'fatal.title': '無法開啟工作區',
   'fatal.login': '登入失敗：網址裡的一次性 token 無效或已用過。請回到終端機重新執行 drivemerge ui，用它印出的新網址開啟。',
@@ -70,6 +72,10 @@ const zh = {
   'pane.nothingCut': '還沒有剪下任何東西。選取項目後按 Ctrl+X。',
   'pane.cannotPaste': '這裡不能貼上：請選一個資料夾（不能是被剪下資料夾本身或它的子資料夾，也不能是它原本的位置）。',
   'pane.revealNearest': '找不到這個項目（可能已被搬走），已顯示到最近的上層：{loc}',
+  'quarantine.label': '隔離區',
+  'quarantine.tip': '已刪除檔案的存放處：drive-merge 不會真的刪檔，被去重或搬走的原檔會先放在這裡（資料夾 {dir}）。這個畫面不能把東西拖出或拖進去；要還原請在終端機執行 drivemerge plan restore <計畫編號>，要永久清除請執行 drivemerge plan purge <計畫編號>。',
+  'quarantine.inside': '在隔離區裡：不能拖放或改名。要還原請在終端機執行 drivemerge plan restore <計畫編號>。',
+  'quarantine.cannotHere': '隔離區不能新增資料夾或貼上東西。',
 
   'badge.new': '新增',
   'badge.moved': '移入',
@@ -80,7 +86,7 @@ const zh = {
   'badge.dupN': '重複 {n}',
   'tip.movedFrom': '原本在 {from}',
   'tip.merged': '同名資料夾合併在一起',
-  'tip.conflict': '同名但內容不同的檔案，需要改名才能一起放',
+  'tip.conflict': '同名但內容不同的檔案：要先在各自的資料夾改名才能一起放（在這一列按 F2 看做法）',
   'tip.dedupe': '內容完全相同的檔案，執行時只保留一份',
   'tip.dup': '有 {n} 個檔案在別處還有相同內容的副本',
 
@@ -112,6 +118,12 @@ const zh = {
   'staged.clearText': '這份草稿會被捨棄並換成全新的空草稿。雲端不會有任何變動，但已暫存的步驟（包含 Claude 提出的）都會消失。',
   'staged.clearOk': '捨棄並重新開始',
   'staged.cleared': '已清除，這是新的空草稿。',
+  'staged.staleTip': '有 {n} 個暫存的步驟已失效：重新掃描後它們的來源或目的地不見了，不會被執行',
+  'staged.staleSummary': '其中 {n} 個步驟已失效，不會被執行。',
+  'stale.badge': '已失效',
+  'stale.SRC_NOT_FOUND': '來源已不存在：{items}（重新掃描後被搬走或刪除了）。這一步不會產生任何動作。',
+  'stale.DST_NOT_DIR': '目的地已不是資料夾：{items}（重新掃描後被刪除或改變了）。這一步不會產生任何動作。',
+  'stale.remove': '建議移除這一步。',
 
   'sug.button': '建議',
   'sug.title': '整理建議',
@@ -128,11 +140,28 @@ const zh = {
   'sug.add': '加入暫存',
   'sug.added': '已加入',
   'sug.addedN': '已加入 {n} 個暫存步驟，可以再調整。',
+  'sug.q': '「{term}」',
+  'sug.sep': '、',
+  'sug.joinReasons': '；',
+  'sug.RELATED.title': '這 {n} 個資料夾看起來相關：{names}',
+  'sug.DUPLICATES.title': '這 {n} 個資料夾內容幾乎相同：{names}',
+  'sug.RELATED.why.names': '資料夾名稱都有{terms}',
+  'sug.RELATED.why.files': '裡面的檔名常出現{terms}',
+  'sug.RELATED.why.same': '其中有 {n} 份內容完全相同的檔案',
+  'sug.RELATED.why.alike': '名稱與內容相近',
+  'sug.RELATED.reason': '{why}。建議整理到「{anchor}」底下。',
+  'sug.DUPLICATES.reason': '內容相同度 {pct}（只計算已用雜湊證明相同的內容，共 {shared} 份相同）。把其餘資料夾合併進「{kept}」後，相同的檔案會自動變成有見證的去重，約可釋出 {saved}。',
 
   'prev.title': '預覽變更',
   'prev.plan': '計畫 #{id}',
   'prev.loading': '正在模擬…',
   'prev.nothing': '這份草稿的淨效果是沒有任何變更（來回拖放後回到原位），不需要執行。',
+  'prev.nothingStale': '這份草稿裡沒有任何可以執行的步驟：它們的來源或目的地在重新掃描後都不見了。請到「暫存的變更」移除它們。',
+  'prev.staleTitle': '有 {n} 個暫存的步驟已失效，不會被執行',
+  'prev.staleText': '重新掃描之後，這些步驟的來源或目的地已經不存在，所以預覽不包含它們。其餘步驟照常預覽；若要清理，請到「暫存的變更」移除它們。',
+  'prev.nothingEmptyDirs': '這份草稿只搬動了裡面沒有任何檔案的資料夾，而雲端只靠檔案來變動：不會發生任何變更，所以沒有需要執行的。',
+  'prev.skippedTitle': '有 {n} 個資料夾裡面沒有任何檔案，搬動它們不會改變雲端',
+  'prev.skippedText': '雲端只靠檔案來變動：空資料夾不會被搬到新位置，也不會被建立，所以預覽不包含它們。要整理它們，請直接到雲端處理。',
   'prev.stale': '草稿在預覽之後又有變動，這份預覽已失效，必須重新預覽才能核准。',
   'prev.repreview': '重新預覽',
   'prev.files': '搬動的檔案',
@@ -151,6 +180,25 @@ const zh = {
   'prev.reveal': '顯示位置',
   'prev.conflictList': '衝突',
   'prev.conflictOne': '同名衝突',
+  'conflict.DIFFERENT_CONTENT.title': '同名但內容不同的檔案',
+  'conflict.DIFFERENT_CONTENT.text': '目的地已經有一個名稱相同、內容卻不一樣的檔案。drive-merge 絕不覆寫：請先取消把它們放在一起的那一步，在各自的資料夾裡把其中一個改名，再重新合併。在合併後的畫面直接改名會把兩個一起改掉。',
+  'conflict.DIR_IN_WAY.title': '同名的資料夾擋住了這個檔案',
+  'conflict.DIR_IN_WAY.text': '目的地有一個同名的資料夾還留在雲端上（逐檔執行不會刪除資料夾），檔案放不進去。請改名，或換一個位置。',
+  'conflict.FILE_IN_WAY.title': '同名的檔案擋住了資料夾',
+  'conflict.FILE_IN_WAY.text': '這個路徑上需要一個資料夾，但那裡已經有一個同名的檔案。請改名，或換一個位置。',
+  'conflict.OCCUPIED.title': '位置要到最後才會空出來',
+  'conflict.OCCUPIED.text': '那個位置現在被另一個檔案佔著，而它要到最後的「移入隔離區」階段才會離開，所以現在放不進去。請改名，或換一個位置。',
+  'conflict.CYCLE.title': '搬移互相等待（例如互換）',
+  'conflict.CYCLE.text': '幾個搬移都在等對方先讓出位置，排不出先後順序（例如兩個東西互換名稱）。請拆成幾步，先改成一個暫時的名稱。',
+  'conflict.CASE_ONLY_RENAME.title': '只改大小寫的更名無法執行',
+  'conflict.CASE_ONLY_RENAME.text': '這個雲端不分大小寫，只改變大小寫的更名無法逐檔執行（舊名和新名會被當成同一個名稱）。請改成不同的名稱，或換一個位置。',
+  'clash.title': '兩個內容不同的檔案共用同一個名稱',
+  'clash.text': '合併之後，「{name}」其實是兩個不同的檔案；在這一列改名會把兩個一起改掉，衝突還是在。要同時保留它們，請先取消第 {seq} 步（它把「{from}」帶到這裡），到原本的資料夾替其中一個改名，再重新拖放。',
+  'clash.remove': '取消第 {seq} 步',
+  'clash.removed': '已取消那一步。請在原位置替「{name}」改名（F2），再重新拖放。',
+  'clash.show': '顯示位置',
+  'clash.explain': '這一列其實是兩個內容不同的檔案，在這裡改名會把兩個一起改掉。請取消把它們放在一起的那一步，在原本的資料夾改名後再重新合併。',
+  'clash.fix': '取消那一步，先改名',
   'prev.with': '與',
   'prev.warnings': '提醒（{n}）',
   'prev.perCloud': '各雲端變化',
@@ -190,23 +238,31 @@ const zh = {
   'prog.stage.dir_stats': '正在更新資料夾統計…',
   'prog.failedHelp': '遇到錯誤就會立刻停止，已完成的步驟不會自動還原。可以在終端機用 drivemerge plan restore {id} 還原。',
   'prog.unknownFailure': '某個步驟失敗',
+  'prog.rawDetails': '引擎回報的原始內容（不翻譯）：',
+  'catalog.title': '雲端已經變動，這個畫面還是舊資料。',
+  'catalog.text': '剛才的執行動過 {remotes}，但目錄還沒更新：畫面上的位置和之後的預覽都可能與雲端不一致。重新掃描之後才準。',
+  'catalog.rescan': '重新掃描',
+  'catalog.cli': '請在終端機重新掃描：',
+  'catalog.dismiss': '不再提醒（我已經掃描過了）',
+  'catalog.blocked': '目錄資料已過期：上一次執行改動了雲端，還沒重新掃描，所以這份預覽可能和雲端不一致，現在不能核准。請先重新掃描，再重新預覽。',
 
   'kind.move': '搬移',
   'kind.copy+delete': '複製後移入隔離區',
   'kind.merge': '合併',
   'kind.dedupe': '去重',
 
-  'warn.MERGE': '同名資料夾已合併進「{dst}」：內容相同的檔案會自動去重，內容不同的同名檔案會列為衝突。',
+  'warn.MERGE': '資料夾「{src}」已合併進既有的「{into}」：內容相同的檔案會自動去重，內容不同的同名檔案會列為衝突。',
   'warn.CROSS_REMOTE': '跨雲搬移：會先複製（經過這台電腦）並驗證，再把原檔移入隔離區。',
-  'warn.READ_ONLY': '有雲端沒有寫入權限，這個變更無法通過模擬。',
-  'warn.CASE_COLLISION': '這朵雲不分大小寫，名稱和既有項目只差在大小寫。',
+  'warn.READ_ONLY': '「{remote}」沒有寫入權限，這個變更無法通過模擬。',
+  'warn.CASE_COLLISION': '「{remote}」不分大小寫，「{name}」和「{dst}」裡既有的名稱只差在大小寫。',
+  'warn.CASE_ONLY_RENAME': '「{remote}」不分大小寫，把「{from}」改成「{to}」只改變了大小寫，無法逐檔執行，預覽時會被擋下。請改成不同的名稱。',
 
   'err.network': '連不上 drive-merge 服務，請確認終端機裡的 drivemerge ui 還在執行。',
   'err.unknown': '發生未知的錯誤。',
   'err.SRC_NOT_FOUND': '找不到要搬移的項目，它可能已經被移動或不存在了。',
   'err.DST_NOT_DIR': '目的地不是資料夾。',
-  'err.INTO_ITSELF': '不能把資料夾移進它自己或它的子資料夾。',
-  'err.NAME_EXISTS': '目的地已經有同名的項目。',
+  'err.INTO_ITSELF': '不能把資料夾「{item}」移進它自己或它的子資料夾。',
+  'err.NAME_EXISTS': '目的地已經有同名的項目：「{item}」。',
   'err.NOOP': '這些項目本來就在那裡，不需要移動。',
   'err.BAD_NAME': '名稱不合法：不能空白、不能是「.」或「..」，也不能含有「/」。',
   'err.NOT_FOUND': '找不到資料（草稿或雲端不存在）。',
@@ -214,6 +270,7 @@ const zh = {
   'err.BAD_REQUEST': '請求的內容不正確。',
   'err.NOTHING_TO_UNDO': '沒有可以復原的步驟。',
   'err.NOTHING_TO_REDO': '沒有可以重做的步驟。',
+  'err.QUARANTINE': '隔離區是已刪除檔案的存放處，不能在這個畫面搬進或搬出。要還原請在終端機執行 drivemerge plan restore <計畫編號>，要永久清除請執行 drivemerge plan purge <計畫編號>。',
   'err.STALE': '草稿在預覽之後又有變動，請重新預覽。',
   'err.STALE_PREVIEW': '草稿在預覽之後又有變動，請重新預覽。',
   'err.JOB_BUSY': '還有另一個工作（執行或重新掃描）正在跑，請等它結束。',
@@ -225,6 +282,7 @@ const zh = {
   'err.HUMAN_ONLY': '核准與執行只能在 drivemerge ui 開啟的瀏覽器頁面進行。',
   'err.UNAUTHENTICATED': '尚未登入或登入已失效。請用終端機裡 drivemerge ui 印出的網址重新開啟。',
   'err.CONFLICT': '這個操作和目前的狀態衝突。',
+  'err.BAD_TOKEN': '登入失敗：網址裡的一次性 token 無效或已用過。請回到終端機重新執行 drivemerge ui，用它印出的新網址開啟。',
 
   'viol.SRC_MISSING.title': '來源不存在',
   'viol.SRC_MISSING.text': '要搬的檔案找不到：可能已被搬走或刪除，或目錄資料過時了。請重新掃描那朵雲，再重新預覽。',
@@ -258,6 +316,63 @@ const zh = {
   'viol.NOOP.text': '檔案已經在那裡，或目的地已有完全相同的內容，這一步不會改變任何東西。',
   'viol.PROBABLE_ONLY.title': '只憑名稱與大小判斷相同',
   'viol.PROBABLE_ONLY.text': '這個去重沒有雜湊證明，只是名稱和大小一樣。預設不允許，請先做雜湊比對（bridging）。',
+  // The detail line under a problem: <ns>.<CODE>.detail, or .detail.<variant> for a code with several sentences.
+  'viol.BAD_PATH.detail.remote': '{role}的雲端編號 {rid} 不存在。',
+  'viol.BAD_PATH.detail.path': '{role}路徑「{path}」{problem}。',
+  'viol.BAD_PATH.detail.quarantine': '{role}路徑「{path}」位於隔離區內。',
+  'viol.BAD_PATH.detail.op_kind': '不明的步驟種類「{kind}」。',
+  'viol.BAD_PATH.detail.no_destination': '「{kind}」步驟需要目的地雲端與路徑。',
+  'viol.DEPENDENCY.detail.not_earlier': 'depends_on {dep} 不是這份計畫中較早的步驟。',
+  'viol.DEPENDENCY.detail.witness_made_by': '見證檔「{at}」是由步驟 {by} 建立的；這個刪除步驟必須宣告 depends_on 該步驟（直接或經由其他步驟）。',
+  'viol.DEPENDENCY.detail.position': '步驟編號 {seq} 不是唯一的正整數位置。',
+  'viol.READ_ONLY_REMOTE.detail': '「{at}」沒有設定 write_remote（沒有寫入權限）。',
+  'viol.CROSS_REMOTE_MOVE.detail': '搬移不能跨雲端；請改用複製加刪除。',
+  'viol.AMBIGUOUS_PATH.detail.source': '有 {n} 個現存項目共用「{at}」，rclone 無法指定其中一個。',
+  'viol.AMBIGUOUS_PATH.detail.destination': '有 {n} 個現存項目共用目的地「{at}」。',
+  'viol.AMBIGUOUS_PATH.detail.witness': '有 {n} 個現存項目共用見證檔路徑「{at}」。',
+  'viol.SRC_MISSING.detail.missing': '「{at}」沒有現存的檔案：{why}。',
+  'viol.SRC_MISSING.detail.other_entry': '「{at}」放的是{what}，不是計畫中的項目 {planned}。',
+  'viol.EXPECT_MISMATCH.detail': '「{at}」在這一步的大小是 {size}，計畫預期的是 {expected}。',
+  'viol.NATIVE_DOC.detail': '「{at}」是 Google 原生文件：沒有檔案位元組可複製，也無法據以驗證刪除。',
+  'viol.DST_EXISTS.detail.file_above': '「{at}」是檔案，所以無法在它底下建立「{dst}」。',
+  'viol.DST_EXISTS.detail.directory': '「{at}」是資料夾。',
+  'viol.DST_EXISTS.detail.different': '「{at}」已有內容不同或未能證明相同的檔案；絕不覆寫。',
+  'viol.CASE_COLLISION.detail.file': '「{at}」與檔案「{other}」衝突（不分大小寫）。',
+  'viol.CASE_COLLISION.detail.name': '「{at}」與「{other}」衝突（不分大小寫）。',
+  'viol.NO_WITNESS.detail.none_given': '刪除必須指定見證檔：也就是會保留下來的相同副本。',
+  'viol.NO_WITNESS.detail.is_source': '見證檔「{at}」就是要被刪除的檔案本身。',
+  'viol.NO_WITNESS.detail.missing': '見證檔「{at}」沒有現存的檔案：{why}。',
+  'viol.NO_WITNESS.detail.gone': '計畫結束時，見證檔「{at}」已不是內容相同的現存檔案。',
+  'viol.WITNESS_MISMATCH.detail.vouched': '「{at}」已經僅憑名稱與大小，為另一個不同的檔案作過見證；一個可能相符的見證檔不能同時涵蓋兩份內容。',
+  'viol.WITNESS_MISMATCH.detail.differs': '見證檔「{at}」與要刪除的檔案不相符：{why}。',
+  'viol.PROBABLE_ONLY.detail': '「{at}」只憑名稱與大小相符，內容並未以雜湊證明。',
+  'viol.NOOP.detail.identical': '「{at}」已經有相同的內容。',
+  'viol.NOOP.detail.onto_itself': '把「{at}」搬到它自己身上。',
+  'viol.NOOP.detail.identical_move': '「{at}」已經有相同的內容；這次搬移只會移除「{removed}」。',
+  'viol.CONTENT_LOST.detail': '「{at}」：這份內容只會剩下 {n} 份現存副本（原則要求 {need} 份）。',
+  'viol.QUOTA.detail': '「{at}」會寫入 {bytes}，但只剩 {free} 可用。',
+  'viol.role.source': '來源',
+  'viol.role.destination': '目的地',
+  'viol.role.witness': '見證檔',
+  'viol.why.moved': '它已被步驟 {by} 搬走或刪除',
+  'viol.why.directory': '該路徑是資料夾',
+  'viol.why.tombstone': 'catalog 標記它已不存在（墓碑記錄）',
+  'viol.why.absent': 'catalog 裡沒有這個檔案',
+  'viol.why.different': '大小或雜湊值不同',
+  'viol.why.unproven': '無法證明內容相同',
+  'viol.what.created': '這份計畫稍早建立的檔案',
+  'viol.what.entry': '項目 {entry}',
+  'viol.problem.empty': '是空的',
+  'viol.problem.nul': '含有 NUL 字元',
+  'viol.problem.absolute': '是絕對路徑',
+  'viol.problem.empty_segment': '含有空的路徑片段',
+  'viol.problem.dot_segment': '含有「{segment}」片段',
+  'conflict.DIFFERENT_CONTENT.detail': '已經有另一個內容不同的檔案使用這個名稱。',
+  'conflict.DIR_IN_WAY.detail': '有同名的資料夾擋在這裡。',
+  'conflict.FILE_IN_WAY.detail': '這裡需要資料夾的位置上有一個檔案。',
+  'conflict.OCCUPIED.detail': '這個位置在刪除階段之前仍被佔用。',
+  'conflict.CYCLE.detail': '幾個搬移互相等待（互換需要一個暫時的名稱）。',
+  'conflict.CASE_ONLY_RENAME.detail': '這個雲端不分大小寫，只改大小寫的更名無法逐檔執行。',
 };
 
 const en = {
@@ -273,6 +388,7 @@ const en = {
   'common.refresh': 'Refresh',
   'common.copy': 'Copy',
   'common.copied': 'Copied',
+  'common.listSep': ', ',
 
   'fatal.title': 'Cannot open the workspace',
   'fatal.login': 'Sign-in failed: the one-time token in the address is invalid or already used. Run drivemerge ui again in the terminal and open the new address it prints.',
@@ -329,6 +445,10 @@ const en = {
   'pane.nothingCut': 'Nothing cut yet. Select items and press Ctrl+X.',
   'pane.cannotPaste': 'Cannot paste here: pick a folder (not the cut folder itself, a folder inside it, or where the items already are).',
   'pane.revealNearest': 'Could not find that item (it may have been moved); showing the nearest parent: {loc}',
+  'quarantine.label': 'Quarantine',
+  'quarantine.tip': 'Where deleted files wait: drive-merge never really deletes, so originals removed by a dedupe or a cross-cloud move are parked here (folder {dir}). Nothing can be dragged out of or into it in this window. To restore, run drivemerge plan restore <plan id> in a terminal; to remove for good, drivemerge plan purge <plan id>.',
+  'quarantine.inside': 'Inside quarantine: it cannot be dragged or renamed. To restore, run drivemerge plan restore <plan id> in a terminal.',
+  'quarantine.cannotHere': 'Quarantine cannot take new folders or pasted items.',
 
   'badge.new': 'new',
   'badge.moved': 'moved in',
@@ -339,7 +459,7 @@ const en = {
   'badge.dupN': 'dup {n}',
   'tip.movedFrom': 'Originally at {from}',
   'tip.merged': 'Folders with the same name are merged',
-  'tip.conflict': 'Same name, different content: rename one to keep both',
+  'tip.conflict': 'Same name, different content: rename one in its own folder to keep both (press F2 on this row to see how)',
   'tip.dedupe': 'Identical content: only one copy is kept',
   'tip.dup': '{n} file here has identical copies elsewhere|{n} files here have identical copies elsewhere',
 
@@ -371,6 +491,12 @@ const en = {
   'staged.clearText': 'This draft is discarded and replaced by a fresh empty one. Nothing changes in the cloud, but every staged step (including ones proposed by Claude) is lost.',
   'staged.clearOk': 'Discard and start over',
   'staged.cleared': 'Cleared. This is a new empty draft.',
+  'staged.staleTip': '{n} staged step is stale: after a rescan its source or destination is gone, so it will not run|{n} staged steps are stale: after a rescan their sources or destinations are gone, so they will not run',
+  'staged.staleSummary': '{n} of them is stale and will not run.|{n} of them are stale and will not run.',
+  'stale.badge': 'stale',
+  'stale.SRC_NOT_FOUND': 'The source no longer exists: {items} (moved or deleted, seen by a rescan). This step does nothing.',
+  'stale.DST_NOT_DIR': 'The destination is no longer a folder: {items} (deleted or changed, seen by a rescan). This step does nothing.',
+  'stale.remove': 'Consider removing this step.',
 
   'sug.button': 'Suggestions',
   'sug.title': 'Suggestions',
@@ -387,11 +513,28 @@ const en = {
   'sug.add': 'Stage it',
   'sug.added': 'Staged',
   'sug.addedN': 'Staged {n} step. You can still adjust it.|Staged {n} steps. You can still adjust them.',
+  'sug.q': '"{term}"',
+  'sug.sep': ', ',
+  'sug.joinReasons': '; ',
+  'sug.RELATED.title': 'These {n} folders look related: {names}',
+  'sug.DUPLICATES.title': 'These {n} folders hold almost the same content: {names}',
+  'sug.RELATED.why.names': 'their folder names share {terms}',
+  'sug.RELATED.why.files': 'file names inside often contain {terms}',
+  'sug.RELATED.why.same': '{n} file inside has exactly the same content|{n} files inside have exactly the same content',
+  'sug.RELATED.why.alike': 'similar names and contents',
+  'sug.RELATED.reason': '{why}. Suggested: tidy them under "{anchor}".',
+  'sug.DUPLICATES.reason': 'Content similarity {pct} (only content proven identical by hash counts; {shared} shared). Merging the others into "{kept}" turns identical files into witnessed dedupes and frees about {saved}.',
 
   'prev.title': 'Preview of changes',
   'prev.plan': 'Plan #{id}',
   'prev.loading': 'Simulating…',
   'prev.nothing': 'The net effect of this draft is no change at all (everything was dragged back), so there is nothing to run.',
+  'prev.nothingStale': 'None of the steps in this draft can run: after a rescan their sources or destinations are gone. Remove them in "Staged changes".',
+  'prev.staleTitle': '{n} staged step is stale and will not run|{n} staged steps are stale and will not run',
+  'prev.staleText': 'After a rescan the source or destination of these steps no longer exists, so the preview does not include them. The other steps are previewed as usual; to tidy up, remove them in "Staged changes".',
+  'prev.nothingEmptyDirs': 'This draft only moves folders that hold no files, and a cloud changes through files only: nothing would happen, so there is nothing to run.',
+  'prev.skippedTitle': '{n} folder holds no files, so moving it changes nothing in the cloud|{n} folders hold no files, so moving them changes nothing in the cloud',
+  'prev.skippedText': 'A cloud changes through files only: an empty folder is neither moved to its new place nor created there, so the preview does not include it. To tidy it up, do it in the cloud itself.',
   'prev.stale': 'The draft changed after this preview, so it is out of date. Preview again before approving.',
   'prev.repreview': 'Preview again',
   'prev.files': 'Files moved',
@@ -410,6 +553,25 @@ const en = {
   'prev.reveal': 'Show',
   'prev.conflictList': 'Conflicts',
   'prev.conflictOne': 'Name conflict',
+  'conflict.DIFFERENT_CONTENT.title': 'Same name, different content',
+  'conflict.DIFFERENT_CONTENT.text': 'The destination already has a file with that name but different content. drive-merge never overwrites: take back the step that put them together, rename one of them in its own folder, and merge again. Renaming in the merged view would rename both.',
+  'conflict.DIR_IN_WAY.title': 'A folder with that name is in the way',
+  'conflict.DIR_IN_WAY.text': 'A folder with that name is still there in the cloud (running file by file never removes folders), so the file cannot go in. Rename it or pick another place.',
+  'conflict.FILE_IN_WAY.title': 'A file with that name is in the way of a folder',
+  'conflict.FILE_IN_WAY.text': 'A folder is needed on this path, but a file with the same name is already there. Rename it or pick another place.',
+  'conflict.OCCUPIED.title': 'The spot is only freed at the very end',
+  'conflict.OCCUPIED.text': 'Another file sits there and only leaves in the final quarantine phase, so nothing can land there yet. Rename it or pick another place.',
+  'conflict.CYCLE.title': 'Moves waiting on each other (for example a swap)',
+  'conflict.CYCLE.text': 'Several moves each wait for another to free its spot, so there is no valid order (for example two things swapping names). Split it into steps with a temporary name.',
+  'conflict.CASE_ONLY_RENAME.title': 'A rename that only changes case cannot be carried out',
+  'conflict.CASE_ONLY_RENAME.text': 'This cloud ignores letter case, so a rename that only changes upper and lower case cannot be done file by file (the old and the new name count as the same name). Give it a different name, or pick another place.',
+  'clash.title': 'Two different files share this name',
+  'clash.text': '"{name}" is two different files after the merge. Renaming this row would rename both and the clash would stay. To keep both, take back step {seq} (it brought "{from}" here), rename one of them in its own folder, and drag again.',
+  'clash.remove': 'Take back step {seq}',
+  'clash.removed': 'Step taken back. Rename "{name}" where it is now (F2), then drag again.',
+  'clash.show': 'Show it',
+  'clash.explain': 'This row is really two different files, and renaming here would rename both. Take back the step that put them together, rename one in its own folder, and merge again.',
+  'clash.fix': 'Take back the step and rename first',
   'prev.with': 'with',
   'prev.warnings': 'Notes ({n})',
   'prev.perCloud': 'Per-cloud change',
@@ -449,23 +611,31 @@ const en = {
   'prog.stage.dir_stats': 'Updating folder statistics…',
   'prog.failedHelp': 'It stops at the first error and does not undo finished steps. In a terminal you can restore with drivemerge plan restore {id}.',
   'prog.unknownFailure': 'A step failed',
+  'prog.rawDetails': 'Details as the engine reported them (not translated):',
+  'catalog.title': 'The clouds changed; this view is out of date.',
+  'catalog.text': 'The last run changed {remotes}, but the catalog has not caught up: the places you see, and any preview made now, may not match the clouds. Rescan to bring it up to date.',
+  'catalog.rescan': 'Rescan',
+  'catalog.cli': 'Rescan in a terminal:',
+  'catalog.dismiss': 'Dismiss (I already rescanned)',
+  'catalog.blocked': 'The catalog is out of date: the last run changed the clouds and nothing has been rescanned yet, so this preview may not match them and cannot be approved now. Rescan first, then preview again.',
 
   'kind.move': 'move',
   'kind.copy+delete': 'copy, then quarantine',
   'kind.merge': 'merge',
   'kind.dedupe': 'dedupe',
 
-  'warn.MERGE': 'Folder merged into the one named the same in "{dst}": identical files are deduplicated, different files with the same name become conflicts.',
+  'warn.MERGE': 'Folder "{src}" was merged into the existing "{into}": identical files are deduplicated, different files with the same name become conflicts.',
   'warn.CROSS_REMOTE': 'Cross-cloud move: copied through this computer and verified first, then the original is quarantined.',
-  'warn.READ_ONLY': 'A cloud involved has no write access, so this change cannot pass the simulation.',
-  'warn.CASE_COLLISION': 'This cloud ignores case and the name differs from an existing one only by case.',
+  'warn.READ_ONLY': '"{remote}" has no write access, so this change cannot pass the simulation.',
+  'warn.CASE_COLLISION': '"{remote}" ignores case, and "{name}" differs only by case from an existing name in "{dst}".',
+  'warn.CASE_ONLY_RENAME': '"{remote}" ignores case, so renaming "{from}" to "{to}" only changes the case and cannot be carried out file by file; the preview will refuse it. Give it a different name.',
 
   'err.network': 'Cannot reach the drive-merge service. Make sure drivemerge ui is still running in the terminal.',
   'err.unknown': 'Something went wrong.',
   'err.SRC_NOT_FOUND': 'The item to move was not found; it may already have been moved.',
   'err.DST_NOT_DIR': 'The destination is not a folder.',
-  'err.INTO_ITSELF': 'A folder cannot be moved into itself or one of its subfolders.',
-  'err.NAME_EXISTS': 'The destination already has an item with that name.',
+  'err.INTO_ITSELF': 'The folder "{item}" cannot be moved into itself or one of its subfolders.',
+  'err.NAME_EXISTS': 'The destination already has an item with that name: "{item}".',
   'err.NOOP': 'These items are already there; nothing to move.',
   'err.BAD_NAME': 'Invalid name: it cannot be empty, "." or "..", or contain "/".',
   'err.NOT_FOUND': 'Not found (the draft or the cloud does not exist).',
@@ -473,6 +643,7 @@ const en = {
   'err.BAD_REQUEST': 'The request was not valid.',
   'err.NOTHING_TO_UNDO': 'Nothing to undo.',
   'err.NOTHING_TO_REDO': 'Nothing to redo.',
+  'err.QUARANTINE': 'Quarantine is where deleted files wait, so nothing can be moved into or out of it in this window. To restore, run drivemerge plan restore <plan id> in a terminal; to remove for good, drivemerge plan purge <plan id>.',
   'err.STALE': 'The draft changed after the preview. Preview again.',
   'err.STALE_PREVIEW': 'The draft changed after the preview. Preview again.',
   'err.JOB_BUSY': 'Another job (an execution or a rescan) is still running. Wait for it to finish.',
@@ -484,6 +655,7 @@ const en = {
   'err.HUMAN_ONLY': 'Approving and executing are only possible from the browser page opened by drivemerge ui.',
   'err.UNAUTHENTICATED': 'You are not signed in, or the session expired. Reopen the address that drivemerge ui printed in the terminal.',
   'err.CONFLICT': 'That conflicts with the current state.',
+  'err.BAD_TOKEN': 'Sign-in failed: the one-time token in the address is invalid or already used. Run drivemerge ui again in the terminal and open the new address it prints.',
 
   'viol.SRC_MISSING.title': 'Source is missing',
   'viol.SRC_MISSING.text': 'The file to move cannot be found: it may have been moved or deleted, or the catalog is out of date. Rescan that cloud and preview again.',
@@ -517,25 +689,102 @@ const en = {
   'viol.NOOP.text': 'The file is already there, or the destination already has identical content, so nothing changes.',
   'viol.PROBABLE_ONLY.title': 'Same only by name and size',
   'viol.PROBABLE_ONLY.text': 'This dedupe has no hash proof, only the same name and size. It is not allowed by default; run hash bridging first.',
+  // The detail line under a problem: <ns>.<CODE>.detail, or .detail.<variant> for a code with several sentences.
+  'viol.BAD_PATH.detail.remote': 'The {role} cloud id {rid} does not exist.',
+  'viol.BAD_PATH.detail.path': 'The {role} path "{path}" {problem}.',
+  'viol.BAD_PATH.detail.quarantine': 'The {role} path "{path}" is inside the quarantine area.',
+  'viol.BAD_PATH.detail.op_kind': 'Unknown step kind "{kind}".',
+  'viol.BAD_PATH.detail.no_destination': 'A "{kind}" step needs a destination cloud and path.',
+  'viol.DEPENDENCY.detail.not_earlier': 'depends_on {dep} is not an earlier step of this plan.',
+  'viol.DEPENDENCY.detail.witness_made_by': 'The witness "{at}" is created by step {by}; this delete must declare depends_on that step (directly or through other steps).',
+  'viol.DEPENDENCY.detail.position': 'Step number {seq} is not a unique positive position.',
+  'viol.READ_ONLY_REMOTE.detail': '"{at}" has no write_remote configured.',
+  'viol.CROSS_REMOTE_MOVE.detail': 'A move cannot cross clouds; use copy + delete.',
+  'viol.AMBIGUOUS_PATH.detail.source': '{n} live entries share "{at}"; rclone cannot address one of them.',
+  'viol.AMBIGUOUS_PATH.detail.destination': '{n} live entries share the destination "{at}".',
+  'viol.AMBIGUOUS_PATH.detail.witness': '{n} live entries share the witness path "{at}".',
+  'viol.SRC_MISSING.detail.missing': 'No live file at "{at}": {why}.',
+  'viol.SRC_MISSING.detail.other_entry': '"{at}" holds {what}, not the planned entry {planned}.',
+  'viol.EXPECT_MISMATCH.detail': '"{at}" is {size} at this step, the plan expected {expected}.',
+  'viol.NATIVE_DOC.detail': '"{at}" is a Google-native doc: no bytes to copy or to verify a delete against.',
+  'viol.DST_EXISTS.detail.file_above': '"{at}" is a file, so "{dst}" cannot be created under it.',
+  'viol.DST_EXISTS.detail.directory': '"{at}" is a folder.',
+  'viol.DST_EXISTS.detail.different': '"{at}" holds different or unproven content; it is never overwritten.',
+  'viol.CASE_COLLISION.detail.file': '"{at}" collides with the file "{other}" (case-insensitive).',
+  'viol.CASE_COLLISION.detail.name': '"{at}" collides with "{other}" (case-insensitive).',
+  'viol.NO_WITNESS.detail.none_given': 'A delete must name a witness: the identical copy that survives.',
+  'viol.NO_WITNESS.detail.is_source': 'The witness "{at}" is the file being deleted.',
+  'viol.NO_WITNESS.detail.missing': 'No live file at the witness "{at}": {why}.',
+  'viol.NO_WITNESS.detail.gone': 'The witness "{at}" is no longer live with the same content at the end of the plan.',
+  'viol.WITNESS_MISMATCH.detail.vouched': '"{at}" already vouches, by name and size only, for a different file; one probable match cannot cover two contents.',
+  'viol.WITNESS_MISMATCH.detail.differs': 'The witness "{at}" does not match the deleted file: {why}.',
+  'viol.PROBABLE_ONLY.detail': '"{at}" matches by name and size only; its content is not hash-proven.',
+  'viol.NOOP.detail.identical': '"{at}" already holds identical content.',
+  'viol.NOOP.detail.onto_itself': 'Move of "{at}" onto itself.',
+  'viol.NOOP.detail.identical_move': '"{at}" already holds identical content; the move only removes "{removed}".',
+  'viol.CONTENT_LOST.detail': '"{at}": its content would be left with {n} live copy (the policy needs {need}).|"{at}": its content would be left with {n} live copies (the policy needs {need}).',
+  'viol.QUOTA.detail': '"{at}" would receive {bytes} but only {free} are free.',
+  'viol.role.source': 'source',
+  'viol.role.destination': 'destination',
+  'viol.role.witness': 'witness',
+  'viol.why.moved': 'it was already moved or deleted by step {by}',
+  'viol.why.directory': 'that path is a folder',
+  'viol.why.tombstone': 'the catalog marks it missing (tombstone)',
+  'viol.why.absent': 'the catalog has no such file',
+  'viol.why.different': 'its size or hash differs',
+  'viol.why.unproven': 'its content is not provably identical',
+  'viol.what.created': 'a file created earlier in this plan',
+  'viol.what.entry': 'entry {entry}',
+  'viol.problem.empty': 'is empty',
+  'viol.problem.nul': 'contains a NUL byte',
+  'viol.problem.absolute': 'is absolute',
+  'viol.problem.empty_segment': 'has an empty segment',
+  'viol.problem.dot_segment': 'has a "{segment}" segment',
+  'conflict.DIFFERENT_CONTENT.detail': 'A different file already has that name.',
+  'conflict.DIR_IN_WAY.detail': 'A folder with that name is in the way.',
+  'conflict.FILE_IN_WAY.detail': 'A file is where this needs a folder.',
+  'conflict.OCCUPIED.detail': 'The spot is still occupied until the delete phase.',
+  'conflict.CYCLE.detail': 'Moves wait on each other (a swap needs a temporary name).',
+  'conflict.CASE_ONLY_RENAME.detail': 'This cloud ignores case, so a rename that changes only the case cannot be carried out file by file.',
 };
 
 const DICTS = { 'zh-TW': zh, en };
 export const LANGS = Object.keys(DICTS);
 export const dictionaries = DICTS;
 
-function storedLang() {
+/**
+ * The browser's own order decides: the first entry of `languages` (navigator.languages, most preferred first)
+ * that has a dictionary wins. en, en-US, en_GB -> English; zh, zh-TW, zh-Hant, zh_CN -> zh-TW (not zha, zhx);
+ * any other entry is skipped. English when none matches.
+ */
+export function detectLang(languages) {
+  const list = Array.isArray(languages) ? languages : [];
+  for (const entry of list) {
+    const tag = String(entry).trim();
+    if (/^en(?:[-_]|$)/i.test(tag)) return 'en';
+    if (/^zh(?:[-_]|$)/i.test(tag)) return 'zh-TW';
+  }
+  return 'en';
+}
+
+function initialLang() {
   try {
     const q = new URLSearchParams(window.location.search).get('lang');
     if (q && DICTS[q]) return q;
+  } catch (e) { /* no query string to read */ }
+  try {
     const s = window.localStorage.getItem('dm-lang');
     if (s && DICTS[s]) return s;
-  } catch (e) { /* storage blocked: use the default */ }
-  return 'zh-TW';
+  } catch (e) { /* storage blocked: detect */ }
+  const nav = window.navigator || {};
+  return detectLang(nav.languages && nav.languages.length ? nav.languages : [nav.language]);
 }
 
-let current = storedLang();
+let current = initialLang();
 
 export const getLang = () => current;
+/** Value for <html lang>. */
+export const htmlLang = (lang) => (lang === 'zh-TW' ? 'zh-Hant-TW' : 'en');
 export function setLang(lang) {
   if (!DICTS[lang]) return;
   current = lang;

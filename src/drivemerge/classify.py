@@ -10,6 +10,8 @@ deterministically.
 Everything here is a pure function of the catalog: SQL reads only, nothing is
 written and nothing is ever marked for deletion. Two files that map to the same
 target are *not* resolved here; the plan builder knows file identity and does.
+Placement is idempotent (see plan_layout): files a layout already put in place
+are not moved again, so re-running a reorganize or consolidate does not nest paths.
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ import string
 import tomllib
 import unicodedata
 from collections import Counter
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from datetime import date
 from functools import lru_cache
@@ -489,7 +492,7 @@ def _profile_remote(conn: sqlite3.Connection, rid: int, rname: str, prefix: str,
 
     rows = conn.execute(
         f"""SELECT e.path, e.name, e.ext, e.category, e.size, e.mtime,
-                   CASE WHEN e.content_group IS NULL THEN 0 ELSE EXISTS (
+                   CASE WHEN e.content_group IS NULL OR e.size = 0 THEN 0 ELSE EXISTS (
                        SELECT 1 FROM entries d WHERE d.content_group = e.content_group
                           AND d.id <> e.id AND d.is_dir = 0 AND d.present = 1) END
             FROM entries e
@@ -646,9 +649,10 @@ class _UnitCtx:
     name: str
     comp: _Compiled | None          # the unit rule that claimed it, if any
     variables: dict[str, str]       # unit-level template variables (everything but {relpath})
+    view: str                       # the unit folder's path as the rules see it (below target_root when inside)
 
 
-def _unit_ctx(conn: sqlite3.Connection, rname: str, unit: Unit, unit_rules: list[_Compiled]) -> _UnitCtx:
+def _unit_ctx(conn: sqlite3.Connection, rname: str, unit: Unit, unit_rules: list[_Compiled], view: str) -> _UnitCtx:
     name = posixpath.basename(unit.path)
     ext = _name_ext(name)
     stats: list[tuple[int, str | None]] = []
@@ -663,20 +667,20 @@ def _unit_ctx(conn: sqlite3.Connection, rname: str, unit: Unit, unit_rules: list
             stats.append((int(row[0]), row[1]))
         return stats[0]
 
-    comp = _first_match(unit_rules, rname, category_of(ext), ext, name, unit.path, lambda: get_stats()[0])
+    comp = _first_match(unit_rules, rname, category_of(ext), ext, name, view, lambda: get_stats()[0])
     if comp is None:
-        return _UnitCtx(name, None, {})
+        return _UnitCtx(name, None, {}, view)
     ymd = date_from_name(name)
     if ymd is None and comp.fields & _DATE_VARS:
         ymd = _mtime_date(get_stats()[1])
     ymd = ymd or _UNKNOWN
-    parent = posixpath.dirname(unit.path)
+    parent = posixpath.dirname(view)
     variables = {
         "name": name, "stem": _stem(name, ext), "ext": ext, "category": category_of(ext),
         "year": ymd[0], "month": ymd[1], "day": ymd[2], "remote": rname,
-        "parent": parent.rpartition("/")[2], "dir": parent, "path": unit.path, "unit": name,
+        "parent": parent.rpartition("/")[2], "dir": parent, "path": view, "unit": name,
     }
-    return _UnitCtx(name, comp, variables)
+    return _UnitCtx(name, comp, variables, view)
 
 
 def _clean_root(target_root: str) -> str:
@@ -686,8 +690,77 @@ def _clean_root(target_root: str) -> str:
     return "/".join(parts)
 
 
+def _exact(s: str) -> str:
+    return s
+
+
+def _below(path: str, root_parts: list[str], fold: Callable[[str], str]) -> str | None:
+    """`path` seen from inside the root folder ('Archive/a/b' in 'Archive' -> 'a/b'), None when it lies outside.
+
+    `root_parts` are already folded; the root folder itself is not inside itself.
+    """
+    n = len(root_parts)
+    parts = path.split("/", n)
+    if len(parts) <= n or any(fold(a) != b for a, b in zip(parts, root_parts)):
+        return None
+    return parts[n]
+
+
+# Template variables that follow a file's path, i.e. the ones a path-keeping template echoes into its output
+# ({relpath} too for a loose file, where it is the whole path; inside a unit it is fixed).
+_PATH_VARS = frozenset({"parent", "dir", "path"})
+_PATH_VARS_LOOSE = _PATH_VARS | {"relpath"}
+
+
+@lru_cache(maxsize=256)
+def _literal_head(template: str) -> tuple[str, ...]:
+    """The leading folders of a template that hold no variable: 'Unsorted/{remote}/{path}' -> ('Unsorted',)."""
+    head: list[str] = []
+    for segment in template.split("/"):
+        if not segment:
+            continue
+        parts = _parse_segment(segment)
+        if any(fname for _literal, fname in parts):
+            break
+        head.append("".join(literal for literal, _fname in parts))
+    return tuple(head)
+
+
+def _echoes(template: str, fields: frozenset[str], variables: dict[str, str], base: str, here: str, *,
+            shift_relpath: bool, remote_names: Collection[str], fold: Callable[[str], str]) -> bool:
+    """True when `here` is what `template` renders for this file standing at a shorter path.
+
+    A template that keeps the original path ('Unsorted/{remote}/{path}') never renders its own
+    output, so a file an earlier run put in place would be pushed one level deeper every time.
+    Such a file is recognised by its output: dropping leading folders from `base` (the path the
+    template echoes: the file's, or its unit folder's) and rendering again gives back `here`.
+    {remote} may also be another cloud's name, since a consolidated copy keeps the name of the cloud it came from.
+    """
+    if not fields & (_PATH_VARS_LOOSE if shift_relpath else _PATH_VARS):
+        return False
+    head = _literal_head(template)
+    if head:
+        got = here.split("/", len(head))
+        if len(got) <= len(head) or [fold(g) for g in got[:len(head)]] != [fold(h) for h in head]:
+            return False
+    want = fold(here)
+    remotes = remote_names if "remote" in fields else (variables["remote"],)
+    segments = base.split("/")
+    for i in range(1, len(segments)):
+        short = "/".join(segments[i:])
+        folder = short.rpartition("/")[0]
+        shifted = {**variables, "path": short, "dir": folder, "parent": folder.rpartition("/")[2]}
+        if shift_relpath:
+            shifted["relpath"] = short
+        for remote in remotes:
+            shifted["remote"] = remote
+            if fold(render(template, shifted)) == want:
+                return True
+    return False
+
+
 def plan_layout(conn: sqlite3.Connection, ruleset: RuleSet, *, remote_ids: list[int] | None = None, target_root: str = "",
-                path_prefix: str | None = None) -> list[Placement]:
+                path_prefix: str | None = None, root_remote_ids: Collection[int] | None = None) -> list[Placement]:
     """One Placement per live file (native docs included), ordered by (remote, path).
 
     * A file inside a unit goes with its unit. The first `unit = true` rule that
@@ -701,16 +774,41 @@ def plan_layout(conn: sqlite3.Connection, ruleset: RuleSet, *, remote_ids: list[
     * A loose file takes the first non-unit rule that matches, else the fallback.
     * Collisions between targets are left to the plan builder.
 
+    Placement is idempotent: files a layout already put in place stay there, so
+    applying a plan and planning again yields the same positions (no ops).
+
+    * Below `target_root` a file is laid out by where it stands *inside* the
+      root: 'Archive/Unsorted/gd/x' under root 'Archive' is 'Unsorted/gd/x' to the
+      rules (path_glob, {path}, {dir}, {parent}, {relpath}, and the unit folder's
+      path for unit rules), and the result goes back under the root. Only the
+      remotes in `root_remote_ids` (default: every selected remote) hold the
+      root: in a consolidate the root is a folder of the target, so a source's
+      'Archive' folder is just a folder and keeps its name in the path.
+    * A file that already stands where its rule's template puts it keeps its
+      position (target_path equals its current path). That is a given for templates
+      built from the file's own properties, but a template that keeps the path
+      ('Unsorted/{remote}/{path}') never renders its own output, so there the file
+      stays when the template renders its current position for the same file at a
+      shorter path (leading folders dropped, {remote} possibly another cloud's
+      name because a consolidated copy keeps its origin's). The rule is the one
+      that matches the file where it stands now.
+
     `path_prefix` limits the output to files at or under that folder in every
     selected remote; units are still detected on the whole remote.
     """
     root = _clean_root(target_root)
+    root_parts = root.split("/") if root else []
     loose_rules, unit_rules = _compile(ruleset)
     fallback_fields = _template_fields(ruleset.fallback)
     prefix = path_prefix.strip("/") if path_prefix else ""
     where, args = _under(prefix, include_self=True)
+    rooted = None if root_remote_ids is None else set(root_remote_ids)
+    insensitive = {rid for rid, ci in conn.execute("SELECT id, case_insensitive FROM remotes") if ci}
+    remote_names = [name for _rid, name in _remotes(conn, None)]
     out: list[Placement] = []
     for rid, rname in _remotes(conn, remote_ids):
+        fold = _norm if rid in insensitive else _exact
+        inside = [fold(p) for p in root_parts] if root_parts and (rooted is None or rid in rooted) else []
         units = {u.path: u for u in detect_units(conn, ruleset, remote_ids=[rid])}
         ctxs: dict[str, _UnitCtx] = {}
         rows = conn.execute(
@@ -719,6 +817,9 @@ def plan_layout(conn: sqlite3.Connection, ruleset: RuleSet, *, remote_ids: list[
             (rid, *args),
         )
         for eid, path, parent, name, ext, cat, size, mtime in rows:
+            here = path                      # the path the rules see: inside the root, relative to it
+            if inside:
+                here = _below(path, inside, fold) or path
             unit = None
             if units:
                 p = parent
@@ -731,28 +832,36 @@ def plan_layout(conn: sqlite3.Connection, ruleset: RuleSet, *, remote_ids: list[
             template = ruleset.fallback
             variables = None
             fields = fallback_fields
-            relpath = path
+            relpath = here
+            base, shift_relpath = here, True        # what a path-keeping template echoes
             if unit is not None:
                 relpath = path[len(unit.path) + 1:]
+                shift_relpath = False
                 ctx = ctxs.get(unit.path)
                 if ctx is None:
-                    ctx = ctxs[unit.path] = _unit_ctx(conn, rname, unit, unit_rules)
+                    view = (_below(unit.path, inside, fold) if inside else None) or unit.path
+                    ctx = ctxs[unit.path] = _unit_ctx(conn, rname, unit, unit_rules, view)
                 if ctx.comp is not None:
-                    rule_name, template = ctx.comp.rule.name, ctx.comp.rule.target
+                    rule_name, template, fields = ctx.comp.rule.name, ctx.comp.rule.target, ctx.comp.fields
                     variables = {**ctx.variables, "relpath": relpath}
+                    base = ctx.view
             else:
-                c = _first_match(loose_rules, rname, cat, ext, name, path, size)
+                c = _first_match(loose_rules, rname, cat, ext, name, here, size)
                 if c is not None:
                     rule_name, template, fields = c.rule.name, c.rule.target, c.fields
             if variables is None:
+                folder = here.rpartition("/")[0]
                 variables = {
                     "name": name, "stem": _stem(name, ext), "ext": ext, "category": cat, "remote": rname,
-                    "parent": parent.rpartition("/")[2], "dir": parent, "path": path,
+                    "parent": folder.rpartition("/")[2], "dir": folder, "path": here,
                     "unit": posixpath.basename(unit.path) if unit else "", "relpath": relpath,
                 }
                 if fields & _DATE_VARS:
                     variables["year"], variables["month"], variables["day"] = _date_for(name, mtime)
             target = render(template, variables)
+            if target != here and _echoes(template, fields, variables, base, here, shift_relpath=shift_relpath,
+                                          remote_names=remote_names, fold=fold):
+                target = here
             out.append(Placement(eid, rid, path, f"{root}/{target}" if root else target, rule_name,
                                  unit.path if unit else None))
     return out

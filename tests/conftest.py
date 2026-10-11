@@ -25,13 +25,17 @@ class Catalog:
         self.conn = conn
         self._scan: dict[int, int] = {}
 
-    def remote(self, name: str, provider: str = "local", *, writable: bool = True) -> int:
+    def remote(self, name: str, provider: str = "local", *, writable: bool = True,
+               case_insensitive: bool | None = None) -> int:
+        """A `local` remote is case-sensitive here on every platform (the real default follows the OS)."""
         prov = providers.get(provider)
+        if case_insensitive is None:
+            case_insensitive = False if provider == "local" else prov.case_insensitive
         rid = self.conn.execute(
             "INSERT INTO remotes(name, provider, read_remote, write_remote, case_insensitive, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
             (name, provider, f"{name}:", f"{name}:" if writable else None,
-             int(prov.case_insensitive), db.utcnow()),
+             int(case_insensitive), db.utcnow()),
         ).fetchone()[0]
         self._scan[rid] = self.conn.execute(
             "INSERT INTO scans(remote_id, status, started_at, finished_at) VALUES (?, 'complete', ?, ?) RETURNING id",

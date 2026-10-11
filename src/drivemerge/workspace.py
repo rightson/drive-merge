@@ -17,9 +17,14 @@ Two ideas keep it fast and exact:
     directory; only the others are mapped individually.
 
 Staging errors are `WorkspaceError`; `code` is one of SRC_NOT_FOUND, DST_NOT_DIR,
-INTO_ITSELF, NAME_EXISTS, NOOP, BAD_NAME (docs/WORKSPACE.md section A) or, for
-requests that are not about the namespace, NOT_FOUND, NOT_OPEN, BAD_REQUEST,
+INTO_ITSELF, NAME_EXISTS, NOOP, BAD_NAME, QUARANTINE (docs/WORKSPACE.md section A) or,
+for requests that are not about the namespace, NOT_FOUND, NOT_OPEN, BAD_REQUEST,
 NOTHING_TO_UNDO, NOTHING_TO_REDO.
+
+A rescan can change the catalog under an open draft. Actions that then have nothing to act
+on (their sources are gone, their destination folder vanished) still stage fine and simply
+produce no ops, so `get_draft` and `preview` flag them as *stale* instead of letting them
+pass unnoticed.
 
 Nothing here writes to a cloud or touches the catalog; `preview` only creates a
 plan and has the simulator judge it, like every other plan source.
@@ -33,7 +38,7 @@ import re
 import sqlite3
 import unicodedata
 from dataclasses import asdict, dataclass
-from typing import Any, Iterator, NamedTuple
+from typing import Any, Collection, Iterator, NamedTuple
 
 from . import builders, db, identity, plans, simulate
 from .models import Op
@@ -42,19 +47,26 @@ Loc = tuple[int, str]               # (remote_id, path); '' is a remote root
 Sub = tuple[int, str, int, str]     # (src remote, src path, dst remote, dst path) of a moved root
 
 _COLS = "e.id, e.remote_id, e.path, e.name, e.is_dir, e.size, e.mtime, e.category, e.content_group"
-# Files whose content has another live copy anywhere (dir_stats.dup_files counts the same thing).
-_DUP = ("CASE WHEN e.is_dir = 0 AND e.content_group IS NOT NULL THEN (SELECT COUNT(*) FROM entries d "
+# Files whose content has another live copy anywhere (dir_stats.dup_files counts the same thing). Empty files
+# are never duplicates: they all share one hash and are placeholders (identity.duplicate_groups hides them too).
+_DUP = ("CASE WHEN e.is_dir = 0 AND e.size > 0 AND e.content_group IS NOT NULL THEN (SELECT COUNT(*) FROM entries d "
         "WHERE d.content_group = e.content_group AND d.present = 1 AND d.is_dir = 0) ELSE 0 END")
 _CHUNK = 500
 _GHOST_LIMIT = 2000
 
 
 class WorkspaceError(ValueError):
-    """A request the workspace refuses. `code` is machine-readable; str(e) is for people."""
+    """A request the workspace refuses.
 
-    def __init__(self, code: str, message: str):
+    `code` is machine-readable and `params` hold the facts the message was made from (a place is
+    {"remote", "path"}), so that a page can word the refusal in its own language; str(e) is the English
+    sentence for terminals, logs and API clients.
+    """
+
+    def __init__(self, code: str, message: str, **params: Any):
         super().__init__(message)
         self.code = code
+        self.params = params
 
 
 # --------------------------------------------------------------------------- #
@@ -115,7 +127,8 @@ def _chunks(items: list, n: int = _CHUNK) -> Iterator[list]:
 
 def _check_name(name: Any) -> str:
     if not isinstance(name, str) or not name or "/" in name or name in (".", "..") or "\x00" in name:
-        raise WorkspaceError("BAD_NAME", f"{name!r} is not a valid file or folder name")
+        raise WorkspaceError("BAD_NAME", f"{name!r} is not a valid file or folder name",
+                             name="" if name is None else str(name))
     return name
 
 
@@ -135,6 +148,33 @@ def _remotes(conn: sqlite3.Connection) -> dict[int, _Remote]:
 
 def _remote_by_name(rem: dict[int, _Remote], name: Any) -> _Remote | None:
     return next((r for r in rem.values() if r.name == name), None)
+
+
+class _Quarantine:
+    """The folder executed plans park deleted files in (`db.quarantine_dir`), as each remote compares names.
+
+    Its files are deleted files, restored or purged only from the command line, so a draft must
+    never stage a move out of it, into it, or of a folder that contains it.
+    """
+
+    def __init__(self, conn: sqlite3.Connection, rem: dict[int, _Remote]):
+        self.path = db.quarantine_dir(conn).strip("/")
+        self._rem = rem
+
+    def _key(self, rid: int, path: str) -> str:
+        return _fold(path) if self._rem[rid].ci else path
+
+    def at(self, rid: int, path: str) -> bool:
+        """The quarantine folder itself."""
+        return bool(self.path) and self._key(rid, path) == self._key(rid, self.path)
+
+    def inside(self, rid: int, path: str) -> bool:
+        """The quarantine folder or anything below it."""
+        return bool(self.path) and _under(self._key(rid, path), self._key(rid, self.path))
+
+    def encloses(self, rid: int, path: str) -> bool:
+        """A folder strictly above the quarantine folder: moving it would carry the quarantine along."""
+        return bool(self.path) and not self.at(rid, path) and _under(self._key(rid, self.path), self._key(rid, path))
 
 
 # --------------------------------------------------------------------------- #
@@ -476,6 +516,15 @@ def _occupants(cat: _Cat, rem: dict[int, _Remote], frid: int, fpath: str) -> lis
     return cat.at(frid, fpath)
 
 
+def _respelled_in_place(rem: dict[int, _Remote], m: _Moved) -> bool:
+    """A file whose final spot is its own under another spelling (case, Unicode form) on a remote that ignores both.
+
+    The cloud sees one name, so the move would land on the file itself: the executor refuses that, and moving
+    file by file cannot change the case of a folder either (the cloud keeps the spelling it has).
+    """
+    return m.rid == m.frid and rem[m.rid].ci and m.path != m.fpath and _fold(m.path) == _fold(m.fpath)
+
+
 def _dedupe_victims(space: _Space, rem: dict[int, _Remote], moved: list[_Moved]) -> dict[int, Loc]:
     """Moved files whose final spot already holds identical content.
 
@@ -589,7 +638,7 @@ class _Delta:
         """
         by_group: dict[str, list[Loc]] = {}
         for m in moved:
-            if m.id in victims and m.key.startswith("g:"):
+            if m.id in victims and m.key.startswith("g:") and m.size > 0:
                 by_group.setdefault(m.key, []).append(victims[m.id])
         for key, spots in by_group.items():
             n = conn.execute("SELECT COUNT(*) FROM entries WHERE content_group = ? AND present = 1 AND is_dir = 0",
@@ -610,13 +659,14 @@ class _Delta:
         }
 
 
-def _summary(moved: list[_Moved], rem: dict[int, _Remote]) -> dict:
+def _summary(moved: list[_Moved], rem: dict[int, _Remote], deduped: Collection[int] = ()) -> dict:
+    """Totals of the moved set. `deduped` (ids of files a merge deletes instead of copying) are not transferred."""
     files = [m for m in moved if not m.is_dir]
     touched = {m.rid for m in files} | {m.frid for m in files}
     return {
         "moved_files": len(files),
         "moved_bytes": sum(m.size for m in files),
-        "cross_remote_bytes": sum(m.size for m in files if m.rid != m.frid),
+        "cross_remote_bytes": sum(m.size for m in files if m.rid != m.frid and m.id not in deduped),
         "remotes_touched": sorted(rem[i].name for i in touched if i in rem),
     }
 
@@ -625,13 +675,18 @@ def _summary(moved: list[_Moved], rem: dict[int, _Remote]) -> dict:
 # Staging validation
 # --------------------------------------------------------------------------- #
 
-def _need_dir(space: _Space, loc: Loc) -> None:
+def _need_dir(space: _Space, rem: dict[int, _Remote], loc: Loc) -> None:
     if loc[1] and "dir" not in space.kinds_at(*loc):
-        raise WorkspaceError("DST_NOT_DIR", f"destination {loc[1]!r} is not a folder")
+        raise WorkspaceError("DST_NOT_DIR", f"destination {loc[1]!r} is not a folder", dst=_at(rem, loc))
 
 
 def _fmt(rem: dict[int, _Remote], loc: Loc) -> str:
     return f"{rem[loc[0]].name}:{loc[1]}"
+
+
+def _at(rem: dict[int, _Remote], loc: Loc) -> dict:
+    """A place as a message parameter."""
+    return {"remote": rem[loc[0]].name, "path": loc[1]}
 
 
 def _stage(space: _Space, rem: dict[int, _Remote], act: _Act) -> list[dict]:
@@ -647,58 +702,93 @@ def _stage(space: _Space, rem: dict[int, _Remote], act: _Act) -> list[dict]:
         raise
 
 
-def _case_clash(space: _Space, rem: dict[int, _Remote], dst: Loc, name: str, target: str, own: str | None) -> bool:
-    """A differently-cased sibling with the same folded name already sits in the destination."""
+def _keep_out_of_quarantine(q: _Quarantine, rem: dict[int, _Remote], sources: list[Loc],
+                            targets: list[Loc]) -> None:
+    """QUARANTINE: nothing moves out of, into or around the quarantine folder (CLI restores and purges it)."""
+    how = "the quarantine folder holds deleted files; restore or purge them with the drivemerge command line"
+    for loc in sources:
+        if q.inside(*loc):
+            raise WorkspaceError("QUARANTINE", f"{_fmt(rem, loc)!r} is in the quarantine folder: {how}",
+                                 item=_at(rem, loc))
+        if q.encloses(*loc):
+            raise WorkspaceError("QUARANTINE", f"{_fmt(rem, loc)!r} contains the quarantine folder, "
+                                               f"which cannot travel with it: {how}", item=_at(rem, loc))
+    for loc in targets:
+        if q.inside(*loc):
+            raise WorkspaceError("QUARANTINE", f"{_fmt(rem, loc)!r} is in the quarantine folder: {how}",
+                                 item=_at(rem, loc))
+
+
+def _folded_children(space: _Space, rem: dict[int, _Remote], dst: Loc) -> dict[str, set[str]] | None:
+    """Final paths of the destination's children by folded name; None on a case-sensitive remote.
+
+    Listing a folder walks every sub-move, so it is done once per staged action, not once per dragged
+    item (that was cubic in the number of items); the caller keeps the result up to date as items land.
+    """
     if not rem[dst[0]].ci:
-        return False
-    folded = _fold(name)
-    return any(_fold(_name(z)) == folded and z != target and z != own
-               for z in space.children(dst[0], dst[1]))
+        return None
+    out: dict[str, set[str]] = {}
+    for z in space.children(dst[0], dst[1]):
+        out.setdefault(_fold(_name(z)), set()).add(z)
+    return out
+
+
+def _case_clash(siblings: dict[str, set[str]] | None, name: str, target: str, own: str | None) -> bool:
+    """A differently-cased sibling with the same folded name already sits in the destination."""
+    return siblings is not None and any(z != target and z != own for z in siblings.get(_fold(name), ()))
 
 
 def _stage_checked(space: _Space, rem: dict[int, _Remote], act: _Act) -> list[dict]:
     warns: list[dict] = []
 
-    def warn(code: str, message: str) -> None:
-        warns.append({"code": code, "message": message})
+    def warn(code: str, message: str, **params: Any) -> None:
+        warns.append({"code": code, "message": message, "params": params})
 
     dst = act.dst
+    quarantine = _Quarantine(space.cat.conn, rem)
     if act.kind == "mkdir":
         name = _check_name(act.new_name)
-        _need_dir(space, dst)
+        _keep_out_of_quarantine(quarantine, rem, [], [(dst[0], _join(dst[1], name))])
+        _need_dir(space, rem, dst)
         loc = (dst[0], _join(dst[1], name))
         kinds = space.kinds_at(*loc)
         if "file" in kinds:
-            raise WorkspaceError("NAME_EXISTS", f"{_fmt(rem, loc)!r} is already a file")
+            raise WorkspaceError("NAME_EXISTS", f"{_fmt(rem, loc)!r} is already a file", item=_at(rem, loc))
         if kinds:
-            raise WorkspaceError("NOOP", f"folder {_fmt(rem, loc)!r} already exists")
-        if _case_clash(space, rem, dst, name, loc[1], None):
-            warn("CASE_COLLISION", f"{rem[dst[0]].name} ignores case: a folder named like {name!r} already exists")
+            raise WorkspaceError("NOOP", f"folder {_fmt(rem, loc)!r} already exists", item=_at(rem, loc))
+        if _case_clash(_folded_children(space, rem, dst), name, loc[1], None):
+            warn("CASE_COLLISION", f"{rem[dst[0]].name} ignores case: a folder named like {name!r} already exists",
+                 remote=rem[dst[0]].name, name=name, dst=_at(rem, dst))
         space.apply(act)
         if not rem[dst[0]].writable:
-            warn("READ_ONLY", f"{rem[dst[0]].name} has no write access; the plan will not pass simulation")
+            warn("READ_ONLY", f"{rem[dst[0]].name} has no write access; the plan will not pass simulation",
+                 remote=rem[dst[0]].name)
         return warns
 
     if act.new_name is not None:
         _check_name(act.new_name)
         if len(act.items) != 1:
-            raise WorkspaceError("BAD_NAME", "new_name renames exactly one item")
+            raise WorkspaceError("BAD_NAME", "new_name renames exactly one item", name=str(act.new_name))
     if not act.items:
         raise WorkspaceError("BAD_REQUEST", "a move needs at least one item")
+    _keep_out_of_quarantine(quarantine, rem, act.items,
+                            [(dst[0], _join(dst[1], act.new_name or _name(ps))) for _, ps in act.items])
     kinds = []
     for rs, ps in act.items:
         k = space.kinds_at(rs, ps) if ps else set()
         if not k:
             raise WorkspaceError("SRC_NOT_FOUND", f"{_fmt(rem, (rs, ps))!r} does not exist"
-                                 + (" (a remote root cannot be moved)" if not ps else ""))
+                                 + (" (a remote root cannot be moved)" if not ps else ""), item=_at(rem, (rs, ps)))
         kinds.append(k)
-    _need_dir(space, dst)
+    _need_dir(space, rem, dst)
     for (rs, ps), k in zip(act.items, kinds):
         if "dir" in k and rs == dst[0] and _under(dst[1], ps):
-            raise WorkspaceError("INTO_ITSELF", f"cannot move {_fmt(rem, (rs, ps))!r} into itself")
+            raise WorkspaceError("INTO_ITSELF", f"cannot move {_fmt(rem, (rs, ps))!r} into itself",
+                                 item=_at(rem, (rs, ps)))
 
     real = 0
     remotes_used = {dst[0]}
+    siblings = _folded_children(space, rem, dst)
     for (rs, ps), k in zip(act.items, kinds):
         name = act.new_name or _name(ps)
         target = _join(dst[1], name)
@@ -707,24 +797,36 @@ def _stage_checked(space: _Space, rem: dict[int, _Remote], act: _Act) -> list[di
         occupied = space.kinds_at(dst[0], target)
         if occupied:
             if "dir" not in k or "file" in occupied:
-                raise WorkspaceError("NAME_EXISTS", f"{_fmt(rem, (dst[0], target))!r} already exists")
-            warn("MERGE", f"folder {_fmt(rem, (rs, ps))!r} merges into the existing {_fmt(rem, (dst[0], target))!r}")
-        if _case_clash(space, rem, dst, name, target, ps if rs == dst[0] else None):
+                raise WorkspaceError("NAME_EXISTS", f"{_fmt(rem, (dst[0], target))!r} already exists",
+                                     item=_at(rem, (dst[0], target)))
+            warn("MERGE", f"folder {_fmt(rem, (rs, ps))!r} merges into the existing {_fmt(rem, (dst[0], target))!r}",
+                 src=_at(rem, (rs, ps)), into=_at(rem, (dst[0], target)))
+        if _case_clash(siblings, name, target, ps if rs == dst[0] else None):
             warn("CASE_COLLISION", f"{rem[dst[0]].name} ignores case: {name!r} differs only by case from "
-                                   f"an existing name in {_fmt(rem, dst)!r}")
+                                   f"an existing name in {_fmt(rem, dst)!r}",
+                 remote=rem[dst[0]].name, name=name, dst=_at(rem, dst))
+        if rs == dst[0] and rem[rs].ci and target != ps and _fold(target) == _fold(ps):
+            warn("CASE_ONLY_RENAME", f"{rem[rs].name} ignores case: renaming {_name(ps)!r} to {name!r} only changes "
+                                     "the case (or Unicode form), which cannot be carried out file by file; "
+                                     "the preview will refuse it", remote=rem[rs].name, **{"from": _name(ps)}, to=name)
         space.push((rs, ps, dst[0], target), act.seq)
+        if siblings is not None:
+            siblings.setdefault(_fold(name), set()).add(target)
+            if rs == dst[0] and _parent(ps) == dst[1]:
+                siblings.get(_fold(_name(ps)), set()).discard(ps)      # a rename leaves its old spelling behind
         remotes_used.add(rs)
         real += 1
     if not real:
-        raise WorkspaceError("NOOP", "every item is already where it would be moved to")
+        raise WorkspaceError("NOOP", "every item is already where it would be moved to", dst=_at(rem, dst))
 
     for rid in sorted(remotes_used):
         if not rem[rid].writable:
-            warn("READ_ONLY", f"{rem[rid].name} has no write access; the plan will not pass simulation")
+            warn("READ_ONLY", f"{rem[rid].name} has no write access; the plan will not pass simulation",
+                 remote=rem[rid].name)
     others = [rs for rs, _ in act.items if rs != dst[0]]
     if others:
         warn("CROSS_REMOTE", f"{len(others)} item(s) move between remotes: their bytes are copied through "
-                             f"this machine, then the originals are quarantined")
+                             f"this machine, then the originals are quarantined", n=len(others))
     return warns
 
 
@@ -735,14 +837,14 @@ def _stage_checked(space: _Space, rem: dict[int, _Remote], act: _Act) -> list[di
 def _draft_row(conn: sqlite3.Connection, draft_id: int) -> sqlite3.Row:
     row = _q(conn, "SELECT * FROM drafts WHERE id = ?", (draft_id,)).fetchone()
     if row is None:
-        raise WorkspaceError("NOT_FOUND", f"no draft {draft_id}")
+        raise WorkspaceError("NOT_FOUND", f"no draft {draft_id}", draft=draft_id)
     return row
 
 
 def _open_draft(conn: sqlite3.Connection, draft_id: int) -> sqlite3.Row:
     row = _draft_row(conn, draft_id)
     if row["status"] != "open":
-        raise WorkspaceError("NOT_OPEN", f"draft {draft_id} is {row['status']}")
+        raise WorkspaceError("NOT_OPEN", f"draft {draft_id} is {row['status']}", draft=draft_id, status=row["status"])
     return row
 
 
@@ -764,14 +866,55 @@ def _space_for(cat: _Cat, acts: list[_Act]) -> _Space:
     return space
 
 
-def _action_dict(a: _Act, rem: dict[int, _Remote]) -> dict:
+def _action_dict(a: _Act, rem: dict[int, _Remote], stale: dict | None = None) -> dict:
     return {
         "id": a.id, "seq": a.seq, "kind": a.kind,
         "items": [{"remote": rem[r].name, "path": p} for r, p in a.items],
         "dst": {"remote": rem[a.dst[0]].name, "path": a.dst[1]},
         "new_name": a.new_name, "note": a.note, "created_by": a.created_by,
         "state": a.state, "created_at": a.created_at,
+        "stale": stale is not None, "stale_reason": stale,
     }
+
+
+def _why_stale(space: _Space, rem: dict[int, _Remote], act: _Act) -> dict | None:
+    """Why `act`, staged earlier, has nothing to act on in `space` (the after-view of the actions before it).
+
+    Only what a rescan can silently take away counts: sources that are gone and a destination that
+    is no longer a folder. Name clashes and the like are not stale, the preview reports them as conflicts.
+    The reason is {"code", "message" (English), "items"}: `items`, the places concerned, are what a page
+    words the code with.
+    """
+    def locs(places: list[Loc]) -> list[dict]:
+        return [{"remote": rem[r].name, "path": p} for r, p in places]
+
+    gone = [loc for loc in act.items if not space.kinds_at(*loc)]
+    if gone:
+        names = ", ".join(repr(_fmt(rem, loc)) for loc in gone)
+        return {"code": "SRC_NOT_FOUND", "message": f"{names} no longer exist{'s' if len(gone) == 1 else ''}",
+                "items": locs(gone)}
+    if act.dst[1] and "dir" not in space.kinds_at(*act.dst):
+        return {"code": "DST_NOT_DIR", "message": f"destination {_fmt(rem, act.dst)!r} is no longer a folder",
+                "items": locs([act.dst])}
+    return None
+
+
+def _stale_actions(cat: _Cat, rem: dict[int, _Remote], acts: list[_Act]) -> dict[int, dict]:
+    """Active actions that no longer fit the catalog, by action id.
+
+    Replays the draft the way the views do (every active action applied, a stale one included), so a
+    later action that built on a stale one is stale as well, for the same reason.
+    """
+    space = _Space(cat)
+    out: dict[int, dict] = {}
+    for a in acts:
+        if a.state != "active":
+            continue
+        why = _why_stale(space, rem, a)
+        if why is not None:
+            out[a.id] = why
+        space.apply(a)
+    return out
 
 
 def create_draft(conn: sqlite3.Connection, title: str) -> dict:
@@ -794,27 +937,47 @@ def get_draft(conn: sqlite3.Connection, draft_id: int) -> dict:
     d = _draft_row(conn, draft_id)
     rem = _remotes(conn)
     acts = _acts(conn, draft_id)
-    space = _space_for(_Cat(conn), acts)
+    cat = _Cat(conn)
+    space = _space_for(cat, acts)
+    stale = _stale_actions(cat, rem, acts)
+    moved = space.moved()
+    # Only files that cross clouds can be dedupe victims that matter here, so skip the lookups otherwise.
+    victims = _dedupe_victims(space, rem, moved) if any(m.rid != m.frid and not m.is_dir for m in moved) else {}
     return {
         "id": d["id"], "title": d["title"], "status": d["status"], "version": d["version"],
         "preview_plan_id": d["preview_plan_id"], "preview_version": d["preview_version"],
-        "actions": [_action_dict(a, rem) for a in acts],
+        "actions": [_action_dict(a, rem, stale.get(a.id)) for a in acts],
         "undo_available": any(a.state == "active" for a in acts),
         "redo_available": any(a.state == "undone" for a in acts),
-        "summary": _summary(space.moved(), rem),
+        "summary": {**_summary(moved, rem, victims), "stale_actions": len(stale)},
     }
 
 
+def _retire_plan(conn: sqlite3.Connection, plan_id: int | None) -> bool:
+    """Cancel a draft's earlier preview plan so nobody can still approve it, unless it already ran.
+
+    A plan that ran (or failed) is history and is kept. The UI refuses a stale preview on its own, but
+    the CLI approves any simulated plan, so a plan that no longer matches its draft must not stay one.
+    """
+    if plan_id is None:
+        return False
+    if plans.get_plan(conn, plan_id, with_ops=False).status not in ("draft", "simulated", "approved"):
+        return False
+    plans.cancel_plan(conn, plan_id)
+    return True
+
+
 def discard_draft(conn: sqlite3.Connection, draft_id: int) -> None:
-    """Close a draft without applying it. The version bump makes any preview of it stale."""
+    """Close a draft without applying it. The version bump makes any preview of it stale; its plan is cancelled."""
     d = _draft_row(conn, draft_id)
     if d["status"] == "discarded":
         return
     if d["status"] != "open":
-        raise WorkspaceError("NOT_OPEN", f"draft {draft_id} is {d['status']}")
+        raise WorkspaceError("NOT_OPEN", f"draft {draft_id} is {d['status']}", draft=draft_id, status=d["status"])
     with db.transaction(conn):
         conn.execute("UPDATE drafts SET status = 'discarded' WHERE id = ?", (draft_id,))
         _bump(conn, draft_id)
+        _retire_plan(conn, d["preview_plan_id"])
 
 
 def mark_applied(conn: sqlite3.Connection, draft_id: int) -> None:
@@ -832,7 +995,8 @@ def _parse_action(action: Any, rem: dict[int, _Remote]) -> _Act:
     def loc(spec: Any, code: str) -> Loc:
         r = _remote_by_name(rem, spec.get("remote")) if isinstance(spec, dict) else None
         if r is None:
-            raise WorkspaceError(code, f"unknown remote in {spec!r}")
+            raise WorkspaceError(code, f"unknown remote in {spec!r}",
+                                 remote=str(spec.get("remote")) if isinstance(spec, dict) else "")
         return r.id, _clean(spec.get("path"))
 
     items: list[Loc] = []
@@ -923,7 +1087,8 @@ def remove_action(conn: sqlite3.Connection, draft_id: int, action_id: int) -> di
         acts = _acts(conn, draft_id)
         target = next((a for a in acts if a.id == action_id), None)
         if target is None:
-            raise WorkspaceError("NOT_FOUND", f"draft {draft_id} has no action {action_id}")
+            raise WorkspaceError("NOT_FOUND", f"draft {draft_id} has no action {action_id}", draft=draft_id,
+                                 action=action_id)
         removed = [target.id]
         if target.state == "active":
             conn.execute("UPDATE draft_actions SET state = 'undone' WHERE id = ?", (target.id,))
@@ -941,7 +1106,7 @@ def remove_action(conn: sqlite3.Connection, draft_id: int, action_id: int) -> di
 def _rid(rem: dict[int, _Remote], name: str) -> int:
     r = _remote_by_name(rem, name)
     if r is None:
-        raise WorkspaceError("NOT_FOUND", f"unknown remote {name!r}")
+        raise WorkspaceError("NOT_FOUND", f"unknown remote {name!r}", remote=str(name))
     return r.id
 
 
@@ -949,7 +1114,7 @@ def _node(r: _Remote, path: str) -> dict:
     return {"name": _name(path) or r.name, "path": path, "remote": r.name, "is_dir": True, "size": None,
             "mtime": None, "category": "other", "files": 0, "dirs": 0, "bytes": 0, "dup_files": 0,
             "entry_id": None, "origins": [], "moved_here": False, "merged": False, "conflict": False,
-            "dedupe": False, "virtual": False}
+            "dedupe": False, "virtual": False, "quarantine": False, "quarantine_root": False}
 
 
 def _group_item(r: _Remote, rem: dict[int, _Remote], z: str, origins: list[_Origin]) -> dict:
@@ -1025,6 +1190,9 @@ def list_dir(conn: sqlite3.Connection, remote: str, path: str, *, draft_id: int 
     _sort(items)
     page = items[offset:offset + limit]
     _finish_items(conn, r, page, space)
+    quarantine = _Quarantine(conn, rem)
+    for i in page:
+        i["quarantine"], i["quarantine_root"] = quarantine.inside(rid, i["path"]), quarantine.at(rid, i["path"])
     return {"remote": remote, "path": path, "view": view, "draft_version": version,
             "items": page, "ghosts": ghost_rows, "total": len(items)}
 
@@ -1080,7 +1248,8 @@ def build_ops(conn: sqlite3.Connection, draft_id: int) -> tuple[list[Op], dict]:
     version = d["version"]
     rem = _remotes(conn)
     cat = _Cat(conn)
-    space = _space_for(cat, _acts(conn, draft_id))
+    acts = _acts(conn, draft_id)
+    space = _space_for(cat, acts)
     moved = space.moved()
     files = sorted((m for m in moved if not m.is_dir), key=lambda m: (m.rid, m.path, m.id))
     rows = _fetch_rows(conn, [m.id for m in files])
@@ -1098,10 +1267,13 @@ def build_ops(conn: sqlite3.Connection, draft_id: int) -> tuple[list[Op], dict]:
     deduped: set[int] = set()
     taken: dict[tuple[int, str], _Prim] = {}
 
-    def conflict(m: _Moved, code: str, reason: str, other: Loc | None) -> None:
-        conflicts.append({"code": code, "reason": reason, "from": {"remote": rem[m.rid].name, "path": m.path},
-                          "to": {"remote": rem[m.frid].name, "path": m.fpath},
+    def conflict(m: _Moved, code: str, reason: str, other: Loc | None, at: tuple[Loc, Loc] | None = None) -> None:
+        (sr, sp), (dr, dp) = at or ((m.rid, m.path), (m.frid, m.fpath))
+        conflicts.append({"code": code, "reason": reason, "from": {"remote": rem[sr].name, "path": sp},
+                          "to": {"remote": rem[dr].name, "path": dp},
                           "with": None if other is None else {"remote": rem[other[0]].name, "path": other[1]}})
+
+    respelled: set[Loc] = set()
 
     landing = {(m.frid, nk(m.frid, m.fpath)) for m in files}
 
@@ -1139,6 +1311,12 @@ def build_ops(conn: sqlite3.Connection, draft_id: int) -> tuple[list[Op], dict]:
             conflict(m, "DIFFERENT_CONTENT", "a different file already has that name", clash)
         elif (hole := file_in_the_way(m)) is not None:
             conflict(m, "FILE_IN_WAY", "a file is where this needs a folder", hole)
+        elif _respelled_in_place(rem, m):
+            # One conflict for the folder (or file) the user renamed, not one per file inside it.
+            if m.root not in respelled:
+                respelled.add(m.root)
+                conflict(m, "CASE_ONLY_RENAME", "this remote ignores case, so a rename that changes only the case "
+                         "cannot be carried out file by file", None, at=(m.root, space.fwd(*m.root)))
         else:
             clean = True
         prim = _Prim(m, row, "move" if m.rid == m.frid else "copy")
@@ -1160,8 +1338,8 @@ def build_ops(conn: sqlite3.Connection, draft_id: int) -> tuple[list[Op], dict]:
         spots = [p.m.fpath] + [a for a in _ancestors(p.m.fpath) if a]
         for sp in spots:
             for kind, j in origin_of.get((p.m.frid, nk(p.m.frid, sp)), ()):
-                if j == i:
-                    continue
+                if j == i and sp == p.m.fpath:
+                    continue            # lands on its own spot (a case-only rename, flagged above); not a wait
                 if kind == "move":
                     succ[j].append(i)
                     indeg[i] += 1
@@ -1211,13 +1389,17 @@ def build_ops(conn: sqlite3.Connection, draft_id: int) -> tuple[list[Op], dict]:
     deletes.sort(key=lambda t: t[0])
     ops.extend(op for _, op in deletes)
 
+    stale = _stale_actions(cat, rem, acts)
+    stale_actions = [_action_dict(a, rem, stale[a.id]) for a in acts if a.id in stale]
     info = {
         "draft_version": version,
         "changes": _changes(space, rem, moved, deduped),
         "conflicts": conflicts,
         "empty_dirs_left": _empty_dirs(conn, space, moved),
+        "empty_dirs_skipped": _empty_dirs_skipped(rem, moved),
         "dedupes": len(dedupes),
-        "summary": _summary(moved, rem),
+        "summary": _summary(moved, rem, deduped),
+        "stale_actions": stale_actions,
     }
     return ops, info
 
@@ -1249,6 +1431,17 @@ def _changes(space: _Space, rem: dict[int, _Remote], moved: list[_Moved], dedupe
     return out
 
 
+def _empty_dirs_skipped(rem: dict[int, _Remote], moved: list[_Moved]) -> list[dict]:
+    """Moved folders with no file in them. Ops are per file, so nothing ever creates them at the new place.
+
+    Only the topmost of a run of nested empty folders is listed, like a moved root in `changes`.
+    """
+    holding = {(m.rid, a) for m in moved if not m.is_dir for a in _ancestors(m.path)}
+    empty = {(m.rid, m.path): m for m in moved if m.is_dir and (m.rid, m.path) not in holding}
+    return [{"from": {"remote": rem[m.rid].name, "path": m.path}, "to": {"remote": rem[m.frid].name, "path": m.fpath}}
+            for (rid, path), m in sorted(empty.items()) if (rid, _parent(path)) not in empty]
+
+
 def _empty_dirs(conn: sqlite3.Connection, space: _Space, moved: list[_Moved]) -> int:
     """Catalog folders that the file-by-file execution leaves with no files in them (they are not deleted)."""
     delta = _Delta(space, moved)
@@ -1267,19 +1460,23 @@ def preview(conn: sqlite3.Connection, draft_id: int, *, policy: simulate.SafetyP
     """Turn the draft into a 'workspace' plan, simulate it, and bind the result to the draft version."""
     title = _open_draft(conn, draft_id)["title"]
     ops, info = build_ops(conn, draft_id)
-    if not ops:
-        return {"plan_id": None, "message": "nothing to do"}
-    version = info["draft_version"]
     old = _q(conn, "SELECT preview_plan_id FROM drafts WHERE id = ?", (draft_id,)).fetchone()[0]
+    if not ops:
+        # Everything was taken back (or went stale): the plan of the moves that are gone must not stay approvable.
+        if _retire_plan(conn, old):
+            conn.execute("UPDATE drafts SET preview_plan_id = NULL, preview_version = NULL, updated_at = ? "
+                         "WHERE id = ?", (db.utcnow(), draft_id))
+        return {"plan_id": None, "message": "nothing to do", "stale_actions": info["stale_actions"],
+                "empty_dirs_skipped": info["empty_dirs_skipped"]}
+    version = info["draft_version"]
     plan_id = plans.create_plan(conn, f"Workspace: {title}", "workspace", ops, created_by="workspace",
                                 params={"draft_id": draft_id, "draft_version": version})
     report = simulate.simulate_plan(conn, plan_id, policy=policy)
     conn.execute("UPDATE drafts SET preview_plan_id = ?, preview_version = ?, updated_at = ? WHERE id = ?",
                  (plan_id, version, db.utcnow(), draft_id))
-    if old is not None and plans.get_plan(conn, old, with_ops=False).status in ("draft", "simulated", "approved"):
-        # The previous preview describes an older draft: retire it, so previewing again never leaves a stale
-        # plan that someone could still approve from the CLI. A plan that ran (or failed) is history: keep it.
-        plans.cancel_plan(conn, old)
+    # The previous preview describes an older draft: retire it, so previewing again never leaves a stale
+    # plan that someone could still approve from the CLI.
+    _retire_plan(conn, old)
     counts = {k: sum(o.op == k for o in ops) for k in ("move", "copy", "delete")}
     return {
         "plan_id": plan_id,
@@ -1289,17 +1486,23 @@ def preview(conn: sqlite3.Connection, draft_id: int, *, policy: simulate.SafetyP
         "ok": report.ok and not info["conflicts"],
         "simulation": asdict(report),
         "summary": {**info["summary"], "dedupes": info["dedupes"], "conflicts": len(info["conflicts"]),
-                    "ops": counts, "roots": len(info["changes"])},
+                    "ops": counts, "roots": len(info["changes"]), "stale_actions": len(info["stale_actions"]),
+                    "empty_dirs_skipped": len(info["empty_dirs_skipped"])},
         "changes": info["changes"],
         "conflicts": info["conflicts"],
         "empty_dirs_left": info["empty_dirs_left"],
+        # Folders the draft moves that hold no files: a cloud changes through files only, so these stay where they are.
+        "empty_dirs_skipped": info["empty_dirs_skipped"],
+        # Steps with nothing left to act on contribute no ops; `ok` ignores them (they can do no harm), the page
+        # lists them so that nobody approves a plan believing they are part of it.
+        "stale_actions": info["stale_actions"],
     }
 
 
 def is_stale_preview(conn: sqlite3.Connection, plan_id: int) -> bool:
     """True for a workspace plan whose draft changed (or closed) since the preview; False for other plans."""
     plan = plans.get_plan(conn, plan_id, with_ops=False)
-    if plan.kind != "workspace":
+    if plan.kind != "workspace" or plan.created_by != "workspace":      # only a preview of ours is tied to a draft
         return False
     row = _q(conn, "SELECT status, version FROM drafts WHERE id = ?", (plan.params.get("draft_id"),)).fetchone()
     return row is None or row["status"] != "open" or row["version"] != plan.params.get("draft_version")

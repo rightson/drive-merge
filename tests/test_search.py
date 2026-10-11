@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import unicodedata
+
 import pytest
 
 from drivemerge import db, search
@@ -307,3 +309,75 @@ def test_nfd_name_matches_nfc_query_via_fts(conn, catalog):
     catalog.file(g, f"Docs/{nfd}", size=5)
     rows = search.search(conn, "café")
     assert [r["name"] for r in rows] == [nfd]
+
+
+# --- review fixes: NFD folders, NUL, empty files ------------------------------------------------
+
+FOLDER_NFC = "Résumés"
+FOLDER_NFD = unicodedata.normalize("NFD", FOLDER_NFC)
+
+
+@pytest.fixture
+def nfd_catalog(conn, catalog):
+    """An iCloud folder stored the way macOS emits it (NFD) next to an ASCII twin."""
+    g = catalog.remote("icloud", "iclouddrive")
+    catalog.file(g, f"{FOLDER_NFD}/cv.txt")
+    catalog.file(g, f"{FOLDER_NFD}/Sub/note.txt")
+    catalog.file(g, "Photos/cv.txt")
+    catalog.file(g, f"{unicodedata.normalize('NFD', 'éé')}/z.txt")
+    return conn
+
+
+def test_ascii_folder_name_finds_its_files(nfd_catalog):
+    assert _paths(search.search(nfd_catalog, "Photos")) == ["Photos/cv.txt"]
+
+
+@pytest.mark.parametrize("query", [FOLDER_NFC, FOLDER_NFD, FOLDER_NFC.upper(), "résumé", "sumés"])
+def test_folder_name_in_either_unicode_form_finds_files_below_an_nfd_folder(nfd_catalog, query):
+    assert sorted(_paths(search.search(nfd_catalog, query))) == sorted(
+        [f"{FOLDER_NFD}/Sub/note.txt", f"{FOLDER_NFD}/cv.txt"])
+
+
+def test_folder_name_term_still_ands_with_other_terms(nfd_catalog):
+    assert _paths(search.search(nfd_catalog, f"{FOLDER_NFC} cv")) == [f"{FOLDER_NFD}/cv.txt"]
+    assert _paths(search.search(nfd_catalog, f"{FOLDER_NFC} Photos")) == []
+
+
+def test_short_folder_name_term_uses_both_forms_too(nfd_catalog):
+    assert _paths(search.search(nfd_catalog, "éé")) == [f"{unicodedata.normalize('NFD', 'éé')}/z.txt"]
+    assert _paths(search.search(nfd_catalog, "é"))          # 1 character: LIKE on the NFD path
+
+
+@pytest.mark.parametrize("prefix", [FOLDER_NFC, FOLDER_NFD, f"/{FOLDER_NFC}/"])
+def test_path_prefix_in_either_unicode_form_matches_an_nfd_folder(nfd_catalog, prefix):
+    assert sorted(_paths(search.search(nfd_catalog, "txt", path_prefix=prefix))) == sorted(
+        [f"{FOLDER_NFD}/Sub/note.txt", f"{FOLDER_NFD}/cv.txt"])
+    assert _paths(search.search(nfd_catalog, "txt", path_prefix=prefix.rstrip("/") + "/Sub")) == [f"{FOLDER_NFD}/Sub/note.txt"]
+
+
+def test_path_prefix_stays_segment_aware_for_nfd_folders(nfd_catalog, catalog):
+    g = nfd_catalog.execute("SELECT id FROM remotes").fetchone()[0]
+    catalog.file(g, f"{FOLDER_NFD}x/other.txt")
+    assert _paths(search.search(nfd_catalog, "other", path_prefix=FOLDER_NFC)) == []
+
+
+def test_nul_in_a_term_cannot_break_the_query(conn, catalog):
+    assert search.search(conn, "abc\x00def") == []
+    g = catalog.remote("g", "drive")
+    catalog.file(g, "docs/abc-def.txt")
+    assert _paths(search.search(conn, "abc\x00def")) == ["docs/abc-def.txt"]         # NUL separates terms
+    assert _paths(search.search(conn, "ab\x00")) == ["docs/abc-def.txt"]
+    assert len(search.search(conn, "\x00")) == 1                                       # no terms left: no filter
+
+
+def test_empty_files_are_not_duplicates(conn, catalog):
+    g = catalog.remote("g", "drive")
+    e1 = catalog.file(g, "proj1/__init__.py", size=0, md5="d41d8cd98f00b204e9800998ecf8427e")
+    e2 = catalog.file(g, "proj2/__init__.py", size=0, md5="d41d8cd98f00b204e9800998ecf8427e")
+    r1 = catalog.file(g, "a/real.bin", size=5, md5="aa")
+    r2 = catalog.file(g, "b/real.bin", size=5, md5="aa")
+    for eid, group in [(e1, 1), (e2, 1), (r1, 2), (r2, 2)]:
+        conn.execute("UPDATE entries SET content_group = ? WHERE id = ?", (group, eid))
+    assert _paths(search.search(conn, "py", duplicates_only=True)) == []
+    assert sorted(_paths(search.search(conn, "real", duplicates_only=True))) == ["a/real.bin", "b/real.bin"]
+    assert search.stats(conn)["duplicates"] == {"groups": 1, "redundant_files": 1, "redundant_bytes": 5}

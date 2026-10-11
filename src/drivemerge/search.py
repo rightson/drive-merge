@@ -18,9 +18,11 @@ _COLS = (
 )
 _FROM = "FROM entries e JOIN remotes r ON r.id = e.remote_id"
 _FTS_FROM = "FROM entries_fts JOIN entries e ON e.id = entries_fts.rowid JOIN remotes r ON r.id = e.remote_id"
+# Empty files share one hash and are placeholders (__init__.py, .gitkeep), not redundant copies;
+# identity.duplicate_groups hides them with min_size=1, so every other view must agree.
 _DUPLICATED = (
     "e.content_group IN (SELECT d.content_group FROM entries d "
-    "WHERE d.present = 1 AND d.is_dir = 0 AND d.content_group IS NOT NULL "
+    "WHERE d.present = 1 AND d.is_dir = 0 AND d.size > 0 AND d.content_group IS NOT NULL "
     "GROUP BY d.content_group HAVING COUNT(*) >= 2)"
 )
 
@@ -48,7 +50,19 @@ def entry_to_dict(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def _terms(q: str | None) -> list[str]:
-    return unicodedata.normalize("NFC", q).split() if q else []
+    """Whitespace-separated NFC terms. NUL cannot occur in a name and would cut an FTS phrase short."""
+    return unicodedata.normalize("NFC", q).replace("\x00", " ").split() if q else []
+
+
+def _forms(text: str) -> list[str]:
+    """The NFC and NFD spellings of `text` (one when they agree).
+
+    name_norm is NFC, but `path` keeps whatever the cloud emitted and macOS/iCloud emit NFD, so a
+    folder name only matches its path when both spellings are tried.
+    """
+    nfc = unicodedata.normalize("NFC", text)
+    nfd = unicodedata.normalize("NFD", text)
+    return [nfc] if nfd == nfc else [nfc, nfd]
 
 
 def _fts_phrase(term: str) -> str:
@@ -68,7 +82,8 @@ def search(conn: sqlite3.Connection, q: str | None = None, *, remote: str | None
            duplicates_only: bool = False, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
     """Search the catalog. Live files only unless the flags say otherwise.
 
-    Each whitespace-separated term in `q` must match the name or the path.
+    Each whitespace-separated term in `q` must match the name or the path, in
+    either Unicode form (macOS/iCloud store NFD paths); `path_prefix` likewise.
     Terms of 3+ characters use the trigram FTS index and are ranked by bm25;
     shorter terms use LIKE and results fall back to remote, path order.
     `modified_after` is inclusive and `modified_before` exclusive. Size
@@ -82,13 +97,15 @@ def search(conn: sqlite3.Connection, q: str | None = None, *, remote: str | None
     if fts:
         src, order = _FTS_FROM, "bm25(entries_fts), e.path, r.name, e.id"
         conds.append("entries_fts MATCH ?")
-        params.append(" ".join(_fts_phrase(t) for t in fts))
+        params.append(" AND ".join("(" + " OR ".join(_fts_phrase(f) for f in _forms(t)) + ")" for t in fts))
     else:
         src, order = _FROM, "r.name, e.path, e.id"
     for t in terms:
         if len(t) < 3:
-            conds.append(r"(e.name_norm LIKE ? ESCAPE '\' OR e.path LIKE ? ESCAPE '\')")
-            params += [_like(t.casefold()), _like(t)]
+            forms = _forms(t)
+            likes = [r"e.name_norm LIKE ? ESCAPE '\'"] + [r"e.path LIKE ? ESCAPE '\'"] * len(forms)
+            conds.append("(" + " OR ".join(likes) + ")")
+            params += [_like(t.casefold()), *(_like(f) for f in forms)]
 
     if not include_missing:
         conds.append("e.present = 1")
@@ -120,8 +137,10 @@ def search(conn: sqlite3.Connection, q: str | None = None, *, remote: str | None
         params.append(modified_before)
     prefix = (path_prefix or "").strip("/")
     if prefix:
-        conds.append("(e.path = ? OR substr(e.path, 1, ?) = ?)")
-        params += [prefix, len(prefix) + 1, prefix + "/"]
+        forms = _forms(prefix)
+        conds.append("(" + " OR ".join(["(e.path = ? OR substr(e.path, 1, ?) = ?)"] * len(forms)) + ")")
+        for f in forms:
+            params += [f, len(f) + 1, f + "/"]
     if duplicates_only:
         conds.append(_DUPLICATED)
 
@@ -208,7 +227,7 @@ def stats(conn: sqlite3.Connection) -> dict[str, Any]:
     groups, redundant_files, redundant_bytes = conn.execute(
         """SELECT COUNT(*), COALESCE(SUM(copies - 1), 0), COALESCE(SUM((copies - 1) * size), 0)
            FROM (SELECT COUNT(*) AS copies, MAX(size) AS size FROM entries
-                 WHERE is_dir = 0 AND present = 1 AND content_group IS NOT NULL
+                 WHERE is_dir = 0 AND present = 1 AND size > 0 AND content_group IS NOT NULL
                  GROUP BY content_group HAVING COUNT(*) >= 2)"""
     ).fetchone()
 

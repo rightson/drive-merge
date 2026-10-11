@@ -14,6 +14,7 @@ export class ApiError extends Error {
     this.name = 'ApiError';
     this.status = status;
     this.code = (body && body.code) || null;
+    this.params = (body && body.params) || null;
     this.body = body;
   }
 }

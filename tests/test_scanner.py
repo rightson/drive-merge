@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import time
 import unicodedata
 
 import pytest
@@ -682,7 +683,9 @@ def test_small_trees_and_modest_deletions_are_not_blocked(conn):
     sync_remotes(conn, Config(remotes=[RemoteConfig(name="y", provider="other", read="y:")]))
     ry = RemoteConfig(name="y", provider="other", read="y:")
     scan_remote(conn, _fake_rclone(_items(20)), ry)
-    assert scan_remote(conn, _fake_rclone([]), ry).tombstoned == 20  # below the size threshold
+    assert scan_remote(conn, _fake_rclone(_items(15)), ry).tombstoned == 5    # a share of a small tree: fine
+    scan_remote(conn, _fake_rclone(_items(3)), ry)
+    assert scan_remote(conn, _fake_rclone([]), ry).tombstoned == 3            # a handful of files really can all go
 
 
 def test_stale_running_scan_is_marked_failed(conn):
@@ -696,3 +699,325 @@ def test_stale_running_scan_is_marked_failed(conn):
     scan_remote(conn, _fake_rclone(_items(1)), rc)
     statuses = [r[0] for r in conn.execute("SELECT status FROM scans ORDER BY id")]
     assert statuses == ["failed", "complete"]
+
+
+# --- review fixes: keys shared inside one listing -----------------------------------------------
+
+def plain_item(path, size=10, **kw) -> dict:
+    """A backend without provider IDs (rclone local): rows are keyed by path."""
+    return {"Path": path, "Name": path.rsplit("/", 1)[-1], "Size": size, "IsDir": False,
+            "ModTime": "2024-01-01T00:00:00Z", **kw}
+
+
+@pytest.fixture
+def plain(conn):
+    r = RemoteConfig(name="x", provider="other", read="x:")
+    config.sync_remotes(conn, config.Config(remotes=[r]))
+    return r
+
+
+def test_items_sharing_a_key_each_get_a_row_and_rescans_do_not_churn(conn, plain):
+    # rclone lists `a\xff.txt` and `a\xfe.txt` (and more) under the one spelling `a<U+FFFD>.txt`
+    name = "a�.txt"
+    out = listing(plain_item(name, 5), plain_item(name, 7), plain_item(name, 9), plain_item("ok.txt", 1))
+    res = scan_remote(conn, Rclone(runner=FakeRunner(out)), plain, batch_size=2)      # the batch cuts between them
+    assert (res.files, res.ambiguous) == (4, 2)
+    e = keyed(conn)
+    assert sorted(e) == [f"p:{name}", f"p:{name}#2", f"p:{name}#3", "p:ok.txt"]
+    assert [e[k]["size"] for k in (f"p:{name}", f"p:{name}#2", f"p:{name}#3")] == [5, 7, 9]
+    assert len({e[k]["path"] for k in e if k != "p:ok.txt"}) == 1                    # same path: ambiguous, not hidden
+    assert conn.execute("SELECT COUNT(*) FROM entries WHERE is_dir = 0 AND present = 1").fetchone()[0] == res.files
+
+    conn.execute("UPDATE entries SET content_group = 3")
+    versions = {k: v["row_version"] for k, v in e.items()}
+    mark = max_rv(conn)
+    again = scan_remote(conn, Rclone(runner=FakeRunner(out)), plain, batch_size=2)
+    after = keyed(conn)
+    assert again.ambiguous == 2 and again.tombstoned == 0
+    assert {k: v["row_version"] for k, v in after.items()} == versions
+    assert conn.execute("SELECT COUNT(*) FROM entries WHERE row_version > ?", (mark,)).fetchone()[0] == 0
+    assert all(v["content_group"] == 3 and v["last_seen_scan"] == again.scan_id for v in after.values())
+
+    gone = scan_remote(conn, Rclone(runner=FakeRunner(listing(plain_item(name, 5), plain_item(name, 7),
+                                                               plain_item("ok.txt", 1)))), plain)
+    assert gone.tombstoned == 1 and keyed(conn)[f"p:{name}#3"]["present"] == 0
+    assert keyed(conn)[f"p:{name}#2"]["present"] == 1
+
+
+def test_a_repeated_provider_id_is_kept_as_a_second_row(conn, remote):
+    out = listing(gdrive_file("s.txt", "A", md5="11"), gdrive_file("s.txt", "A", md5="22"))
+    res = scan_remote(conn, Rclone(runner=FakeRunner(out)), remote)
+    assert (res.files, res.ambiguous) == (2, 1)
+    assert {k: v["md5"] for k, v in keyed(conn).items()} == {"id:A": "11", "id:A#2": "22"}
+
+
+@needs_rclone
+def test_real_names_that_differ_only_in_invalid_utf8_are_not_collapsed(conn, local_remote):
+    r, root = local_remote
+    for name, body in ((b"a\xff.txt", b"first"), (b"a\xfe.txt", b"second!"), (b"ok.txt", b"fine")):
+        try:
+            with open(os.path.join(os.fsencode(str(root)), name), "wb") as f:
+                f.write(body)
+        except OSError:
+            pytest.skip("filesystem refuses non-UTF-8 names")
+    res = scan_remote(conn, Rclone(), r)
+    assert (res.files, res.ambiguous) == (3, 1)
+    assert conn.execute("SELECT COUNT(*) FROM entries WHERE is_dir = 0 AND present = 1").fetchone()[0] == 3
+    mark = max_rv(conn)
+    scan_remote(conn, Rclone(), r)
+    assert conn.execute("SELECT COUNT(*) FROM entries WHERE row_version > ?", (mark,)).fetchone()[0] == 0
+
+
+# --- review fixes: sub-root scans store the folders above the root ------------------------------
+
+def dir_item(path, id_=None) -> dict:
+    return {"Path": path, "Name": path.rsplit("/", 1)[-1], "Size": -1, "IsDir": True,
+            "ModTime": "2024-01-01T00:00:00Z", **({"ID": id_} if id_ else {})}
+
+
+def test_subroot_scan_stores_the_root_and_its_parents(conn, remote):
+    out = listing(gdrive_file("x.jpg", "F1"))
+    res = scan_remote(conn, Rclone(runner=FakeRunner(out)), remote, root="Photos/2020")
+    e = rows(conn)
+    assert sorted(e) == ["Photos", "Photos/2020", "Photos/2020/x.jpg"]
+    assert (e["Photos"]["is_dir"], e["Photos"]["parent"], e["Photos"]["entry_key"]) == (1, "", "p:Photos")
+    assert (e["Photos/2020"]["parent"], e["Photos/2020"]["name"]) == ("Photos", "2020")
+    assert all(e[p]["last_seen_scan"] == res.scan_id for p in e)
+    assert (res.files, res.dirs) == (1, 0)                       # the summary still counts what rclone listed
+
+    versions = {k: v["row_version"] for k, v in keyed(conn).items()}
+    scan_remote(conn, Rclone(runner=FakeRunner(out)), remote, root="Photos/2020")
+    assert {k: v["row_version"] for k, v in keyed(conn).items()} == versions    # an unchanged rescan adds nothing
+
+
+def test_subroot_scan_of_an_empty_folder_still_stores_its_parents(conn, remote):
+    scan_remote(conn, Rclone(runner=FakeRunner("[\n]\n")), remote, root="a/b")
+    assert sorted(rows(conn)) == ["a", "a/b"]
+
+
+def test_subroot_scan_does_not_duplicate_folders_the_catalog_has(conn, remote):
+    full = listing(dir_item("Photos", "D1"), dir_item("Photos/2020", "D2"), gdrive_file("Photos/2020/x.jpg", "F1"))
+    scan_remote(conn, Rclone(runner=FakeRunner(full)), remote)
+    before = keyed(conn)
+    scan_remote(conn, Rclone(runner=FakeRunner(listing(gdrive_file("x.jpg", "F1")))), remote, root="Photos/2020")
+    after = keyed(conn)
+    assert sorted(after) == ["id:D1", "id:D2", "id:F1"]
+    assert {k: v["row_version"] for k, v in after.items()} == {k: v["row_version"] for k, v in before.items()}
+
+
+def test_a_full_scan_replaces_the_stored_parents_with_the_listed_ones(conn, remote):
+    scan_remote(conn, Rclone(runner=FakeRunner(listing(gdrive_file("x.jpg", "F1")))), remote, root="Photos/2020")
+    full = listing(dir_item("Photos", "D1"), dir_item("Photos/2020", "D2"), gdrive_file("Photos/2020/x.jpg", "F1"))
+    res = scan_remote(conn, Rclone(runner=FakeRunner(full)), remote)
+    assert res.tombstoned == 2
+    live = [(r["path"], r["entry_key"]) for r in conn.execute("SELECT * FROM entries WHERE present = 1 ORDER BY path")]
+    assert live == [("Photos", "id:D1"), ("Photos/2020", "id:D2"), ("Photos/2020/x.jpg", "id:F1")]
+
+
+def test_a_failed_subroot_scan_stores_no_parents(conn, remote):
+    bad = Rclone(runner=FakeRunner("[\n]\n", rc=3, err="ERROR : directory not found"))
+    with pytest.raises(RcloneError):
+        scan_remote(conn, bad, remote, root="Photos/2020")
+    assert conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0] == 0
+
+
+@needs_rclone
+def test_real_subroot_only_catalog_can_be_browsed_from_the_root(conn, local_remote):
+    from drivemerge import dirstats, workspace
+    r, root = local_remote
+    (root / "Photos" / "2020").mkdir(parents=True)
+    (root / "Photos" / "2020" / "x.jpg").write_text("x")
+    scan_remote(conn, Rclone(), r, root="Photos/2020")
+    dirstats.refresh(conn)
+    assert [i["name"] for i in workspace.list_dir(conn, "loc", "")["items"]] == ["Photos"]
+    sub = workspace.list_dir(conn, "loc", "Photos/2020")["items"]
+    assert [i["name"] for i in sub] == ["x.jpg"]
+    photos = workspace.list_dir(conn, "loc", "")["items"][0]
+    assert (photos["files"], photos["dirs"]) == (1, 1)
+
+
+# --- review fixes: the root typed in another case on a case-insensitive remote -----------------
+
+@pytest.fixture
+def dropbox(conn):
+    r = RemoteConfig(name="db", provider="dropbox", read="db:")
+    config.sync_remotes(conn, config.Config(remotes=[r]))
+    return r
+
+
+def dropbox_file(path, id_):
+    return {"Path": path, "Name": path.rsplit("/", 1)[-1], "Size": 10, "ID": id_, "IsDir": False,
+            "ModTime": "2024-01-01T00:00:00Z", "Hashes": {"dropbox": "ab" * 32}}
+
+
+def test_root_typed_in_another_case_keeps_the_catalogs_spelling(conn, dropbox):
+    from drivemerge import workspace
+    full = listing(dir_item("Photos", "id:d1"), dir_item("Photos/2020", "id:d2"), dropbox_file("Photos/2020/a.jpg", "id:f1"))
+    scan_remote(conn, Rclone(runner=FakeRunner(full)), dropbox)
+    before = keyed(conn)
+    fake = FakeRunner(listing(dropbox_file("a.jpg", "id:f1")))          # what Dropbox lists for `db:photos/2020`
+    res = scan_remote(conn, Rclone(runner=fake), dropbox, root="photos/2020")
+    assert res.root == "Photos/2020" and fake.calls[0][-1] == "db:Photos/2020"
+    assert conn.execute("SELECT root FROM scans WHERE id = ?", (res.scan_id,)).fetchone()[0] == "Photos/2020"
+    after = keyed(conn)
+    assert {k: v["path"] for k, v in after.items()} == {k: v["path"] for k, v in before.items()}
+    assert {k: v["row_version"] for k, v in after.items()} == {k: v["row_version"] for k, v in before.items()}
+    assert res.tombstoned == 0 and sorted(rows(conn)) == ["Photos", "Photos/2020", "Photos/2020/a.jpg"]
+    assert [i["name"] for i in workspace.list_dir(conn, "db", "Photos/2020", view="before")["items"]] == ["a.jpg"]
+
+
+def test_a_missing_file_below_a_retyped_root_is_still_tombstoned(conn, dropbox):
+    full = listing(dir_item("Photos", "id:d1"), dropbox_file("Photos/a.jpg", "id:f1"), dropbox_file("Photos/b.jpg", "id:f2"))
+    scan_remote(conn, Rclone(runner=FakeRunner(full)), dropbox)
+    res = scan_remote(conn, Rclone(runner=FakeRunner(listing(dropbox_file("a.jpg", "id:f1")))), dropbox, root="PHOTOS")
+    assert res.tombstoned == 1 and rows(conn)["Photos/b.jpg"]["present"] == 0
+
+
+def test_root_spelling_is_kept_where_the_catalog_knows_no_folder(conn, dropbox):
+    scan_remote(conn, Rclone(runner=FakeRunner(listing(dir_item("Photos", "id:d1")))), dropbox)
+    scan_remote(conn, Rclone(runner=FakeRunner(listing(dropbox_file("x.jpg", "id:f9")))), dropbox, root="photos/NewDir")
+    assert sorted(rows(conn)) == ["Photos", "Photos/NewDir", "Photos/NewDir/x.jpg"]
+
+
+def test_a_case_sensitive_remote_takes_the_root_literally(conn, remote):
+    scan_remote(conn, Rclone(runner=FakeRunner(listing(dir_item("Photos", "D1")))), remote)
+    scan_remote(conn, Rclone(runner=FakeRunner(listing(gdrive_file("x.jpg", "F1")))), remote, root="photos")
+    assert sorted(rows(conn)) == ["Photos", "photos", "photos/x.jpg"]
+
+
+# --- review fixes: an emptied small remote, overlapping scans, partial scans --------------------
+
+@needs_rclone
+def test_real_emptied_small_remote_is_refused_without_force(conn, local_remote):
+    r, root = local_remote
+    for i in range(30):
+        (root / f"photo{i}.jpg").write_bytes(b"x" * (i + 1))
+    scan_remote(conn, Rclone(), r)
+    for f in root.iterdir():                                  # the drive is unmounted: an empty mount point
+        f.unlink()
+    from drivemerge.scanner import SuspiciousScan
+    with pytest.raises(SuspiciousScan, match="30 of 30"):
+        scan_remote(conn, Rclone(), r)
+    assert conn.execute("SELECT COUNT(*) FROM entries WHERE present = 0").fetchone()[0] == 0
+    assert scan_remote(conn, Rclone(), r, force=True).tombstoned == 30
+
+
+def test_a_listing_missing_part_of_a_small_tree_is_not_refused(conn, plain):
+    scan_remote(conn, _fake_rclone(_items(10)), plain)
+    assert scan_remote(conn, _fake_rclone(_items(1)), plain).tombstoned == 9
+
+
+class Racing(Rclone):
+    """Lists `items`; after the first one, runs `during()` (a newer scan of the same remote)."""
+
+    def __init__(self, items, during):
+        super().__init__()
+        self.items, self.during = items, during
+
+    def lsjson(self, remote, path="", **kw):
+        for i, it in enumerate(self.items):
+            yield dict(it)
+            if i == 0:
+                self.during()
+
+
+def test_a_scan_that_a_newer_one_replaced_stops_before_it_can_tombstone(conn, plain):
+    from drivemerge.scanner import ScanSuperseded
+    items = [plain_item(f"f{i}.txt", i + 1) for i in range(3)]
+    scan_remote(conn, Rclone(runner=FakeRunner(listing(*items))), plain)            # scan 1: the catalog knows f0..f2
+    newer = []
+    old = Racing(items, lambda: newer.append(scan_remote(conn, Rclone(runner=FakeRunner(listing(*items))), plain)))
+    with pytest.raises(ScanSuperseded):
+        scan_remote(conn, old, plain, batch_size=2)                                 # scan 2, replaced by scan 3
+    assert newer and newer[0].scan_id == 3 and newer[0].tombstoned == 0
+    assert conn.execute("SELECT COUNT(*) FROM entries WHERE present = 1").fetchone()[0] == 3
+    assert [r[0] for r in conn.execute("SELECT status FROM scans ORDER BY id")] == ["complete", "failed", "complete"]
+    assert all(r["last_seen_scan"] == 3 for r in conn.execute("SELECT * FROM entries"))   # nothing moved back to scan 2
+    assert db.snapshot(conn) == {str(db.remote_id(conn, "x")): 3}
+
+
+def test_overlapping_scans_in_two_connections_do_not_tombstone_live_files(tmp_path):
+    import threading
+    from drivemerge.scanner import ScanSuperseded
+
+    path = tmp_path / "c.db"
+    r = RemoteConfig(name="x", provider="other", read="x:")
+    c0 = db.connect(path)
+    config.sync_remotes(c0, config.Config(remotes=[r]))
+    items = [plain_item(f"f{i}.txt", i + 1) for i in range(3)]
+    scan_remote(c0, Rclone(runner=FakeRunner(listing(*items))), r)
+
+    class Gated(Rclone):
+        def __init__(self, wait=None):
+            super().__init__()
+            self.wait = wait
+
+        def lsjson(self, remote, path="", **kw):
+            if self.wait is not None:
+                assert self.wait.wait(10)
+            yield from (dict(i) for i in items)
+
+    b_flushed, a_done = threading.Event(), threading.Event()
+    outcome: dict[str, BaseException | None] = {}
+
+    def run(name, rclone, **kw):
+        try:
+            scan_remote(db.connect(path), rclone, r, **kw)
+            outcome[name] = None
+        except BaseException as e:
+            outcome[name] = e
+
+    def b_progress(*_):                                      # scan 3 pauses right after writing every row
+        b_flushed.set()
+        assert a_done.wait(10)
+
+    ta = threading.Thread(target=run, args=("old", Gated(b_flushed)))
+    ta.start()
+    deadline = time.monotonic() + 10
+    while not c0.execute("SELECT 1 FROM scans WHERE id = 2").fetchone():
+        assert time.monotonic() < deadline, "the first scan never started"
+        time.sleep(0.001)
+    tb = threading.Thread(target=run, args=("new", Gated()), kwargs={"progress": b_progress})
+    tb.start()
+    ta.join(15)
+    a_done.set()
+    tb.join(15)
+    assert isinstance(outcome["old"], ScanSuperseded) and outcome["new"] is None
+    assert c0.execute("SELECT COUNT(*) FROM entries WHERE present = 0").fetchone()[0] == 0
+
+
+def test_a_failed_scan_leaves_dir_stats_matching_the_rows_it_committed(conn, plain):
+    from drivemerge import dirstats
+    rid = db.remote_id(conn, "x")
+    scan_remote(conn, Rclone(runner=FakeRunner(listing(dir_item("Docs"), plain_item("Docs/a.txt", 4)))), plain)
+    dirstats.refresh(conn)
+    assert dirstats.get(conn, rid, "Docs")["files"] == 1
+
+    items = [plain_item(f"Docs/n{i}.txt", i + 1) for i in range(3)]
+    partial = FakeRunner(listing(*items)[:-3] + ",\n", rc=1, err="ERROR : boom")      # dies after the listing began
+    with pytest.raises(RcloneError):
+        scan_remote(conn, Rclone(runner=partial), plain, batch_size=2)
+    live = conn.execute("SELECT COUNT(*), SUM(size) FROM entries WHERE present = 1 AND is_dir = 0").fetchone()
+    docs = dirstats.get(conn, rid, "Docs")
+    assert live[0] > 1 and (docs["files"], docs["bytes"]) == tuple(live)
+
+
+def test_suspicious_scan_also_leaves_dir_stats_matching(conn, plain):
+    from drivemerge import dirstats
+    from drivemerge.scanner import SuspiciousScan
+    rid = db.remote_id(conn, "x")
+    scan_remote(conn, _fake_rclone(_items(100)), plain)
+    dirstats.refresh(conn)
+    changed = [dict(i, Size=2) for i in _items(10)]                        # rewritten rows are committed before the guard
+    with pytest.raises(SuspiciousScan):
+        scan_remote(conn, _fake_rclone(changed), plain)
+    assert dirstats.get(conn, rid, "")["bytes"] == conn.execute("SELECT SUM(size) FROM entries").fetchone()[0] == 110
+
+
+def test_a_scan_that_wrote_nothing_does_not_touch_dir_stats(conn, plain, monkeypatch):
+    from drivemerge import dirstats
+    calls = []
+    monkeypatch.setattr(dirstats, "refresh", lambda *a, **k: calls.append(1))
+    with pytest.raises(RcloneError):
+        scan_remote(conn, Rclone(runner=FakeRunner("[\n", rc=3, err="ERROR : directory not found")), plain)
+    assert calls == []

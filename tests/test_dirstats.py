@@ -222,3 +222,17 @@ def test_refresh_200k_files_in_seconds(conn, catalog):
     assert stats(conn, g, f"t{top:02d}/s03") == (
         len(leaf), 0, sum(sizes[i] for i in leaf), sum(dup[i] for i in leaf))
     assert elapsed < 5, f"refresh took {elapsed:.2f}s"
+
+
+def test_empty_files_never_count_as_duplicates(conn, catalog):
+    """Every empty file shares one hash; `__init__.py` in two projects is not a redundant copy."""
+    g = catalog.remote("g", "drive")
+    e1 = catalog.file(g, "proj1/__init__.py", size=0, md5="d41d8cd98f00b204e9800998ecf8427e")
+    e2 = catalog.file(g, "proj2/__init__.py", size=0, md5="d41d8cd98f00b204e9800998ecf8427e")
+    r1 = catalog.file(g, "proj1/real.bin", size=5, md5="aa")
+    r2 = catalog.file(g, "proj2/real.bin", size=5, md5="aa")
+    set_groups(conn, {e1: 1, e2: 1, r1: 2, r2: 2})
+    dirstats.refresh(conn)
+
+    assert stats(conn, g, "proj1") == (2, 0, 5, 1)          # only real.bin is a duplicate
+    assert stats(conn, g, "") == (4, 2, 10, 2)

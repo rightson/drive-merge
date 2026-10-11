@@ -1,8 +1,9 @@
 """Tests for drivemerge.suggest: related-folder clusters and duplicate-folder merges.
 
-Content identity in these catalogs comes from a shared md5 on every remote (as if
+Content identity in these catalogs comes from a shared sha256 on every remote (as if
 the hash domains had been bridged), then identity.rebuild_groups() fills
-content_group exactly like a real scan would.
+content_group exactly like a real scan would. sha256, because md5 alone is not
+accepted as proof of identical bytes.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ def populate(catalog, rid, folder, files):
     """Add files to `folder`. A name alone is unique content; (name, content) pairs share bytes by content."""
     for item in files:
         name, content = item if isinstance(item, tuple) else (item, f"{rid}:{folder}/{item}")
-        catalog.file(rid, f"{folder}/{name}", size=100 + len(content), md5=hashlib.md5(content.encode()).hexdigest())
+        catalog.file(rid, f"{folder}/{name}", size=100 + len(content), sha256=hashlib.sha256(content.encode()).hexdigest())
 
 
 def shared(prefix, names):
@@ -169,8 +170,9 @@ def test_suggestion_shape_and_actions_are_stageable(scattered):
     for s in sugs:
         assert s["id"].startswith("related:") and len(s["id"]) == len("related:") + 12
         assert 0.25 <= s["score"] <= 1.0
-        assert s["title"].startswith(f"這 {len(s['folders'])} 個資料夾看起來相關：")
+        assert s["title"].startswith(f"These {len(s['folders'])} folders look related: ")
         assert isinstance(s["reason"], str) and s["reason"]
+        assert s["code"] == "RELATED" and s["params"]["count"] == len(s["folders"])
         assert 2 <= len(s["folders"]) <= suggest.MAX_CLUSTER
         for f in s["folders"]:
             assert set(f) == {"remote", "path", "files", "bytes"}
@@ -184,8 +186,18 @@ def test_suggestion_shape_and_actions_are_stageable(scattered):
         json.dumps(s)                                       # plain JSON all the way down
     main = next(s for s in sugs if any(f["path"] == "School/NTU/Thesis" for f in s["folders"]))
     assert {"thesis", "研究計畫", "chapter"} <= set(main["terms"])               # bigrams are shown as the word
-    assert main["title"].startswith("這 5 個資料夾看起來相關：") and main["title"].endswith("…")
-    assert "「thesis」" in main["reason"] and "「研究計畫」" in main["reason"] and "4 份內容完全相同" in main["reason"]
+    assert main["title"].startswith("These 5 folders look related: ") and main["title"].endswith("…")
+    assert '"thesis"' in main["reason"] and '"研究計畫"' in main["reason"] and "4 files inside have exactly the same content" in main["reason"]
+    assert main["reason"].endswith(f'Suggested: tidy them under "{main["params"]["anchor"]}".')
+    # The same sentences as a code and the facts behind them, for a client that words them in its own language.
+    p = main["params"]
+    assert set(p) == {"count", "names", "anchor", "name_terms", "content_terms", "same"} and p["same"] == 4
+    assert p["count"] == 5 and len(p["names"]) == len(set(p["names"])) >= 4
+    assert p["anchor"] == f"{main['folders'][0]['remote']}:{main['folders'][0]['path']}"
+    assert {"thesis", "研究計畫"} <= set(p["name_terms"] + p["content_terms"])
+    assert p["name_terms"] + p["content_terms"] == main["terms"]
+    assert all(s["params"]["same"] >= 0 for s in sugs)
+    assert "detail" not in main                                      # `params` replaced the earlier `detail`
 
 
 def test_anchor_has_most_files_and_ties_go_by_path(conn, catalog):
@@ -332,7 +344,7 @@ def test_shared_content_pulls_differently_named_folders_together(conn, catalog):
     identity.rebuild_groups(conn)
     (s,) = suggest.related_folders(conn)
     assert locs(s) == {("A", "Work/quarterly"), ("B", "Misc2/stuffy")}
-    assert "4 份內容完全相同" in s["reason"]
+    assert "4 files inside have exactly the same content" in s["reason"]
 
 
 def test_empty_and_tiny_catalogs(conn, catalog):
@@ -442,8 +454,13 @@ def test_copied_tree_is_reported_once_at_its_highest_level(conn, catalog):
         "dst": {"remote": "Dropbox", "path": ""},
         "note": s["id"],
     }]
-    assert s["title"].startswith("這 2 個資料夾內容幾乎相同：")
-    assert "100%" in s["reason"]
+    assert s["title"].startswith("These 2 folders hold almost the same content: ")
+    assert "similarity 100%" in s["reason"] and s["code"] == "DUPLICATES"
+    assert set(s["params"]) == {"count", "names", "kept", "similarity", "shared", "saved_bytes"}
+    assert s["params"]["similarity"] == 1.0 and s["params"]["shared"] == 10 and s["params"]["saved_bytes"] > 0
+    assert s["params"]["kept"] == "Dropbox:School" and s["params"]["count"] == 2
+    assert f"{s['params']['shared']} shared" in s["reason"]                  # the sentence is built from these numbers
+    assert f'into "{s["params"]["kept"]}"' in s["reason"]
 
 
 def test_deep_copies_are_found_beyond_the_four_level_window(conn, catalog):
@@ -627,12 +644,12 @@ def _bulk_catalog(conn, leaves: int, seed: int = 7) -> tuple[int, int]:
     conn.execute("DROP TRIGGER entries_fts_ai")                   # full-text indexing is irrelevant here and slow
     rows, dirs, version = [], set(), 0
 
-    def add(rid, scan, path, is_dir, size=None, md5=None):
+    def add(rid, scan, path, is_dir, size=None, sha256=None):
         nonlocal version
         version += 1
         parent, _, name = path.rpartition("/")
         rows.append((rid, f"p:{path}", path, parent, name, name.casefold(), "", "other", int(is_dir), size,
-                     "2024-01-01T00:00:00Z", md5, scan, scan, version))
+                     "2024-01-01T00:00:00Z", sha256, scan, scan, version))
 
     def ensure(rid, scan, folder):
         parts = folder.split("/")
@@ -659,7 +676,7 @@ def _bulk_catalog(conn, leaves: int, seed: int = 7) -> tuple[int, int]:
                 add(rid2, scan2, f"{copy}/{fname}", False, 100, h)
     conn.executemany(
         "INSERT INTO entries(remote_id, entry_key, path, parent, name, name_norm, ext, category, is_dir, size, "
-        "mtime, md5, first_seen_scan, last_seen_scan, row_version) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+        "mtime, sha256, first_seen_scan, last_seen_scan, row_version) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
     identity.rebuild_groups(conn)
     return len(dirs), len(rows)
 
@@ -676,3 +693,25 @@ def test_twenty_thousand_folders_in_seconds(conn):
     assert related_seconds < 10 and dup_seconds < 10, (related_seconds, dup_seconds, n_dirs, n_rows)
     assert len(related) == 20 and len(dups) == 20
     assert all(2 <= len(s["folders"]) <= suggest.MAX_CLUSTER for s in related + dups)
+
+
+EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
+
+
+def test_folders_of_empty_files_are_not_duplicates_of_each_other(conn, catalog):
+    """Empty files all share one hash, which says nothing about the folders that hold them."""
+    a = catalog.remote("A", "drive")
+    b = catalog.remote("B", "dropbox")
+    for rid, folder in ((a, "proj1/pkg"), (b, "other/placeholders")):
+        for n in ("a.py", "b.py", "c.py"):
+            catalog.file(rid, f"{folder}/{n}", size=0, sha256=EMPTY_SHA256)
+    identity.rebuild_groups(conn)
+    assert conn.execute("SELECT COUNT(DISTINCT content_group) FROM entries WHERE is_dir = 0").fetchone()[0] == 1
+    assert suggest.duplicate_folders(conn) == []
+    assert suggest.related_folders(conn) == []
+    # the same folders with real, identical content are still found
+    for rid, folder in ((a, "proj2"), (b, "copy")):
+        populate(catalog, rid, folder, shared("real", ["x.pdf", "y.pdf", "z.pdf"]))
+    identity.rebuild_groups(conn)
+    (s,) = suggest.duplicate_folders(conn)
+    assert locs(s) == {("A", "proj2"), ("B", "copy")}

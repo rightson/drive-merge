@@ -10,6 +10,10 @@ touches a cloud or a draft.
   same; merging one into the other lets the workspace turn the merge into a
   witnessed deduplication.
 
+Every suggestion carries its `title` and `reason` in English (for the CLI and MCP)
+and the same sentences as a `code` plus `params`, which the web page words in its
+own language.
+
 Neither finder compares all folder pairs. Candidate pairs come from inverted
 indexes (shared name words, shared content groups), so
 the cost grows with the amount of real overlap, not with folders squared.
@@ -177,9 +181,10 @@ class _Tree:
     def _load(self, conn: sqlite3.Connection, want_terms: bool) -> None:
         # Files parked in quarantine are deleted files: they are neither folders to tidy nor copies.
         live = f"present = 1 AND is_dir = 0 AND {db.outside_quarantine(conn)}"
+        # Empty files all share one hash: `__init__.py` in two projects says nothing about the folders.
         shared = {
             r[0] for r in conn.execute(
-                f"SELECT content_group FROM entries WHERE {live} "
+                f"SELECT content_group FROM entries WHERE {live} AND size > 0 "
                 "AND content_group IS NOT NULL GROUP BY content_group HAVING COUNT(*) >= 2"
             )
         }
@@ -470,12 +475,6 @@ def _sid(tree: _Tree, kind: str, members: list[int]) -> str:
     return f"{kind}:{digest[:12]}"
 
 
-def _names(folders: list[dict]) -> str:
-    """Up to three distinct folder names for a title."""
-    names = list(dict.fromkeys(f["path"].rpartition("/")[2] for f in folders))
-    return ", ".join(names[:3]) + ("…" if len(names) > 3 else "")
-
-
 def _human(n: int) -> str:
     size = float(n)
     for unit in ("B", "KB", "MB", "GB", "TB"):
@@ -644,7 +643,38 @@ def _words(terms: list[str]) -> list[str]:
 
 
 def _quote(terms: list[str]) -> str:
-    return "、".join(f"「{t}」" for t in terms)
+    return ", ".join(f'"{t}"' for t in terms)
+
+
+def _folder_names(folders: list[dict]) -> list[str]:
+    """Distinct folder names, in listing order: what a title names (a client shows the first few)."""
+    return list(dict.fromkeys(f["path"].rpartition("/")[2] for f in folders))
+
+
+def _shown(names: list[str]) -> str:
+    return ", ".join(names[:3]) + ("…" if len(names) > 3 else "")
+
+
+def _related_text(p: dict) -> tuple[str, str]:
+    """English title and reason of a RELATED suggestion; the page words them from `code` and `params` itself."""
+    reasons = []
+    if p["name_terms"]:
+        reasons.append(f"their folder names share {_quote(p['name_terms'])}")
+    if p["content_terms"]:
+        reasons.append(f"file names inside often contain {_quote(p['content_terms'])}")
+    if p["same"]:
+        reasons.append(f"{p['same']} file{' inside has' if p['same'] == 1 else 's inside have'} exactly the same content")
+    why = "; ".join(reasons) or "similar names and contents"
+    return (f"These {p['count']} folders look related: {_shown(p['names'])}",
+            f'{why}. Suggested: tidy them under "{p["anchor"]}".')
+
+
+def _duplicates_text(p: dict) -> tuple[str, str]:
+    """English title and reason of a DUPLICATES suggestion."""
+    return (f"These {p['count']} folders hold almost the same content: {_shown(p['names'])}",
+            f"Content similarity {p['similarity']:.0%} (only content proven identical by hash counts; "
+            f"{p['shared']} shared). Merging the others into \"{p['kept']}\" turns identical files into witnessed "
+            f"dedupes and frees about {_human(p['saved_bytes'])}.")
 
 
 def _related_suggestion(tree: _Tree, members: list[int], score: float, sid: str, nv: dict, cv: dict) -> dict:
@@ -657,20 +687,18 @@ def _related_suggestion(tree: _Tree, members: list[int], score: float, sid: str,
     for i in members:
         groups.update(tree.sets[i] or ())
     same = sum(1 for c in groups.values() if c >= 2)
-    reasons = []
-    if name_terms:
-        reasons.append(f"資料夾名稱都有{_quote(name_terms)}")
-    if content_terms:
-        reasons.append(f"裡面的檔名常出現{_quote(content_terms)}")
-    if same:
-        reasons.append(f"其中有 {same} 份內容完全相同的檔案")
-    reason = "；".join(reasons) or "名稱與內容相近"
+    params = {"count": len(folders), "names": _folder_names(folders), "anchor": f"{anchor['remote']}:{anchor['path']}",
+              "name_terms": name_terms, "content_terms": content_terms, "same": same}
+    title, reason = _related_text(params)
     return {
         "id": sid,
         "kind": "related",
         "score": round(score, 3),
-        "title": f"這 {len(folders)} 個資料夾看起來相關：{_names(folders)}",
-        "reason": f"{reason}。建議整理到「{anchor['remote']}:{anchor['path']}」底下。",
+        "title": title,
+        "reason": reason,
+        # The same sentences as a code and the facts behind them, so that a client can word them in its own language.
+        "code": "RELATED",
+        "params": params,
         "folders": [anchor, *rest],
         "terms": [*name_terms, *content_terms],
         "actions": [_move(f, anchor, sid) for f in rest],
@@ -773,14 +801,17 @@ def _duplicate_suggestion(tree: _Tree, members: list[int], score: float, shared:
     kept, rest = folders[0], sorted(folders[1:], key=lambda f: (f["path"], f["remote"]))
     kept_name = kept["path"].rpartition("/")[2]
     dst = {"remote": kept["remote"], "path": kept["path"].rpartition("/")[0]}
+    params = {"count": len(folders), "names": _folder_names(folders), "kept": f"{kept['remote']}:{kept['path']}",
+              "similarity": round(score, 3), "shared": shared, "saved_bytes": saved}
+    title, reason = _duplicates_text(params)
     return {
         "id": sid,
         "kind": "duplicates",
         "score": round(score, 3),
-        "title": f"這 {len(folders)} 個資料夾內容幾乎相同：{_names(folders)}",
-        "reason": (f"內容相同度 {score:.0%}（只計算已用雜湊證明相同的內容，共 {shared} 份相同）。"
-                   f"把其餘資料夾合併進「{kept['remote']}:{kept['path']}」後，相同的檔案會自動變成有見證的去重，"
-                   f"約可釋出 {_human(saved)}。"),
+        "title": title,
+        "reason": reason,
+        "code": "DUPLICATES",
+        "params": params,
         "folders": [kept, *rest],
         "terms": list(_name_tokens(kept_name))[:5],
         "actions": [_move(f, dst, sid, kept_name if f["path"].rpartition("/")[2] != kept_name else None)

@@ -39,10 +39,44 @@ export function keepBothName(name, n, isDir) {
   return `${name.slice(0, dot)} (${n})${name.slice(dot)}`;
 }
 
+// Message parameters that are byte counts, and those that name a short kind with a sentence of its own (`why: "moved"`
+// is worded by `<ns>.why.moved`).
+const BYTE_PARAMS = new Set(['bytes', 'free', 'size', 'expected']);
+const KIND_PARAMS = ['why', 'problem', 'what', 'role'];
+
+/**
+ * The `params` a server message came with, ready for t(): a place ({remote, path}) becomes "remote:path", a byte count
+ * is written with its unit, and a kind (why / problem / what) is replaced by its sentence in namespace `ns`.
+ */
+export function wordParams(ns, params) {
+  const out = {};
+  for (const [k, v] of Object.entries(params || {})) {
+    if (v && typeof v === 'object' && !Array.isArray(v) && v.remote !== undefined) out[k] = fmtLoc({ remote: v.remote, path: v.path || '' });
+    else if (BYTE_PARAMS.has(k) && typeof v === 'number') out[k] = fmtBytes(v);
+    else out[k] = v;
+  }
+  for (const k of KIND_PARAMS) {
+    if (typeof out[k] === 'string') out[k] = t(`${ns}.${k}.${out[k]}`, out, out[k]);
+  }
+  return out;
+}
+
+/**
+ * The detail line under a violation, warning or conflict, in the page's language: `<ns>.<CODE>.detail`, or
+ * `<ns>.<CODE>.detail.<variant>` for a code with several sentences. A message the page has no sentence for (a newer
+ * server, a report stored before `params` existed) is shown as the server wrote it, in English.
+ */
+export function problemDetail(ns, item) {
+  const code = item.code;
+  const params = item.params || {};
+  const key = `${ns}.${code}.detail${params.variant ? `.${params.variant}` : ''}`;
+  return t(key, wordParams(ns, params), item.message !== undefined ? item.message : item.reason);
+}
+
 export function errorText(err) {
   if (!err) return '';
   if (err.status === 0) return t('err.network');
-  const known = err.code && t(`err.${err.code}`, null, '');
+  const known = err.code && t(`err.${err.code}`, wordParams('err', err.params), '');
   return known || err.message || t('err.unknown');
 }
 
@@ -55,14 +89,51 @@ export function describeAction(a) {
   const items = a.items || [];
   const names = items.map((i) => baseName(i.path) || i.remote);
   const first = items[0];
-  const detail = names.length > 3 ? `${names.slice(0, 3).join('、')} …` : names.join('、');
+  const sep = t('common.listSep');
+  const detail = names.length > 3 ? `${names.slice(0, 3).join(sep)} …` : names.join(sep);
   if (a.new_name && items.length === 1 && first.remote === a.dst.remote && parentOf(first.path) === a.dst.path) {
     return { title: t('act.rename', { from: names[0], to: a.new_name }), detail: '' };
   }
   return { title: t('act.move', { n: items.length, dst }), detail };
 }
 
+/** Why a staged step no longer fits the catalog, in words: its `stale_reason` ({code, message, items}). */
+export function staleText(reason) {
+  if (!reason) return '';
+  const items = (reason.items || []).map(fmtLoc).join(t('common.listSep'));
+  return t(`stale.${reason.code}`, { items }, reason.message);
+}
+
 export const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** What a rescan job is doing, in words (its `progress` is {stage} or {remote, remote_index, remotes_total, files}). */
+export function rescanText(job) {
+  const p = (job && job.progress) || {};
+  if (p.stage === 'identity' || p.stage === 'dir_stats') return t(`prog.stage.${p.stage}`);
+  if (!p.remote) return t('prog.wait');
+  return t('prog.scanning', { remote: p.remote, i: p.remote_index || 1, n: p.remotes_total || 1, files: fmtNum(p.files || 0) });
+}
+
+/**
+ * Replay the staged steps on the file the catalog has at `origin` (a step moves everything at or below its items, as
+ * the server's forward map does) and return the last step that moved it, with where it was just before that step:
+ * the step a name clash can be taken back from. Null when no step moved it.
+ */
+export function lastMove(actions, origin) {
+  let at = { remote: origin.remote, path: origin.path };
+  let found = null;
+  for (const a of [...actions].sort((x, y) => x.seq - y.seq)) {
+    if (a.state !== 'active' || a.kind !== 'move') continue;
+    const items = a.items || [];
+    const hit = items.find((it) => it.path && it.remote === at.remote && isUnder(at.path, it.path));
+    if (!hit) continue;
+    const name = (items.length === 1 && a.new_name) || baseName(hit.path);
+    const next = { remote: a.dst.remote, path: joinPath(a.dst.path, name) + at.path.slice(hit.path.length) };
+    if (next.remote !== at.remote || next.path !== at.path) found = { step: a, before: at };
+    at = next;
+  }
+  return found;
+}
 
 export function todayStamp() {
   const d = new Date();
@@ -91,4 +162,70 @@ export function locationInMessage(message, remoteNames) {
     }
   }
   return null;
+}
+
+/** Where a simulator violation happened: its `at` parameter, else the first quoted place in its English message. */
+export function violationLoc(v, remoteNames) {
+  const at = v.params && v.params.at;
+  if (at && at.remote !== undefined) return { remote: at.remote, path: at.path || '' };
+  return locationInMessage(v.message, remoteNames);
+}
+
+/** True for the NO_WITNESS that says the witness file is not there (not: none given, or the file itself). */
+const missingWitness = (v) => (v.params && v.params.variant ? v.params.variant === 'missing' : /no live file at the witness/.test(v.message || ''));
+
+/**
+ * The problems worth showing. The simulator and the workspace both report some failures, and one cause can set off
+ * another: a DST_EXISTS on the very spot a conflict already explains, or a NO_WITNESS for a copy that a read-only
+ * cloud (READ_ONLY_REMOTE) already prevents, are the same problem again, so the page counts and draws it once. So is
+ * a sentence the simulator says again for every op (it names no op, only the place).
+ */
+export function rootCauses(violations, conflicts, remoteNames) {
+  const spot = (loc) => (loc ? fmtLoc({ remote: loc.remote, path: loc.path || '' }) : '');
+  const explained = new Set(conflicts.map((c) => spot(c.to)));
+  const readOnly = new Set(violations.filter((v) => v.code === 'READ_ONLY_REMOTE')
+    .map((v) => (violationLoc(v, remoteNames) || {}).remote));
+  const said = new Set();
+  return violations.filter((v) => {
+    const again = `${v.code}|${v.message}`;
+    if (said.has(again)) return false;
+    said.add(again);
+    const at = violationLoc(v, remoteNames);
+    if (!at) return true;
+    if (v.code === 'DST_EXISTS' && explained.has(spot(at))) return false;
+    if (v.code === 'NO_WITNESS' && readOnly.has(at.remote) && missingWitness(v)) return false;
+    return true;
+  });
+}
+
+/** Words for each suggestion `code`: the placeholders its `sug.<CODE>.reason` needs, made from the server's `params`. */
+const SUGGESTION_REASON = {
+  RELATED: (p) => {
+    const quote = (terms) => terms.map((term) => t('sug.q', { term })).join(t('sug.sep'));
+    const why = [];
+    if ((p.name_terms || []).length) why.push(t('sug.RELATED.why.names', { terms: quote(p.name_terms) }));
+    if ((p.content_terms || []).length) why.push(t('sug.RELATED.why.files', { terms: quote(p.content_terms) }));
+    if (p.same) why.push(t('sug.RELATED.why.same', { n: p.same }));
+    return { why: why.join(t('sug.joinReasons')) || t('sug.RELATED.why.alike'), anchor: p.anchor };
+  },
+  DUPLICATES: (p) => ({
+    pct: `${Math.round((p.similarity || 0) * 100)}%`, shared: fmtNum(p.shared || 0), kept: p.kept, saved: fmtBytes(p.saved_bytes || 0),
+  }),
+};
+
+/**
+ * Title and reason of a suggestion in the page's language. The server sends them in English together with a `code`
+ * and the `params` they were made from; the page words those itself, and shows the server's English text only for a
+ * code it does not know.
+ */
+export function suggestionText(s) {
+  const p = s.params;
+  const reason = SUGGESTION_REASON[s.code];
+  if (!p || !reason) return { title: s.title, reason: s.reason };
+  const names = p.names || [];
+  const shown = names.slice(0, 3).join(t('common.listSep')) + (names.length > 3 ? '…' : '');
+  return {
+    title: t(`sug.${s.code}.title`, { n: p.count, names: shown }, s.title),
+    reason: t(`sug.${s.code}.reason`, reason(p), s.reason),
+  };
 }
