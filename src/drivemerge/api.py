@@ -12,12 +12,13 @@ import threading
 from typing import Any, Literal
 
 import uvicorn
-from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import __version__, builders, plans
+from .compare import CompareError
 from .config import Config
 from .service import Service, ServiceError
 
@@ -60,6 +61,11 @@ def _given(**kwargs: Any) -> dict[str, Any]:
     return {k: v for k, v in kwargs.items() if v is not None}
 
 
+def _csv(value: str | None) -> list[str]:
+    """A comma-separated query parameter as a list (empty items dropped)."""
+    return [part.strip() for part in (value or "").split(",") if part.strip()]
+
+
 def scrub_secrets(obj: Any) -> Any:
     """`obj` without approval secrets at any depth, so a caller holding only the API token never learns the
     code a person is meant to read off their own screen."""
@@ -74,8 +80,11 @@ def _message(exc: Exception) -> str:
     return str(exc.args[0]) if len(exc.args) == 1 else str(exc)
 
 
-def _error(status: int, message: str, headers: dict[str, str] | None = None, code: str | None = None) -> JSONResponse:
+def _error(status: int, message: str, headers: dict[str, str] | None = None, code: str | None = None,
+           params: dict | None = None) -> JSONResponse:
     body = {"error": message} if code is None else {"error": message, "code": code}
+    if params:
+        body["params"] = params
     return JSONResponse(body, status_code=status, headers=headers)
 
 
@@ -109,9 +118,14 @@ def install_error_handlers(app: FastAPI, *, coded: bool = False) -> None:
         missing = _NO_PLAN.fullmatch(str(exc))
         return _error(404 if missing else 400, str(exc), code=code("NOT_FOUND" if missing else "BAD_REQUEST"))
 
+    def compare_error(_: Request, exc: CompareError) -> JSONResponse:
+        # Always coded: compare, coverage and explore refusals are the same facts for a script and for the page.
+        return _error(exc.status, str(exc), code=exc.code, params=exc.params)
+
     app.add_exception_handler(StarletteHTTPException, http_error)
     for exc_type in (ValueError, ServiceError, builders.BuildError):  # the last two subclass ValueError
         app.add_exception_handler(exc_type, bad_request)
+    app.add_exception_handler(CompareError, compare_error)
     app.add_exception_handler(plans.PlanError, plan_error)
     app.add_exception_handler(KeyError, not_found)
 
@@ -166,6 +180,33 @@ def build_router(service: Service, lock: threading.Lock, *, dependencies: list[A
                 include_dirs=include_dirs, include_missing=include_missing,
                 duplicates_only=duplicates_only, limit=limit, offset=offset)
         return {"results": results}
+
+    @api.get("/v1/compare")
+    def compare_folders(left_remote: str, left_path: str, right_remote: str, right_path: str,
+                        max_files: int = 20000) -> dict:
+        with lock:
+            return service.compare((left_remote, left_path), (right_remote, right_path), max_files=max_files)
+
+    @api.get("/v1/coverage")
+    def coverage(category: str | None = None, max_bars: int = 24) -> dict:
+        with lock:
+            return service.coverage(category, max_bars=max_bars)
+
+    @api.get("/v1/explore")
+    def explore(q: str | None = None, in_: str | None = Query(default=None, alias="in"),
+                category: str | None = None, ext: str | None = None, min_size: int | None = None,
+                max_size: int | None = None, modified_after: str | None = None,
+                modified_before: str | None = None, path_prefix: str | None = None,
+                on: str | None = None, not_on: str | None = None, only_on: str | None = None,
+                copies_min: int | None = None, copies_max: int | None = None, sort: str = "relevance",
+                limit: int = 50, offset: int = 0) -> dict:
+        with lock:
+            return service.explore(
+                q, in_remote=in_ or None, category=category or None, ext=ext or None, min_size=min_size,
+                max_size=max_size, modified_after=modified_after or None, modified_before=modified_before or None,
+                path_prefix=path_prefix or None, on=_csv(on), not_on=_csv(not_on),
+                only_on=_csv(only_on) if only_on else None, copies_min=copies_min, copies_max=copies_max,
+                sort=sort, limit=limit, offset=offset)
 
     @api.get("/v1/entries/{entry_id}")
     def get_entry(entry_id: int) -> dict:

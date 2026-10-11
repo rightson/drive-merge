@@ -33,7 +33,7 @@ ALLOWED_TOOLS = {
     "catalog_stats", "search_files", "file_locations", "find_duplicates", "folder_profiles",
     "validate_rules", "preview_layout", "propose_plan", "simulate_plan", "get_plan", "list_plans",
     "list_drafts", "get_draft", "create_draft", "browse_tree", "suggest_reorganization", "stage_moves",
-    "undo_last", "remove_staged", "preview_draft",
+    "undo_last", "remove_staged", "preview_draft", "compare_folders", "coverage",
 }
 WRITING_TOOLS = {"propose_plan", "simulate_plan", "create_draft", "stage_moves", "undo_last", "remove_staged",
                  "preview_draft"}
@@ -171,7 +171,7 @@ def test_source_never_references_human_only_service_methods():
     assert used <= {"stats", "search", "entry", "locations", "duplicates", "profiles", "validate_rules",
                     "preview_layout", "propose_plan", "simulate", "plan", "plans",
                     "list_drafts", "get_draft", "create_draft", "list_dir", "tree_roots", "stage_action",
-                    "undo_action", "remove_action", "preview_draft", "suggestions"}
+                    "undo_action", "remove_action", "preview_draft", "suggestions", "compare", "coverage"}
     for name in NOT_EXPOSED:
         assert not re.search(rf"service\.{name}\b", source), name
 
@@ -199,13 +199,16 @@ def test_human_only_service_methods_are_never_called(fx, server, monkeypatch):
     patch(monkeypatch, fx.service, "list_dir", {"remote": "gdrive", "path": "", "view": "after",
                                                 "draft_version": None, "items": [], "total": 0})
     patch(monkeypatch, fx.service, "suggestions", [])
+    patch(monkeypatch, fx.service, "compare", {"left": {}, "right": {}, "summary": {}, "rows": []})
+    patch(monkeypatch, fx.service, "coverage", {"remotes": [], "intersections": []})
     patch(monkeypatch, fx.service, "stage_action", {"action": {"id": 1, "seq": 1}, "draft_version": 2,
                                                      "warnings": []})
     patch(monkeypatch, fx.service, "undo_action", draft)
     patch(monkeypatch, fx.service, "remove_action", {"draft_version": 2, "removed": [1]})
     patch(monkeypatch, fx.service, "preview_draft", {"plan_id": None, "message": "nothing to do"})
     move = {"items": [{"remote": "gdrive", "path": "Docs"}], "dst": {"remote": "dropbox", "path": ""}}
-    args = {"file_locations": {"entry_id": fx.photo_g}, "validate_rules": {"rules_toml": ""},
+    args = {"compare_folders": {"left_remote": "gdrive", "left_path": "", "right_remote": "dropbox", "right_path": ""},
+            "file_locations": {"entry_id": fx.photo_g}, "validate_rules": {"rules_toml": ""},
             "propose_plan": {"kind": "dedupe", "params": {}}, "simulate_plan": {"plan_id": 1},
             "get_plan": {"plan_id": 1}, "get_draft": {"draft_id": 1}, "create_draft": {"title": "t"},
             "stage_moves": {"draft_id": 1, "moves": [move]}, "undo_last": {"draft_id": 1},
@@ -1345,3 +1348,69 @@ def test_stdio_round_trip_in_a_subprocess(tmp_path):
     names, stats = anyio.run(go)
     assert names == ALLOWED_TOOLS
     assert not stats.is_error and json.loads(stats.content[0].text)["totals"] == {"files": 0, "bytes": 0}
+
+
+# --------------------------------------------------------------------------- compare_folders and coverage
+
+@pytest.fixture
+def cmp_fx(fx):
+    g, d = fx.g, fx.d
+    cat = Catalog(fx.conn)
+    cat._scan = {g: fx.conn.execute("SELECT MAX(id) FROM scans WHERE remote_id = ?", (g,)).fetchone()[0],
+                 d: fx.conn.execute("SELECT MAX(id) FROM scans WHERE remote_id = ?", (d,)).fetchone()[0]}
+    for i in range(310):
+        cat.file(g, f"L/n{i:03}.txt", size=1)
+    s1 = cat.file(g, "L/same.bin", size=5, md5="s")
+    s2 = cat.file(d, "R/same.bin", size=5, dropbox="s")
+    fx.conn.execute("UPDATE entries SET content_group = 99 WHERE id IN (?, ?)", (s1, s2))
+    cat.file(d, "R/other.txt", size=2)
+    return fx
+
+
+def test_compare_folders_tool(cmp_fx):
+    server = build_server(cmp_fx.service)
+    out = ok(server, "compare_folders", left_remote="gdrive", left_path="L", right_remote="dropbox", right_path="R")
+    assert out["note"] == UNTRUSTED_NOTE
+    data = out["data"]
+    assert data["summary"]["same"]["files"] == 1 and data["summary"]["left_only"]["files"] == 310
+    assert data["rows_total"] == 312 and data["rows_truncated"] is True and len(data["rows"]) == 300
+    # differences are listed before same files, so a cap never hides them behind identical files
+    small = ok(server, "compare_folders", left_remote="gdrive", left_path="L", right_remote="dropbox",
+               right_path="R")["data"]
+    assert all(r["status"] != "same" for r in small["rows"])
+    row = data["rows"][0]
+    assert set(row) <= {"rel", "status", "rel_right", "evidence", "elsewhere", "unique", "left", "right"}
+    assert set(row["left"]) <= {"entry_id", "path", "size", "mtime", "content_group"}
+
+
+def test_compare_folders_tool_not_truncated_and_refusals(fx):
+    server = build_server(fx.service)
+    data = ok(server, "compare_folders", left_remote="gdrive", left_path="Photos", right_remote="dropbox",
+              right_path="Camera")["data"]
+    assert data["rows_truncated"] is False and data["rows"][0]["status"] in ("moved", "unverified", "same")
+    assert "NOT_A_FOLDER: gdrive:Docs/report.pdf" in err(server, "compare_folders", left_remote="gdrive", left_path="Docs/report.pdf", right_remote="dropbox", right_path="Camera")
+    assert "unknown remote 'zzz'" in err(server, "compare_folders", left_remote="zzz", left_path="",
+                                         right_remote="dropbox", right_path="")
+    assert "COMPARE_NESTED:" in err(server, "compare_folders", left_remote="gdrive", left_path="Photos",
+                                    right_remote="gdrive", right_path="Photos/2019")
+
+
+def test_coverage_tool(fx):
+    server = build_server(fx.service)
+    out = ok(server, "coverage")
+    assert out["note"] == UNTRUSTED_NOTE
+    data = out["data"]
+    assert [r["name"] for r in data["remotes"]] == ["gdrive", "dropbox"]
+    assert ["gdrive", "dropbox"] in [b["remotes"] for b in data["intersections"]]
+    assert ok(server, "coverage", category="video")["data"]["totals"]["contents"] == 0
+
+
+def test_the_new_tools_are_read_only_and_call_only_read_methods(cmp_fx, monkeypatch):
+    server = build_server(cmp_fx.service)
+    tools = {t.name: t for t in list_tools(server)}
+    for name in ("compare_folders", "coverage"):
+        assert tools[name].annotations.read_only_hint is True
+    before = cmp_fx.conn.total_changes
+    ok(server, "compare_folders", left_remote="gdrive", left_path="L", right_remote="dropbox", right_path="R")
+    ok(server, "coverage")
+    assert cmp_fx.conn.total_changes == before

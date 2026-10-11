@@ -31,6 +31,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp_types import ToolAnnotations
 
+from .compare import CompareError
 from .config import load_config
 from .plans import PlanError
 from .service import Service
@@ -118,6 +119,7 @@ MAX_DRAFT_ACTIONS = 100
 MAX_ACTION_ITEMS = 50
 MAX_TREE = 200
 MAX_ORIGINS = 5
+MAX_COMPARE_ROWS = 300
 MAX_SUGGESTIONS = 50
 MAX_MOVES = 50
 MAX_MOVE_ITEMS = 200
@@ -155,7 +157,7 @@ def _pick(row: dict, keys: tuple[str, ...]) -> dict:
 
 
 def _error_message(exc: Exception) -> str:
-    if isinstance(exc, WorkspaceError):
+    if isinstance(exc, (WorkspaceError, CompareError)):
         text = f"{exc.code}: {exc}"
     elif isinstance(exc, sqlite3.Error):
         text = f"catalog database error (try again if a scan or execution is running): {exc}"
@@ -444,6 +446,48 @@ def build_server(service: Service) -> MCPServer:
         profiles = service.profiles(remote=remote or None, prefix=prefix or "", depth=_clamp(depth, 1, 10),
                                     limit=_clamp(limit, 1, MAX_PROFILES))
         return _wrap(profiles)
+
+    @tool()
+    def compare_folders(left_remote: str, left_path: str, right_remote: str, right_path: str) -> dict:
+        """How two folders differ, file by file, from the catalog (the clouds as last scanned). Changes nothing.
+
+        Files are paired by relative path first, then by identical content (renamed or moved files).
+        Args:
+            left_remote, left_path: the first folder (catalog remote name; path relative to its root, "" = root).
+            right_remote, right_path: the second folder.
+        Statuses: same = proven identical (shared content group); differs = proven different (sizes or a hash of the
+        same type); unverified = same path but nothing proves either, do not call it identical; moved = identical
+        content at another relative path (rel_right); left_only / right_only = no counterpart, with `elsewhere`
+        (copies outside both folders) and `unique` (true = no other copy anywhere: losing this side loses the content).
+        The summary counts every status; `rows` lists differences first (then same files), at most 300, and
+        rows_truncated=true says more exist. Refusals carry a code: NOT_A_FOLDER, COMPARE_NESTED, COMPARE_TOO_LARGE,
+        QUARANTINE, NOT_FOUND.
+        """
+        result = service.compare((left_remote, left_path), (right_remote, right_path))
+        rows = sorted(result["rows"], key=lambda r: r["status"] == "same")   # stable: differences first, then by rel
+        shown = rows[:MAX_COMPARE_ROWS]
+
+        def side(f: dict | None) -> dict | None:
+            return None if f is None else _pick(f, ("entry_id", "path", "size", "mtime", "content_group"))
+
+        return _wrap({
+            "left": result["left"], "right": result["right"], "summary": result["summary"],
+            "rows_total": len(rows), "rows_truncated": len(rows) > len(shown),
+            "rows": [{**_pick(r, ("rel", "status", "rel_right", "evidence", "elsewhere", "unique")),
+                      "left": side(r["left"]), "right": side(r["right"])} for r in shown],
+        })
+
+    @tool()
+    def coverage(category: str | None = None) -> dict:
+        """How the clouds overlap: per cloud files, bytes, `only_here` (contents with no copy on another cloud: what
+        would be lost with that cloud) and `unverified_files` (no comparable hash, so the overlap is under-counted),
+        plus the exact combinations of clouds a content lives on (`intersections`, biggest bytes first) and totals
+        (unique bytes, stored bytes, redundant bytes). Changes nothing.
+
+        Args:
+            category: only files of this category (photo, video, audio, document, pdf, ...); default all.
+        """
+        return _wrap(service.coverage(category or None))
 
     @tool()
     def validate_rules(rules_toml: str) -> dict:

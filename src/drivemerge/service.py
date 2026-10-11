@@ -2,7 +2,7 @@
 
 Everything returns JSON-serialisable values. Methods are grouped by trust level:
 
-* read        — catalog queries and workspace trees; safe for anyone with access to the service
+* read        — catalog queries, compare/coverage/explore and workspace trees; safe for anyone with access to the service
 * maintain    — scans, hash bridging and directory statistics; read-only on the clouds
 * propose     — build and simulate plans, stage workspace drafts; writes only to the local catalog
 * human-only  — approve / execute / restore / purge. The MCP server and the
@@ -18,7 +18,8 @@ import tempfile
 from pathlib import Path
 
 from . import (
-    builders, classify, db, dirstats, executor, identity, plans, search, simulate, suggest, workspace,
+    builders, classify, compare, coverage, db, dirstats, executor, explore, identity, plans, search, simulate,
+    suggest, workspace,
 )
 from .config import Config, sync_remotes
 from .models import Plan
@@ -28,6 +29,8 @@ from .scanner import scan_remote
 PLAN_KINDS = ("dedupe", "consolidate", "reorganize", "manual")
 # Written only by workspace.preview; a proposer's params must never be able to claim a draft.
 RESERVED_PARAMS = ("draft_id", "draft_version")
+MAX_COMPARE_FILES = 100000
+MAX_COVERAGE_BARS = 64
 
 
 def _plain(obj):
@@ -86,6 +89,24 @@ class Service:
     def changes(self, cursor: str | None = None, limit: int = 1000) -> dict:
         rows, nxt = search.changes(self.conn, cursor, limit)
         return {"rows": rows, "cursor": nxt}
+
+    def compare(self, left: tuple[str, str], right: tuple[str, str], *, max_files: int = 20000) -> dict:
+        """Align two folders `(remote, path)` and classify every file (compare.py). Read-only."""
+        if isinstance(max_files, bool) or not isinstance(max_files, int) or not 1 <= max_files <= MAX_COMPARE_FILES:
+            raise compare.CompareError("BAD_QUERY", f"max_files must be between 1 and {MAX_COMPARE_FILES}",
+                                       param="max_files")
+        return compare.compare_folders(self.conn, tuple(left), tuple(right), max_files=max_files)
+
+    def coverage(self, category: str | None = None, *, max_bars: int = 24) -> dict:
+        """How the clouds overlap (coverage.py). `max_bars` is 1 to 64."""
+        if isinstance(max_bars, bool) or not isinstance(max_bars, int) or not 1 <= max_bars <= MAX_COVERAGE_BARS:
+            raise compare.CompareError("BAD_QUERY", f"max_bars must be between 1 and {MAX_COVERAGE_BARS}",
+                                       param="max_bars")
+        return coverage.coverage(self.conn, category=category or None, max_bars=max_bars)
+
+    def explore(self, q: str | None = None, **params) -> dict:
+        """Search results grouped by content with one presence column per cloud (explore.py)."""
+        return explore.explore(self.conn, q, **params)
 
     def ruleset(self, rules_text: str | None = None) -> classify.RuleSet:
         if rules_text is not None:
