@@ -6,7 +6,7 @@ Merge files from Google Drive, Dropbox, OneDrive and iCloud into one place — w
 
 drive-merge runs on your machine. It catalogs **metadata** (never file contents) from every cloud into a local SQLite database via [rclone](https://rclone.org), tells you where each piece of content lives, proves which files are duplicates, proposes a clean folder layout, and — only through simulated, human-approved plans — consolidates everything into one cloud.
 
-Design documents: [docs/DESIGN.md](docs/DESIGN.md) — architecture, safety model, and the open decisions you can adjust — [docs/WORKSPACE.md](docs/WORKSPACE.md) — the visual workspace — and [docs/EXPLORE.md](docs/EXPLORE.md) — the Overview, Explore and Compare views — and [docs/PLANS.md](docs/PLANS.md) — the Plans view. Traditional Chinese versions exist as `docs/*.zh-TW.md`.
+Design documents: [docs/DESIGN.md](docs/DESIGN.md) — architecture, safety model, and the open decisions you can adjust — [docs/WORKSPACE.md](docs/WORKSPACE.md) — the visual workspace — and [docs/EXPLORE.md](docs/EXPLORE.md) — the Overview, Explore and Compare views — [docs/PLANS.md](docs/PLANS.md) — the Plans view — and [docs/SETUP.md](docs/SETUP.md) — the first run in the browser. Traditional Chinese versions exist as `docs/*.zh-TW.md`.
 
 ## Why it is built this way
 
@@ -44,7 +44,10 @@ read = "dropbox:"
 
 ## Use
 
+The first step can be the browser: `drivemerge ui` creates the config if it is missing and opens on the **Setup** screen, where you connect your clouds and run the first scan (see below). Or do the same from a terminal:
+
 ```bash
+drivemerge ui                              # first step, in the browser: Setup connects clouds and scans them
 drivemerge scan --all                      # list every cloud into the catalog (read-only)
 drivemerge identity rebuild                # group identical content
 drivemerge stats
@@ -72,6 +75,8 @@ Two tree panes show any two places side by side, across clouds. Drag files and f
 The rail on the left of the page also opens three read-only views that lead into the workspace: **Overview** (how your clouds overlap: an intersection chart of which content lives on which clouds, and what exists on only one), **Explore** (find a file by name or by a query such as `type:pdf not:gdrive copies:1`; identical copies are grouped, with one presence column per cloud) and **Compare** (an aligned diff of any two folders on any clouds: same, different, moved, one side only, with a button that stages a merge into your draft). They never write a cloud or change the catalog. See [docs/EXPLORE.md](docs/EXPLORE.md).
 
 The **Plans** view builds and reviews whole-library plans from the page: a dedupe plan (with a live estimate and a per-group choice of which copy stays), a consolidate plan (copy-only by default; cleaning up sources sits behind a guarded section), and the review of any plan, including the ones Claude proposes, with the same simulation and the same typed approval code. The Overview can also bridge files that have no comparable hash. See [docs/PLANS.md](docs/PLANS.md).
+
+The **Setup** screen (first item of the rail, `Alt+0`; a page opened with nothing to work on yet lands there) takes a person from `pip install` to a scanned catalog: it checks rclone, connects Google Drive, Dropbox, OneDrive or iCloud by signing in to the provider in a new tab (through rclone's own sign-in helper on `127.0.0.1:53682`, so drive-merge never sees a token), adopts rclone remotes you already have, tests them, runs the first scan with live counts, and later enables changes per cloud. Clouds are added read-only. Connecting and scanning are possible only from the page of a `drivemerge ui` started in your own terminal; otherwise the screen is read-only and shows the commands to run instead. See [docs/SETUP.md](docs/SETUP.md).
 
 API and MCP:
 

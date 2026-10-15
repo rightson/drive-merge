@@ -253,6 +253,13 @@ class MockApi:
         self.bridge_candidates = {"count": 3, "bytes": 2_400_000}
         self.bridge_polls = 0
         self.apply_draft_on_done = True
+        self.setup: dict | None = None              # what /v1/ui/setup reports; None = a server that does not know the route
+        self.connect_view: dict | None = None       # the connect job as GET /v1/jobs/setup-1 shows it
+        self.connect_next: list[dict] = []          # the views that follow, one per answer
+        self.connect_refusal: tuple[int, str, dict] | None = None   # status, code, params of POST /v1/ui/setup/connect
+        self.test_results: dict[str, dict] = {}     # POST /v1/ui/setup/test, by remote name (default {"ok": True})
+        self.enable_response: tuple[int, dict] = (200, {"remote": {"name": "dropbox", "write": "dropbox:"}})
+        self.scan_script: list[tuple[dict, Any]] = []   # (job view, effect run when it is served) for the scan job
         self.next_draft_id = 1
         self.next_action_id = 1
         self.draft = self._new_draft("整理 測試")
@@ -527,6 +534,72 @@ class MockApi:
                 base["approval_code"] = self.CODE
         return base
 
+    # ------------------------------------------------------------------ Setup (docs/SETUP.md section D)
+    def make_setup(self, *, clouds: list[tuple[str, str]] | None = None, scanned: bool = True, rclone_found: bool = True,
+                   loose: list[tuple[str, str]] | None = None, execution_enabled: bool = False, version: str = "v1.71.1") -> dict:
+        """Report this state from /v1/ui/setup: `clouds` are (name, provider) pairs, `loose` rclone remotes not yet added."""
+        remotes = []
+        for name, provider in clouds or []:
+            remotes.append({"name": name, "provider": provider, "read": f"{name}:", "write": None, "writable": False,
+                            "last_scan": {"id": 3, "status": "complete", "finished_at": "2024-03-01T10:00:00Z"} if scanned else None,
+                            "files": 41203 if scanned else 0, "bytes": 12_345_678_901 if scanned else 0})
+        self.setup = {
+            "config_path": "/home/me/.config/drive-merge/config.toml",
+            "rclone": {"found": rclone_found, "version": version if rclone_found else None, "ok": rclone_found, "binary": "rclone"},
+            "remotes": remotes,
+            "rclone_remotes": [{"name": r["name"], "type": r["provider"], "provider": r["provider"], "in_config": True} for r in remotes]
+            + [{"name": n, "type": ty, "provider": ty, "in_config": False} for n, ty in loose or []],
+            "scanned": bool(remotes) and scanned, "identity_built": bool(remotes) and scanned, "execution_enabled": execution_enabled,
+        }
+        return self.setup
+
+    def setup_json(self) -> dict:
+        s = self.setup or {}
+        return {**s, "needed": not s.get("remotes") or not s.get("scanned")}
+
+    def setup_routes(self, method: str, path: str, body: Any, headers: dict) -> tuple[int, Any] | None:
+        if self.setup is None:
+            return None
+        if (method, path) == ("GET", "/v1/ui/setup"):
+            return 200, self.setup_json()
+        if (method, path) == ("POST", "/v1/ui/setup/test"):
+            return 200, self.test_results.get((body or {}).get("name"), {"ok": True})
+        human = re.fullmatch(r"/v1/ui/setup/(connect|adopt|enable-write|connect/[\w-]+/answer|connect/[\w-]+/cancel)", path)
+        if method != "POST" or not human:
+            return None
+        if headers.get("x-csrf-token") != self.CSRF:
+            return 403, {"error": "bad csrf token", "code": "BAD_CSRF"}
+        if path == "/v1/ui/setup/connect":
+            if self.connect_refusal:
+                status, code, params = self.connect_refusal
+                return status, {"error": code, "code": code, "params": params}
+            return 202, {"job_id": "setup-1"}
+        if path == "/v1/ui/setup/adopt":
+            name = (body or {}).get("name")
+            loose = next((r for r in self.setup["rclone_remotes"] if r["name"] == name and not r["in_config"]), None)
+            if loose is None:
+                return 404, {"error": "no such remote", "code": "REMOTE_NOT_FOUND", "params": {"name": name}}
+            loose["in_config"] = True
+            remote = {"name": name, "provider": loose["provider"], "read": f"{name}:", "write": None, "writable": False,
+                      "last_scan": None, "files": 0, "bytes": 0}
+            self.setup["remotes"].append(remote)
+            self.setup["scanned"] = False
+            return 200, {"remote": remote}
+        if path == "/v1/ui/setup/enable-write":
+            return self.enable_response
+        if path.endswith("/answer"):
+            if not self.connect_view or self.connect_view["progress"].get("stage") != "question":
+                return 409, {"error": "not waiting", "code": "NOT_WAITING"}
+            self.connect_view = self.connect_next.pop(0) if self.connect_next else self._connect_done()
+            return 200, {"ok": True}
+        self.connect_view = {"id": "setup-1", "kind": "connect", "status": "failed", "progress": {}, "result": None,
+                             "error": "cancelled", "code": "CANCELLED", "params": {"name": "x"}}
+        return 200, {"ok": True}
+
+    def _connect_done(self) -> dict:
+        return {"id": "setup-1", "kind": "connect", "status": "done", "progress": {}, "error": None,
+                "result": {"remote": {"name": "dropbox", "provider": "dropbox", "read": "dropbox:", "write": None}}}
+
     # ------------------------------------------------------------------ HTTP
     def handle(self, route: Any, request: Any) -> None:
         url = urlparse(request.url)
@@ -628,8 +701,18 @@ class MockApi:
             if m.group(1) != "7" and int(m.group(1)) in self.plans:
                 self.plans[int(m.group(1))]["status"] = "approved"
             return 202, {"job_id": "job-1"}
+        setup = self.setup_routes(method, path, body, headers)
+        if setup is not None:
+            return setup
         if (method, path) == ("POST", "/v1/ui/rescan"):
-            return 202, {"job_id": "job-2"}
+            return 202, {"job_id": "scan-1" if self.scan_script else "job-2"}
+        if (method, path) == ("GET", "/v1/jobs/setup-1") and self.connect_view is not None:
+            return 200, self.connect_view
+        if (method, path) == ("GET", "/v1/jobs/scan-1") and self.scan_script:
+            view, effect = self.scan_script[0] if len(self.scan_script) == 1 else self.scan_script.pop(0)
+            if effect:
+                effect()
+            return 200, view
         m = re.fullmatch(r"/v1/jobs/(job-\d)", path)
         if m:
             if m.group(1) == "job-3":
@@ -3672,7 +3755,7 @@ def _query(ui: Ui) -> dict:
 def test_plans_sits_between_compare_and_the_workspace_and_alt_5_opens_it(make_ui):
     ui = make_ui(locale="en-US").open()
     order = ui.page.eval_on_selector_all('[data-testid="rail"] a', "els => els.map(e => e.dataset.testid)")
-    assert order == ["rail-overview", "rail-explore", "rail-compare", "rail-plans", "rail-workspace"]
+    assert order == ["rail-setup", "rail-overview", "rail-explore", "rail-compare", "rail-plans", "rail-workspace"]
     ui.page.keyboard.press("Alt+5")
     expect(ui.tid("rail-plans")).to_have_attribute("aria-current", "page")
     expect(ui.tid("view-plans")).to_be_visible()
@@ -4168,3 +4251,474 @@ def test_screenshots_of_the_plans_view(make_ui, scheme, locale, width):
     expect(ui.tid("bridge-candidates")).to_contain_text("3")
     ui.page.screenshot(path=str(SHOTS / f"plans-bridge-{tag}.png"))
     assert (SHOTS / f"plans-list-{tag}.png").stat().st_size > 5_000
+
+
+# =========================================================================== Setup (docs/SETUP.md)
+
+def _job(progress: dict, status: str = "running", **extra: Any) -> dict:
+    return {"id": "setup-1", "kind": "connect", "status": status, "progress": progress, "result": None, "error": None, **extra}
+
+
+SIGNIN = _job({"stage": "signin", "auth_url": "http://127.0.0.1:53682/auth?state=abc"})
+
+
+def _question(**kw: Any) -> dict:
+    q = {"name": "config_driveid", "help": "Select a drive.\nSecond line", "default": "", "examples": [], "password": False,
+         "required": False, "exclusive": False, "type": "string"}
+    return {"stage": "question", "question": {**q, **kw}}
+
+
+def _setup_page(make_ui, *, clouds=(), scanned=False, via_route=False, **kw) -> Ui:
+    opts = {k: kw.pop(k) for k in ("locale", "approvals_enabled", "width", "height", "color_scheme") if k in kw}
+    ui = make_ui(**{"locale": "en-US", **opts})
+    ui.mock.make_setup(clouds=list(clouds), scanned=scanned, **kw)
+    ui.page.goto(f"{ui.base}/ui/#token={MockApi.TOKEN}")
+    if via_route:
+        expect(ui.tid("pane-left")).to_be_visible()
+        ui.go("#/setup")
+    expect(ui.tid("view-setup")).to_be_visible()
+    return ui
+
+
+def test_a_server_that_does_not_know_setup_lands_on_the_workspace_and_the_rail_has_setup_first(make_ui):
+    ui = make_ui(locale="en-US").open()                       # /v1/ui/setup is not mocked: 404
+    assert ui.page.evaluate("location.hash") == ""
+    order = ui.page.eval_on_selector_all('[data-testid="rail"] a', "els => els.map(e => e.dataset.testid)")
+    assert order[0] == "rail-setup" and len(order) == 6
+    expect(ui.tid("rail-setup")).to_have_attribute("title", re.compile(r"\(Alt\+0\)"))
+    ui.page.keyboard.press("Alt+0")
+    expect(ui.tid("view-setup")).to_be_visible()
+    ui.page.keyboard.press("Alt+1")
+    expect(ui.tid("rail-overview")).to_have_attribute("aria-current", "page")
+
+
+def test_setup_without_needed_changes_nothing_and_needed_redirects_only_a_page_without_a_route(make_ui):
+    ui = make_ui(locale="en-US")
+    ui.mock.make_setup(clouds=[("gdrive", "drive")], scanned=True)           # needed: false
+    ui.open()
+    assert ui.page.evaluate("location.hash") == ""
+    ui = make_ui(locale="en-US")
+    ui.mock.make_setup()                                                      # no remote: needed
+    ui.page.goto(f"{ui.base}/ui/#token={MockApi.TOKEN}")
+    expect(ui.tid("view-setup")).to_be_visible()
+    assert ui.page.evaluate("location.hash") == "#/setup"
+    ui = make_ui(locale="en-US")
+    ui.mock.make_setup()
+    ui.page.goto(f"{ui.base}/ui/#token={MockApi.TOKEN}")
+    expect(ui.tid("view-setup")).to_be_visible()
+    ui = make_ui(locale="en-US")
+    ui.mock.make_setup()
+    ui.page.goto(f"{ui.base}/ui/?x=1")                                        # a route wins over the redirect
+    ui.page.goto(f"{ui.base}/ui/#/overview")
+    ui.mock.session_open = True
+    ui.page.reload()
+    expect(ui.tid("view-overview")).to_be_visible()
+
+
+def test_the_four_steps_show_their_state(make_ui):
+    ui = _setup_page(make_ui)
+    for step, state in (("rclone", "done"), ("clouds", "todo"), ("scan", "todo"), ("ready", "todo")):
+        expect(ui.tid(f"setup-step-{step}")).to_have_attribute("data-state", state)
+    expect(ui.tid("setup-state-clouds")).to_have_text("Not yet")
+    expect(ui.tid("setup-open-overview")).to_be_disabled()
+    ui = _setup_page(make_ui, clouds=[("gdrive", "drive"), ("dropbox", "dropbox")], scanned=False)
+    expect(ui.tid("setup-step-clouds")).to_have_attribute("data-state", "done")
+    expect(ui.tid("setup-step-scan")).to_have_attribute("data-state", "attention")
+    ui = _setup_page(make_ui, clouds=[("gdrive", "drive")], scanned=True, via_route=True)
+    for step in ("rclone", "clouds", "scan", "ready"):
+        expect(ui.tid(f"setup-step-{step}")).to_have_attribute("data-state", "done")
+    expect(ui.tid("setup-files-gdrive")).to_have_text("41,203 files")
+    expect(ui.tid("setup-execution")).to_contain_text("switched off")
+    ui.tid("setup-open-overview").click()
+    expect(ui.tid("view-overview")).to_be_visible()
+
+
+def test_a_missing_rclone_needs_attention_and_blocks_connecting(make_ui):
+    ui = _setup_page(make_ui, rclone_found=False)
+    expect(ui.tid("setup-step-rclone")).to_have_attribute("data-state", "attention")
+    expect(ui.tid("setup-rclone-text")).to_contain_text('"rclone"')
+    expect(ui.tid("setup-rclone-install")).to_have_attribute("rel", "noopener")
+    expect(ui.tid("setup-connect")).to_be_disabled()
+
+
+def test_connecting_a_cloud_signs_in_through_a_link_answers_a_question_and_lists_the_cloud(make_ui):
+    ui = _setup_page(make_ui)
+    ui.mock.connect_view = SIGNIN
+    ui.tid("setup-connect").click()
+    expect(ui.tid("connect-dialog")).to_be_visible()
+    ui.tid("connect-name").fill("bad name!")
+    expect(ui.tid("connect-start")).to_be_disabled()
+    expect(ui.tid("connect-name-help")).to_contain_text("Invalid name")
+    ui.tid("connect-provider-dropbox").check()
+    ui.tid("connect-name").fill("dbx")
+    ui.tid("connect-start").click()
+    assert ui.mock.last("POST", "/v1/ui/setup/connect").body == {"provider": "dropbox", "name": "dbx"}
+    assert ui.mock.last("POST", "/v1/ui/setup/connect").headers["x-csrf-token"] == MockApi.CSRF
+    link = ui.tid("connect-signin-link")
+    expect(link).to_have_attribute("href", "http://127.0.0.1:53682/auth?state=abc")
+    expect(link).to_have_attribute("target", "_blank")
+    expect(link).to_have_attribute("rel", "noopener")
+    expect(link).to_have_text("Open the sign-in page")
+    link.evaluate("e => e.addEventListener('click', ev => ev.preventDefault())")
+    link.click()
+    expect(link).to_have_text("Open it again")
+    ui.mock.connect_view = _job(_question(name="config_driveid", exclusive=True, default="a1", help="Which drive?",
+                                          examples=[{"value": "a1", "help": "OneDrive (personal)"}, {"value": "b2", "help": "Documents"}]))
+    expect(ui.tid("connect-question")).to_be_visible()
+    expect(ui.tid("connect-q-help")).to_contain_text("Which drive?")
+    expect(ui.tid("connect-q-help")).to_contain_text("From rclone")
+    expect(ui.tid("connect-q-option-0")).to_be_checked()
+    ui.tid("connect-q-option-1").check()
+    ui.mock.make_setup(clouds=[("dbx", "dropbox")], scanned=False)
+    ui.mock.connect_next = [_job({}, status="done", result={"remote": {"name": "dbx", "provider": "dropbox", "write": None}})]
+    ui.tid("connect-q-continue").click()
+    assert ui.mock.last("POST", "/v1/ui/setup/connect/setup-1/answer").body == {"result": "b2"}
+    expect(ui.tid("connect-done")).to_contain_text("dbx is connected (read-only)")
+    expect(ui.tid("setup-cloud-dbx")).to_contain_text("read-only")
+    ui.tid("connect-close").click()
+    expect(ui.tid("connect-dialog")).to_have_count(0)
+
+
+def test_a_sign_in_link_that_is_not_rclones_local_helper_is_never_shown(make_ui):
+    ui = _setup_page(make_ui)
+    ui.mock.connect_view = _job({"stage": "signin", "auth_url": "http://evil.example/auth?state=x"})
+    ui.tid("setup-connect").click()
+    ui.tid("connect-start").click()
+    expect(ui.tid("connect-working")).to_be_visible()
+    expect(ui.tid("connect-signin-link")).to_have_count(0)
+
+
+def test_every_kind_of_question_has_its_input(make_ui):
+    ui = _setup_page(make_ui)
+    ui.mock.connect_view = SIGNIN
+    ui.tid("setup-connect").click()
+    ui.tid("connect-start").click()
+    expect(ui.tid("connect-signin")).to_be_visible()
+
+    def ask(**kw):
+        ui.mock.connect_view = _job(_question(**kw))
+        expect(ui.tid("connect-question")).to_have_attribute("data-name", kw.get("name", "config_driveid"))
+
+    ask(name="use_local", type="bool", default="true", exclusive=True, examples=[{"value": "true", "help": "Yes"}, {"value": "false", "help": "No"}])
+    ui.mock.connect_next = [_job(_question(name="folder", default="root", required=True))]
+    ui.tid("connect-q-no").click()
+    assert ui.mock.last("POST", "/v1/ui/setup/connect/setup-1/answer").body == {"result": "false"}
+    expect(ui.tid("connect-q-input")).to_have_value("root")
+    ui.tid("connect-q-input").fill("")
+    expect(ui.tid("connect-q-continue")).to_be_disabled()                 # required
+    ui.tid("connect-q-input").fill("Archive")
+    ui.mock.connect_next = [_job(_question(name="region", examples=[{"value": "eu", "help": "Europe"}, {"value": "us", "help": "US"}]))]
+    ui.page.keyboard.press("Enter")                                       # Enter submits; nothing navigates
+    assert ui.mock.last("POST", "/v1/ui/setup/connect/setup-1/answer").body == {"result": "Archive"}
+    expect(ui.tid("connect-q-select")).to_be_visible()
+    ui.tid("connect-q-select").select_option(index=2)
+    expect(ui.tid("connect-q-input")).to_have_value("us")
+    expect(ui.tid("connect-q-continue")).to_be_enabled()                  # optional answers may be empty too
+    assert "?" not in ui.page.url
+
+
+def test_a_password_never_reaches_the_url_storage_or_a_toast(make_ui):
+    secret = "s3cret-Pa55-xyz"
+    ui = _setup_page(make_ui)
+    ui.mock.connect_view = SIGNIN
+    ui.tid("setup-connect").click()
+    ui.tid("connect-provider-iclouddrive").check()
+    ui.tid("connect-apple-id").fill("me@example.com")
+    ui.tid("connect-apple-password").fill("icloud-pw")
+    ui.tid("connect-start").click()
+    ui.mock.connect_view = _job(_question(name="password", password=True, required=True, help="Password."))
+    field = ui.tid("connect-q-input")
+    expect(field).to_have_attribute("type", "password")
+    field.fill(secret)
+    ui.mock.connect_next = [_job(_question(name="2fa_code", required=True, help="Enter the code."))]
+    before = ui.page.url
+    ui.tid("connect-q-continue").click()
+    assert ui.mock.last("POST", "/v1/ui/setup/connect/setup-1/answer").body == {"result": secret}
+    expect(ui.tid("connect-q-name")).to_have_text("2fa_code")
+    assert ui.page.url == before and secret not in ui.page.url
+    storage = ui.page.evaluate("JSON.stringify([localStorage, sessionStorage])")
+    assert secret not in storage
+    assert secret not in ui.tid("toasts").inner_text() and secret not in ui.page.locator("body").inner_text()
+    for call in ui.mock.calls:
+        assert secret not in call.path and secret not in json.dumps(call.query)
+        if call.method == "GET":
+            assert call.body is None
+
+
+def test_cancelling_stops_the_sign_in_and_adds_nothing(make_ui):
+    ui = _setup_page(make_ui)
+    ui.mock.connect_view = SIGNIN
+    ui.tid("setup-connect").click()
+    ui.tid("connect-start").click()
+    expect(ui.tid("connect-signin")).to_be_visible()
+    ui.page.keyboard.press("Escape")                                       # a running sign-in is not dismissed by accident
+    expect(ui.tid("connect-dialog")).to_be_visible()
+    ui.tid("connect-cancel").click()
+    assert ui.mock.calls_to("POST", "/v1/ui/setup/connect/setup-1/cancel")
+    expect(ui.tid("connect-dialog")).to_have_count(0)
+    expect(ui.tid("toast").first).to_contain_text("Nothing was added")
+
+
+@pytest.mark.parametrize("code, params, text", [
+    ("SIGNIN_TIMEOUT", {"name": "x"}, "within 10 minutes"),
+    ("CONFIG_WRITE", {"name": "x"}, "could not write its config file"),
+    ("RCLONE_ERROR", {"name": "x", "detail": "Failed to configure token: oauth2: cannot fetch"}, "rclone reported an error"),
+])
+def test_a_failed_connect_is_worded_from_its_code(make_ui, code, params, text):
+    ui = _setup_page(make_ui)
+    ui.mock.connect_view = SIGNIN
+    ui.tid("setup-connect").click()
+    ui.tid("connect-start").click()
+    ui.mock.connect_view = _job({}, status="failed", error="English message", code=code, params=params)
+    expect(ui.tid("connect-failed-text")).to_contain_text(text)
+    expect(ui.tid("connect-failed-text")).to_have_attribute("data-code", code)
+    if "detail" in params:
+        expect(ui.tid("connect-failed-detail")).to_contain_text("oauth2")
+    ui.tid("connect-retry").click()
+    expect(ui.tid("connect-name")).to_be_visible()
+
+
+def test_a_refused_connect_shows_the_reason_in_the_dialog(make_ui):
+    ui = _setup_page(make_ui)
+    ui.mock.connect_refusal = (409, "REMOTE_EXISTS", {"name": "gdrive"})
+    ui.tid("setup-connect").click()
+    ui.tid("connect-start").click()
+    expect(ui.tid("connect-error")).to_contain_text('"gdrive" already exists')
+
+
+def test_rclone_remotes_not_yet_in_drive_merge_can_be_adopted(make_ui):
+    ui = _setup_page(make_ui, clouds=[("gdrive", "drive")], scanned=True, loose=[("work-od", "onedrive")], via_route=True)
+    expect(ui.tid("setup-adopt-work-od")).to_contain_text("Found in rclone: work-od (onedrive)")
+    ui.tid("setup-adopt-add-work-od").click()
+    assert ui.mock.last("POST", "/v1/ui/setup/adopt").body == {"name": "work-od"}
+    expect(ui.tid("setup-cloud-work-od")).to_be_visible()
+    expect(ui.tid("setup-adopt-work-od")).to_have_count(0)
+    expect(ui.tid("setup-step-scan")).to_have_attribute("data-state", "attention")
+
+
+def test_testing_a_cloud_words_the_result_from_its_code(make_ui):
+    ui = _setup_page(make_ui, clouds=[("gdrive", "drive"), ("dropbox", "dropbox")], scanned=True, via_route=True)
+    ui.tid("setup-test-gdrive").click()
+    expect(ui.tid("setup-test-result-gdrive")).to_contain_text("Works")
+    assert ui.mock.last("POST", "/v1/ui/setup/test").body == {"name": "gdrive"}
+    for code, text in (("AUTH_EXPIRED", "expired or was revoked"), ("NETWORK", "could not reach the cloud"), ("NOT_FOUND", "Not found"),
+                       ("RCLONE_ERROR", "rclone reported an error")):
+        ui.mock.test_results["dropbox"] = {"ok": False, "code": code, "params": {}}
+        ui.tid("setup-test-dropbox").click()
+        expect(ui.tid("setup-test-result-dropbox")).to_contain_text(text)
+        expect(ui.tid("setup-test-result-dropbox")).to_have_attribute("data-ok", "false")
+    ui.mock.test_results["dropbox"] = {"ok": False, "code": "AUTH_EXPIRED", "params": {}}
+    ui.tid("setup-test-dropbox").click()
+    expect(ui.tid("setup-test-result-dropbox")).to_contain_text("rclone config reconnect dropbox:")
+
+
+def test_the_first_scan_shows_live_counts_per_cloud_and_ends_with_four_green_steps(make_ui):
+    ui = _setup_page(make_ui, clouds=[("gdrive", "drive"), ("dropbox", "dropbox")], scanned=False)
+    mock = ui.mock
+
+    def running(remote: str, i: int, files: int) -> dict:
+        return {"id": "scan-1", "kind": "rescan", "status": "running", "result": None, "error": None,
+                "progress": {"remotes": ["gdrive", "dropbox"], "remotes_total": 2, "remote": remote, "remote_index": i,
+                             "files": files, "dirs": 0, "bytes": 0}}
+
+    def scanned(*names: str):
+        def effect():
+            for r in mock.setup["remotes"]:
+                if r["name"] in names:
+                    r.update(last_scan={"id": 3, "status": "complete", "finished_at": "2024-03-01T10:00:00Z"}, files=41203, bytes=5_000_000)
+            mock.setup["scanned"] = len(names) == 2
+            mock.setup["identity_built"] = len(names) == 2
+        return effect
+
+    mock.scan_script = [(running("gdrive", 1, 1200), None)]
+    ui.tid("setup-scan-all").click()
+    assert mock.last("POST", "/v1/ui/rescan").body == {"remotes": ["gdrive", "dropbox"]}
+    expect(ui.tid("setup-files-gdrive")).to_have_text("1,200 files")
+    expect(ui.tid("setup-scan-dropbox")).to_have_attribute("data-kind", "waiting")
+    expect(ui.tid("setup-scan-all")).to_be_disabled()
+    mock.scan_script = [(running("dropbox", 2, 300), scanned("gdrive"))]
+    expect(ui.tid("setup-files-gdrive")).to_have_text("41,203 files")
+    expect(ui.tid("setup-files-dropbox")).to_have_text("300 files")
+    expect(ui.tid("setup-scan-text")).to_contain_text("Scanning dropbox (2/2)")
+    mock.scan_script = [({"id": "scan-1", "kind": "rescan", "status": "running", "result": None, "error": None,
+                          "progress": {"stage": "identity", "remotes": ["gdrive", "dropbox"], "remotes_total": 2}}, scanned("gdrive", "dropbox"))]
+    expect(ui.tid("setup-scan-text")).to_contain_text("content identities")
+    mock.scan_script = [({"id": "scan-1", "kind": "rescan", "status": "done", "progress": {}, "error": None,
+                          "result": {"scans": [], "identity": {}}}, scanned("gdrive", "dropbox"))]
+    expect(ui.tid("setup-step-scan")).to_have_attribute("data-state", "done")
+    expect(ui.tid("setup-step-ready")).to_have_attribute("data-state", "done")
+    expect(ui.tid("setup-open-overview")).to_be_enabled()
+    expect(ui.tid("toast").first).to_contain_text("Scan finished")
+
+
+def test_a_failed_scan_says_so(make_ui):
+    ui = _setup_page(make_ui, clouds=[("gdrive", "drive")], scanned=False)
+    ui.mock.scan_script = [({"id": "scan-1", "kind": "rescan", "status": "failed", "progress": {}, "result": None,
+                             "error": "scan did not complete for: gdrive"}, None)]
+    ui.tid("setup-scan-one-gdrive").click()
+    assert ui.mock.last("POST", "/v1/ui/rescan").body == {"remotes": ["gdrive"]}
+    expect(ui.tid("setup-scan-failed")).to_contain_text("did not finish")
+    expect(ui.tid("setup-step-scan")).to_have_attribute("data-state", "attention")
+
+
+def test_enabling_changes_on_drive_goes_through_a_second_sign_in_and_on_dropbox_is_immediate(make_ui):
+    ui = _setup_page(make_ui, clouds=[("gdrive", "drive"), ("dropbox", "dropbox")], scanned=True, via_route=True)
+    ui.mock.enable_response = (202, {"job_id": "setup-1"})
+    ui.mock.connect_view = SIGNIN
+    ui.tid("setup-enable-gdrive").click()
+    expect(ui.tid("dialog")).to_contain_text("gdrive-rw")
+    ui.tid("dialog-ok").click()
+    assert ui.mock.last("POST", "/v1/ui/setup/enable-write").body == {"name": "gdrive"}
+    expect(ui.tid("connect-signin-link")).to_be_visible()
+    ui.mock.connect_view = _job({}, status="done", result={"remote": {"name": "gdrive", "write": "gdrive-rw:"}})
+    expect(ui.tid("connect-done")).to_contain_text("a plan you approve can now change")
+    expect(ui.tid("connect-scan")).to_have_count(0)
+    ui.tid("connect-close").click()
+    expect(ui.tid("connect-dialog")).to_have_count(0)
+    ui.mock.enable_response = (200, {"remote": {"name": "dropbox", "write": "dropbox:"}})
+    ui.tid("setup-enable-dropbox").click()
+    ui.tid("dialog-ok").click()
+    assert ui.mock.last("POST", "/v1/ui/setup/enable-write").body == {"name": "dropbox"}
+    expect(ui.tid("toast").first).to_contain_text("dropbox can now be changed")
+
+
+def test_without_approvals_the_screen_is_read_only_and_shows_commands_and_a_remotes_block(make_ui):
+    ui = _setup_page(make_ui, approvals_enabled=False, clouds=[("gdrive", "drive")], scanned=True, loose=[("work-od", "onedrive")], via_route=True)
+    expect(ui.tid("setup-readonly")).to_be_visible()
+    expect(ui.tid("setup-cmd-rclone")).to_have_text("rclone config")
+    block = ui.tid("setup-cmd-remotes").inner_text()
+    assert '[[remotes]]' in block and 'name = "work-od"' in block and 'provider = "onedrive"' in block and 'read = "work-od:"' in block
+    expect(ui.tid("setup-cmd-scan")).to_contain_text("drivemerge scan --all")
+    for testid in ("setup-connect", "setup-scan-all", "setup-scan-one-gdrive", "setup-enable-gdrive", "setup-adopt-add-work-od"):
+        expect(ui.tid(testid)).to_have_count(0)
+    expect(ui.tid("setup-test-gdrive")).to_be_enabled()                     # testing only reads
+    assert not [c for c in ui.mock.calls if c.method == "POST" and "/setup/" in c.path]
+
+
+def test_setup_speaks_both_languages_and_switches_without_a_reload(make_ui):
+    ui = _setup_page(make_ui, clouds=[("gdrive", "drive")], scanned=True, locale="zh-TW", via_route=True)
+    expect(ui.tid("setup-state-rclone")).to_have_text("已完成")
+    expect(ui.tid("setup-connect")).to_have_text(re.compile("連接雲端"))
+    ui.tid("view-lang").click()
+    expect(ui.tid("setup-state-rclone")).to_have_text("Done")
+    expect(ui.tid("setup-connect")).to_have_text(re.compile("Connect a cloud"))
+    ui.tid("setup-connect").click()
+    expect(ui.tid("connect-start")).to_have_text("Sign in")
+
+
+def test_the_overview_empty_state_links_to_setup(make_ui):
+    ui = make_ui(locale="en-US").open()
+    ui.mock.coverage_override = {"remotes": [], "totals": {"contents": 0, "bytes": 0, "stored_bytes": 0, "redundant_bytes": 0, "copies": 0},
+                                 "intersections": [], "other": None}
+    ui.go("#/overview")
+    ui.tid("ov-setup-link").click()
+    expect(ui.tid("view-setup")).to_be_visible()
+
+
+def test_the_keys_setup_builds_at_run_time_exist_in_both_languages(make_ui):
+    ui = make_ui(locale="en-US")
+    ui.page.goto(f"{ui.base}/ui/#token={MockApi.TOKEN}")
+    dicts = ui.page.evaluate("import('/ui/static/i18n.js').then(m => m.dictionaries)")
+    keys = [f"setup.provider.{p}" for p in ("drive", "dropbox", "onedrive", "iclouddrive", "local", "other")]
+    keys += ["connect.field.apple_id", "connect.field.password", "setup.enable.textDrive", "setup.enable.textOther", "prog.stage.identity", "prog.stage.dir_stats"]
+    sent = {"BAD_NAME": set(), "REMOTE_EXISTS": {"name"}, "REMOTE_NOT_FOUND": {"name"}, "CONFIG_LAYOUT": set(), "RCLONE_MISSING": {"binary"},
+            "NOT_WAITING": set(), "NO_CONFIG_PATH": set(), "SIGNIN_TIMEOUT": set(), "CANCELLED": set(), "RCLONE_ERROR": set(),
+            "CONFIG_WRITE": set(), "AUTH_EXPIRED": set(), "NOT_FOUND": set(), "NETWORK": set(), "MISSING_FIELD": {"field"}}
+    for lang in ("zh-TW", "en"):
+        for key in keys:
+            assert key in dicts[lang], (lang, key)
+        for code, params in sent.items():
+            raw = dicts[lang][f"err.{code}"]
+            assert set(re.findall(r"\{(\w+)\}", raw)) <= params, (lang, code)
+    for code in sent:
+        if code not in ("BAD_NAME", "NOT_FOUND"):
+            assert re.search(r"[一-鿿]", dicts["zh-TW"][f"err.{code}"]) and not re.search(r"[一-鿿]", dicts["en"][f"err.{code}"]), code
+
+
+@pytest.mark.parametrize("scheme", ["light", "dark"])
+@pytest.mark.parametrize("locale", ["en-US", "zh-TW"])
+@pytest.mark.parametrize("width", [1440, 900])
+def test_screenshots_of_the_setup_screen(make_ui, scheme, locale, width):
+    SHOTS.mkdir(parents=True, exist_ok=True)
+    tag = f"{scheme}-{locale}-{width}"
+
+    ui = _setup_page(make_ui, locale=locale, color_scheme=scheme, width=width, loose=[("work-od", "onedrive")])
+    page = ui.page
+
+    def snap(name: str) -> None:
+        page.screenshot(path=str(SHOTS / f"setup-{name}-{tag}.png"))
+        assert (SHOTS / f"setup-{name}-{tag}.png").stat().st_size > 5_000
+
+    snap("fresh")
+    ui.mock.connect_view = SIGNIN
+    ui.tid("setup-connect").click()
+    snap("connect")
+    ui.tid("connect-start").click()
+    expect(ui.tid("connect-signin")).to_be_visible()
+    snap("signin")
+    ui.mock.connect_view = _job(_question(
+        name="config_driveid", exclusive=True, default="a1", help="Select a drive to use.\nThe personal drive is the default.",
+        examples=[{"value": "a1", "help": "OneDrive (personal)"}, {"value": "b2", "help": "Documents (business)"}]))
+    expect(ui.tid("connect-question")).to_be_visible()
+    snap("question")
+    ui.mock.connect_view = _job({}, status="done", result={"remote": {"name": "gdrive", "write": None}})
+    expect(ui.tid("connect-done")).to_be_visible()
+    ui.mock.make_setup(clouds=[("gdrive", "drive"), ("dropbox", "dropbox")], scanned=False)
+    ui.tid("connect-close").click()
+    ui.tid("setup-refresh").click()
+    expect(ui.tid("setup-cloud-gdrive")).to_be_visible()
+    ui.mock.scan_script = [({"id": "scan-1", "kind": "rescan", "status": "running", "result": None, "error": None,
+                             "progress": {"remotes": ["gdrive", "dropbox"], "remotes_total": 2, "remote": "dropbox", "remote_index": 2,
+                                          "files": 12004, "dirs": 0, "bytes": 0}}, None)]
+    ui.tid("setup-scan-all").click()
+    expect(ui.tid("setup-files-dropbox")).to_have_text(re.compile("12,004"))
+    snap("scanning")
+    ui.mock.make_setup(clouds=[("gdrive", "drive"), ("dropbox", "dropbox")], scanned=True)
+    ui.mock.scan_script = [({"id": "scan-1", "kind": "rescan", "status": "done", "progress": {}, "error": None, "result": {}}, None)]
+    expect(ui.tid("setup-step-ready")).to_have_attribute("data-state", "done")
+    snap("done")
+    ui2 = _setup_page(make_ui, locale=locale, color_scheme=scheme, width=width, approvals_enabled=False, loose=[("work-od", "onedrive")])
+    ui2.page.screenshot(path=str(SHOTS / f"setup-readonly-{tag}.png"))
+
+
+def test_icloud_asks_for_the_apple_id_and_password_up_front_and_keeps_them_out_of_the_url_storage_and_toasts(make_ui):
+    password = "apple-Pa55-word"
+    ui = _setup_page(make_ui)
+    ui.mock.connect_view = _job({"stage": "starting", "name": "icloud", "provider": "iclouddrive", "mode": "new"})
+    ui.tid("setup-connect").click()
+    ui.tid("connect-provider-iclouddrive").check()
+    expect(ui.tid("connect-apple-password")).to_have_attribute("type", "password")
+    expect(ui.tid("connect-start")).to_be_disabled()                       # both fields are required
+    ui.tid("connect-apple-id").fill("me@example.com")
+    ui.tid("connect-apple-password").fill(password)
+    before = ui.page.url
+    ui.tid("connect-start").click()
+    body = ui.mock.last("POST", "/v1/ui/setup/connect").body
+    assert body == {"provider": "iclouddrive", "name": "icloud", "apple_id": "me@example.com", "password": password}
+    ui.mock.connect_view = _job({**_question(name="config_2fa", required=True, help="2FA code"), "name": "icloud",
+                                 "provider": "iclouddrive", "mode": "new", "retry": True})
+    expect(ui.tid("connect-q-retry")).to_contain_text("did not accept")
+    assert ui.page.url == before and password not in ui.page.url
+    assert password not in ui.page.evaluate("JSON.stringify([localStorage, sessionStorage])")
+    assert password not in ui.page.locator("body").inner_text()
+    assert all(password not in c.path and password not in json.dumps(c.query) for c in ui.mock.calls)
+
+
+def test_remote_auth_is_offered_as_an_option_and_sent_only_when_ticked(make_ui):
+    ui = _setup_page(make_ui)
+    ui.mock.connect_view = SIGNIN
+    ui.tid("setup-connect").click()
+    ui.tid("connect-remote-auth").check()
+    ui.tid("connect-start").click()
+    assert ui.mock.last("POST", "/v1/ui/setup/connect").body == {"provider": "drive", "name": "gdrive", "remote_auth": True}
+
+
+def test_a_busy_server_and_a_missing_field_are_worded_on_the_setup_screen(make_ui):
+    ui = _setup_page(make_ui, clouds=[("gdrive", "drive")], scanned=False)
+    ui.mock.connect_refusal = (400, "MISSING_FIELD", {"field": "apple_id"})
+    ui.tid("setup-connect").click()
+    ui.tid("connect-start").click()
+    expect(ui.tid("connect-error")).to_contain_text('"Apple ID" is required')
+    ui.mock.connect_refusal = (409, "JOB_BUSY", {})
+    ui.tid("connect-start").click()
+    expect(ui.tid("connect-error")).to_contain_text("sign-in that is still open")

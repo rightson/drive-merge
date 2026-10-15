@@ -15,15 +15,17 @@ from __future__ import annotations
 import dataclasses
 import sqlite3
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 from . import (
     builders, classify, compare, coverage, db, dirstats, executor, explore, identity, plans, search, simulate,
     suggest, workspace,
 )
-from .config import Config, sync_remotes
+from .config import Config, provider_of, sync_remotes
 from .models import Plan
-from .rclone import Rclone
+from .rclone import Rclone, RcloneError
 from .scanner import scan_remote
 
 PLAN_KINDS = ("dedupe", "consolidate", "reorganize", "manual")
@@ -34,6 +36,7 @@ MAX_COVERAGE_BARS = 64
 MAX_GROUP_PAGE = 200       # dedupe groups an estimate lists per page
 SAMPLE_SKIPPED = 200       # skipped files a build result hands back
 # The first 8 characters of a digest ARE the approval code, and `snapshot` is what the digest binds to.
+SETUP_CACHE_S = 10.0       # how long the rclone version and remote listing a setup page asks for are kept
 SECRET_KEYS = frozenset({"digest", "approval_code", "snapshot"})
 
 
@@ -72,13 +75,30 @@ def draft_of(plan: Plan) -> int | None:
 
 
 class Service:
-    def __init__(self, config: Config, conn: sqlite3.Connection | None = None, rclone: Rclone | None = None):
+    def __init__(self, config: Config, conn: sqlite3.Connection | None = None, rclone: Rclone | None = None,
+                 config_path: str | Path | None = None):
         self.config = config
+        self.config_path = str(config_path) if config_path else None
         self.conn = conn if conn is not None else db.connect(config.db_path)
         sync_remotes(self.conn, config)
-        self.rclone = rclone or Rclone(
-            config.rclone_binary, config=config.rclone_config, extra_args=config.rclone_extra_args
-        )
+        self.rclone = rclone or self._make_rclone(config)
+        self._setup_cache: tuple[float, dict | None, list[dict]] | None = None
+        self._setup_lock = threading.Lock()
+
+    @staticmethod
+    def _make_rclone(config: Config) -> Rclone:
+        return Rclone(config.rclone_binary, config=config.rclone_config, extra_args=config.rclone_extra_args)
+
+    def reload_config(self, config: Config) -> None:
+        """Adopt a changed config (the setup screen added a cloud): sync its remotes into the catalog and rebuild
+        the rclone wrapper when its settings changed. A wrapper that was handed in (tests) is kept otherwise."""
+        old = self.config
+        self.config = config
+        sync_remotes(self.conn, config)
+        if (old.rclone_binary, old.rclone_config, old.rclone_extra_args) != (
+                config.rclone_binary, config.rclone_config, config.rclone_extra_args):
+            self.rclone = self._make_rclone(config)
+        self.forget_rclone()
 
     # ---------------------------------------------------------------- read
 
@@ -147,6 +167,59 @@ class Service:
             by_rule[p.rule] = by_rule.get(p.rule, 0) + 1
         return {"total": len(placements), "by_rule": by_rule, "sample": _plain(placements[:limit])}
 
+    # --------------------------------------------------------------- setup
+
+    def forget_rclone(self) -> None:
+        """Drop the cached rclone version and remote listing (a remote was just created, deleted or adopted)."""
+        with self._setup_lock:
+            self._setup_cache = None
+
+    def rclone_facts(self) -> tuple[dict | None, list[dict]]:
+        with self._setup_lock:
+            cached = self._setup_cache
+            if cached is not None and time.monotonic() - cached[0] < SETUP_CACHE_S:
+                return cached[1], cached[2]
+        info = self.rclone.version_info()
+        try:
+            listed = self.rclone.list_remotes() if info is not None else []
+        except RcloneError:
+            listed = []
+        with self._setup_lock:
+            self._setup_cache = (time.monotonic(), info, listed)
+        return info, listed
+
+    def setup_state(self) -> dict:
+        """What the Setup screen shows: rclone, the configured clouds with their scans, the rclone remotes that
+        could be added, and whether the first scan and identity rebuild are done. Read-only."""
+        info, listed = self.rclone_facts()
+        stats = {r["name"]: r for r in search.stats(self.conn)["remotes"]}
+        complete = {r[0] for r in self.conn.execute(
+            "SELECT DISTINCT r.name FROM scans s JOIN remotes r ON r.id = s.remote_id WHERE s.status = 'complete'")}
+        remotes = []
+        used: set[str] = set()
+        for r in self.config.remotes:
+            st = stats.get(r.name, {})
+            remotes.append({"name": r.name, "provider": r.provider, "read": r.read, "write": r.write,
+                            "writable": r.write is not None, "last_scan": st.get("last_scan"),
+                            "files": st.get("files", 0), "bytes": st.get("bytes", 0)})
+            if r.provider != "local":
+                used.update(p.split(":", 1)[0] for p in (r.read, r.write) if p and ":" in p)
+        last_scan = self.conn.execute(
+            "SELECT MAX(finished_at) FROM scans WHERE status = 'complete'").fetchone()[0]
+        built = self.conn.execute("SELECT value FROM meta WHERE key = 'identity_built_at'").fetchone()
+        scanned = bool(remotes) and all(r["name"] in complete for r in remotes)
+        return {
+            "config_path": self.config_path,
+            "rclone": {"found": info is not None, "version": info["version"] if info else None,
+                       "ok": bool(info and info["ok"]), "binary": self.config.rclone_binary},
+            "remotes": remotes,
+            "rclone_remotes": [{"name": r["name"], "type": r["type"], "provider": provider_of(r["type"]),
+                                "in_config": r["name"] in used} for r in listed],
+            "scanned": scanned,
+            "identity_built": bool(scanned and built and (last_scan is None or built[0] >= last_scan)),
+            "execution_enabled": self.config.safety.execution_enabled,
+        }
+
     # ------------------------------------------------------------ maintain
 
     def scan(self, remote: str, *, root: str = "", progress=None, force: bool = False) -> dict:
@@ -158,6 +231,9 @@ class Service:
 
     def rebuild_identity(self) -> dict:
         res = _plain(identity.rebuild_groups(self.conn))
+        with db.transaction(self.conn):         # lets the setup screen tell that this followed the last scan
+            self.conn.execute("INSERT INTO meta(key, value) VALUES ('identity_built_at', ?) "
+                              "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (db.utcnow(),))
         self.refresh_dir_stats()  # dup_files depends on the content groups just rebuilt
         return res
 

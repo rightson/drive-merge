@@ -121,3 +121,12 @@ export const reviewPlan = (id) => call('POST', `/v1/ui/plans/${id}/review`);
 export const cancelPlan = (id) => call('POST', `/v1/ui/plans/${id}/cancel`);
 export const bridgeCandidates = ({ maxBytes, limit } = {}) => call('GET', '/v1/ui/bridge/candidates', { query: { max_bytes: maxBytes, limit } });
 export const startBridge = ({ maxBytes, limit } = {}) => call('POST', '/v1/ui/bridge', { body: { max_bytes: maxBytes, limit } });
+
+// Setup (docs/SETUP.md section D). Connecting, answering, cancelling, adopting and enabling changes are the human channel.
+export const setupState = () => call('GET', '/v1/ui/setup', { quiet401: true });
+export const connect = (body) => call('POST', '/v1/ui/setup/connect', { body });
+export const answer = (jobId, result) => call('POST', `/v1/ui/setup/connect/${encodeURIComponent(jobId)}/answer`, { body: { result } });
+export const cancelConnect = (jobId) => call('POST', `/v1/ui/setup/connect/${encodeURIComponent(jobId)}/cancel`);
+export const adopt = (name) => call('POST', '/v1/ui/setup/adopt', { body: { name } });
+export const testRemote = (name) => call('POST', '/v1/ui/setup/test', { body: { name } });
+export const enableWrite = (name) => call('POST', '/v1/ui/setup/enable-write', { body: { name } });

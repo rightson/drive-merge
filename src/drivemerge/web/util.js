@@ -59,6 +59,7 @@ export function wordParams(ns, params) {
     if (typeof out[k] === 'string') out[k] = t(`${ns}.${k}.${out[k]}`, out, out[k]);
   }
   // Which side of a comparison a refusal is about ("left" | "right").
+  if (out.field === 'apple_id' || out.field === 'password') out.field = t(`connect.field.${out.field}`);
   if (out.side === 'left' || out.side === 'right') out.side = t(`cmp.side.${out.side}`);
   // The state a plan is in ('done', 'cancelled'), as a word of the page's language.
   if (typeof out.plan_status === 'string') out.plan_status = t(`pstatus.${out.plan_status}`, null, out.plan_status);

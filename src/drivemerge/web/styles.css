@@ -939,3 +939,117 @@ a.btn-primary { color: var(--accent-ink); }
 @media (prefers-reduced-motion: reduce) {
   .twisty-btn .icon { transition: none; }
 }
+
+/* ================================================================== Setup (docs/SETUP.md) */
+.su-body { max-width: 960px; width: 100%; margin: 0 auto; }
+.su-steps { display: flex; flex-direction: column; gap: 12px; }
+.su-step {
+  display: grid; grid-template-columns: 32px minmax(0, 1fr); gap: 14px; padding: 14px 16px 16px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+}
+.su-step[data-state="attention"] { border-color: var(--warn); }
+.su-mark {
+  display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; margin-top: 1px; border-radius: 50%;
+  background: var(--hover); border: 1px solid var(--border-strong); color: var(--muted); font-weight: 650; font-size: 13px;
+}
+.su-mark-done { background: var(--ok-bg); border-color: var(--ok); color: var(--ok); }
+.su-mark-attention { background: var(--warn-bg); border-color: var(--warn); color: var(--warn); }
+.su-main { min-width: 0; display: flex; flex-direction: column; gap: 8px; }
+.su-step-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; min-height: 30px; }
+.su-step-head h2 { margin: 0; font-size: 15px; }
+.su-state { display: inline-flex; align-items: center; height: 20px; padding: 0 8px; border-radius: 10px; font-size: 12px; font-weight: 600; background: var(--hover); color: var(--muted); }
+.su-state-done { background: var(--ok-bg); color: var(--ok); }
+.su-state-attention { background: var(--warn-bg); color: var(--warn); }
+.su-aside { color: var(--muted); font: 12px var(--mono); }
+.su-line { display: flex; align-items: flex-start; gap: 7px; margin: 0; }
+.su-line .icon { margin-top: 3px; color: var(--ok); }
+.su-line.warn .icon { color: var(--warn); }
+.su-line.muted { color: var(--muted); }
+.su-sub { margin: 0; color: var(--muted); font-size: 12.5px; display: flex; align-items: center; gap: 6px; overflow-wrap: anywhere; }
+.su-bad { color: var(--danger); }
+.su-ok { display: inline-flex; align-items: center; gap: 4px; color: var(--ok); font-size: 12.5px; font-weight: 600; }
+
+.su-clouds, .su-scans { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
+.su-cloud { padding: 8px 0; border-top: 1px solid var(--border); }
+.su-cloud:first-child, .su-scan:first-child { border-top: 0; }
+.su-cloud-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; min-height: 32px; }
+.su-cloud-row .cloud-name { min-width: 90px; }
+.su-test { display: flex; align-items: flex-start; gap: 6px; margin: 6px 0 0 2px; font-size: 12.5px; }
+.su-test .icon { margin-top: 2px; }
+.su-test.ok { color: var(--ok); }
+.su-test.bad { color: var(--danger); }
+.su-test code { background: rgba(127, 127, 127, 0.18); padding: 0 5px; border-radius: 4px; color: var(--text); }
+.su-actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-top: 4px; }
+.su-adopt { margin-top: 6px; padding: 10px 12px; background: var(--info-bg); border-radius: 8px; }
+.su-adopt h3 { margin: 0 0 6px; font-size: 13px; color: var(--info-ink); }
+.su-adopt ul { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.su-adopt li { display: flex; align-items: center; gap: 8px; }
+.su-scan { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 7px 0; border-top: 1px solid var(--border); min-height: 42px; }
+.su-scan .cloud-name { min-width: 110px; }
+.su-scan-state { flex: 1 1 200px; min-width: 0; display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; font-variant-numeric: tabular-nums; }
+.su-scan-state .icon { color: var(--ok); }
+.su-scan-state .su-bad .icon { color: var(--danger); }
+.su-progress { margin-top: 2px; }
+
+/* read-only fallback */
+.su-ro { padding: 14px 16px 16px; background: var(--info-bg); color: var(--text); border: 1px solid var(--border-strong); border-radius: var(--radius); }
+.su-ro h2 { display: flex; align-items: center; gap: 8px; margin: 0 0 6px; font-size: 15px; color: var(--info-ink); }
+.su-ro > p { margin: 0 0 10px; }
+.su-ro-steps { margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 10px; }
+.su-ro-steps p { margin: 0 0 4px; }
+.su-code { position: relative; }
+.su-code pre {
+  margin: 0; padding: 10px 76px 10px 12px; background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+  font-size: 12.5px; overflow: auto; white-space: pre; max-height: 220px;
+}
+.su-copy { position: absolute; top: 6px; right: 6px; }
+
+/* the connect dialog */
+.su-dialog h2 { margin: 0; }
+.su-providers { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.su-providers legend { grid-column: 1 / -1; }
+.su-provider { display: flex; align-items: center; gap: 8px; padding: 9px 11px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; cursor: pointer; }
+.su-provider.on { border-color: var(--accent); background: var(--accent-soft); }
+.su-provider input, .su-option input { accent-color: var(--accent); }
+.su-connect-form { display: flex; flex-direction: column; gap: 10px; }
+.su-connect-form .field input { width: 100%; }
+.su-advanced .field { margin-top: 8px; }
+.su-note { display: flex; gap: 7px; align-items: flex-start; margin: 0; color: var(--muted); font-size: 12.5px; }
+.su-note .icon { margin-top: 2px; }
+.su-run, .su-done, .su-failed { display: flex; flex-direction: column; gap: 10px; }
+.su-run p, .su-done p, .su-failed p { margin: 0; }
+.su-signin { display: flex; flex-direction: column; gap: 10px; }
+.su-link-btn { height: 36px; padding: 0 16px; text-decoration: none; }
+.su-working { display: flex; align-items: center; gap: 10px; color: var(--muted); padding: 6px 0; }
+.su-done-line, .su-failed-line { display: flex; align-items: center; gap: 8px; }
+.su-done-line .icon { color: var(--ok); }
+.su-failed-line .icon { color: var(--danger); }
+.su-question { display: flex; flex-direction: column; gap: 10px; }
+.su-q-title { margin: 0; font-size: 14px; font-weight: 600; }
+.su-q-title code { background: var(--hover); padding: 1px 7px; border-radius: 5px; font-size: 12.5px; }
+.su-rclone { border: 1px dashed var(--border-strong); border-radius: 8px; background: var(--surface-2); overflow: hidden; }
+.su-rclone-tag { display: flex; align-items: center; gap: 6px; padding: 4px 10px; font-size: 11.5px; color: var(--muted); border-bottom: 1px dashed var(--border-strong); }
+.su-rclone-text { margin: 0; padding: 8px 10px; font: 12.5px/1.5 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 210px; overflow: auto; }
+.su-options { display: flex; flex-direction: column; padding: 4px 6px 8px; max-height: 300px; overflow: auto; }
+.su-option { display: flex; align-items: flex-start; gap: 9px; padding: 6px 6px; border-radius: 6px; cursor: pointer; }
+.su-option:hover { background: var(--hover); }
+.su-option.on { background: var(--accent-soft); }
+.su-option input { margin-top: 3px; }
+.su-option-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.su-option-main code { font-size: 12.5px; overflow-wrap: anywhere; }
+.su-option-help { color: var(--muted); font-size: 12.5px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.su-bool { display: flex; gap: 8px; }
+.su-q-input { display: flex; flex-direction: column; gap: 8px; }
+.su-q-input .field input, .su-q-input .select { width: 100%; max-width: none; }
+.su-q-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.su-option-value { display: flex; align-items: center; gap: 8px; }
+
+@media (max-width: 920px) {
+  .su-providers { grid-template-columns: 1fr; }
+}
+
+.su-retry { display: flex; align-items: center; gap: 6px; margin: 0; padding: 6px 9px; border-radius: 7px; background: var(--warn-bg); color: var(--warn); font-size: 13px; }
+.su-icloud { display: flex; flex-direction: column; gap: 8px; }
+.su-icloud .field input { width: 100%; }
+.su-remote-auth { white-space: normal; align-items: flex-start; font-size: 12.5px; color: var(--muted); }
+.su-remote-auth input { margin-top: 3px; }

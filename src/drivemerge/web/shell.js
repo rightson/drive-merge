@@ -1,6 +1,6 @@
 // The rail and the router (docs/EXPLORE.md section F). The route lives in location.hash:
 //   #/overview   #/explore?q=...   #/compare?l=remote:path&r=remote:path   #/workspace
-//   #/plans   #/plans/<id>   #/plans/new/dedupe?...   #/plans/new/consolidate?...   (docs/PLANS.md)
+//   #/setup   #/plans   #/plans/<id>   #/plans/new/dedupe?...   #/plans/new/consolidate?...   (docs/PLANS.md)
 // No route (or the token exchange's #token=) means the workspace, so a page opened as before shows the workspace.
 import { html, useEffect, useState } from './vendor/htm-preact-standalone.mjs';
 import { t } from './i18n.js';
@@ -10,12 +10,15 @@ import { Overview } from './overview.js';
 import { Explore } from './explore.js';
 import { Compare } from './compare.js';
 import { Plans } from './plans.js';
+import { Setup } from './setup.js';
 
-// The keys Alt+1 ... Alt+5 select, in order; the rail shows Plans between Compare and the workspace.
+// The keys Alt+1 ... Alt+5 select, in order, and Alt+0 opens Setup; the rail shows Setup first and Plans between
+// Compare and the workspace.
 export const VIEWS = ['overview', 'explore', 'compare', 'workspace', 'plans'];
-export const RAIL = ['overview', 'explore', 'compare', 'plans', 'workspace'];
-const VIEW_ICON = { overview: 'chart', explore: 'search', compare: 'swap', workspace: 'columns', plans: 'plans' };
-const ROUTE = /^\/(overview|explore|compare|workspace)(?:\?(.*))?$/;
+export const RAIL = ['setup', 'overview', 'explore', 'compare', 'plans', 'workspace'];
+const VIEW_ICON = { setup: 'setup', overview: 'chart', explore: 'search', compare: 'swap', workspace: 'columns', plans: 'plans' };
+const shortcutOf = (view) => (view === 'setup' ? 0 : VIEWS.indexOf(view) + 1);
+const ROUTE = /^\/(setup|overview|explore|compare|workspace)(?:\?(.*))?$/;
 const PLANS_ROUTE = /^\/plans((?:\/[^?]*)?)(?:\?(.*))?$/;
 
 /** Where a plans route points: the list, one plan's review, or a form that creates a plan. */
@@ -72,14 +75,15 @@ export function useRoute() {
 
 const isTyping = (el) => !!el && (['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName) || el.isContentEditable);
 
-/** Alt+1 ... Alt+5 switch views; "/" jumps to the Explore box unless a text field has the keyboard. */
+/** Alt+0 opens Setup, Alt+1 ... Alt+5 switch the other views; "/" jumps to the Explore box unless a text field has the keyboard. */
 export function useShortcuts(route) {
   useEffect(() => {
     const onKey = (e) => {
       if (document.querySelector('.modal-backdrop')) return;
-      if (e.altKey && !e.ctrlKey && !e.metaKey && /^Digit[1-5]$/.test(e.code)) {
+      if (e.altKey && !e.ctrlKey && !e.metaKey && /^Digit[0-5]$/.test(e.code)) {
         e.preventDefault();
-        const view = VIEWS[Number(e.code.slice(5)) - 1];
+        const digit = Number(e.code.slice(5));
+        const view = digit === 0 ? 'setup' : VIEWS[digit - 1];
         navigate(remembered[view] || `#/${view}`);
         return;
       }
@@ -101,7 +105,7 @@ export function Rail({ route, waiting = 0 }) {
   return html`<nav class="rail" aria-label=${t('nav.label')} data-testid="rail">
     ${RAIL.map((view) => html`<a key=${view} class=${'rail-item' + (route.view === view ? ' on' : '')} href=${`#/${view}`}
       data-testid=${'rail-' + view} aria-current=${route.view === view ? 'page' : undefined}
-      title=${`${t(`nav.${view}Tip`)} (Alt+${VIEWS.indexOf(view) + 1})`}
+      title=${`${t(`nav.${view}Tip`)} (Alt+${shortcutOf(view)})`}
       onClick=${(e) => { if (e.ctrlKey || e.metaKey || e.shiftKey || e.button) return; e.preventDefault(); navigate(remembered[view] || `#/${view}`); }}>
       <${Icon} name=${VIEW_ICON[view]} size=${20} /><span class="rail-label">${t(`nav.${view}`)}</span>
       ${view === 'plans' && waiting > 0 && html`<span class="rail-badge" data-testid="rail-plans-badge" data-count=${waiting}
@@ -112,6 +116,7 @@ export function Rail({ route, waiting = 0 }) {
 
 /** The read-only views; the workspace is not here: it stays mounted by the App and is only hidden. */
 export function ViewHost({ route }) {
+  if (route.view === 'setup') return html`<${Setup} />`;
   if (route.view === 'overview') return html`<${Overview} />`;
   if (route.view === 'explore') return html`<${Explore} params=${route.params} />`;
   if (route.view === 'compare') return html`<${Compare} params=${route.params} />`;
