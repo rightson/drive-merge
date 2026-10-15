@@ -12,7 +12,7 @@ import { CatalogBanner, StagedDrawer, SuggestionsDrawer } from './panels.js';
 import { PreviewModal } from './preview.js';
 import { DialogHost, Toasts } from './ui.js';
 import {
-  Rail, ViewHost, currentView, navigate, useRoute, useShortcuts,
+  Rail, ViewHost, currentView, navigate, parseHash, useRoute, useShortcuts,
 } from './shell.js';
 import { compareHash, plansHash } from './query.js';
 import { isWaiting } from './plans.js';
@@ -317,6 +317,15 @@ function App() {
   };
   const catalogRefreshed = () => { setOutdated(null); setTick((x) => x + 1); };
 
+  /** Setup added a cloud or finished a scan: fetch the cloud list again (colours, panes, Overview) and refresh the trees. */
+  const reloadConfig = async () => {
+    try {
+      const cfg = await api.config();
+      setConfig((prev) => ({ ...cfg, approvals_enabled: cfg.approvals_enabled === undefined ? prev.approvals_enabled : cfg.approvals_enabled }));
+      setTick((x) => x + 1);
+    } catch (e) { /* the next navigation shows the real problem */ }
+  };
+
   async function clearDraft() {
     const ok = await confirmDialog({
       title: t('staged.clearTitle'), message: t('staged.clearText'), okLabel: t('staged.clearOk'), danger: true,
@@ -399,6 +408,14 @@ function App() {
         // A reloaded page has no URL token; the server hands a live session its CSRF token again.
         if (cfg.csrf && !api.hasCsrf()) api.setCsrf(cfg.csrf);
         if (cfg.approvals_enabled === undefined) cfg.approvals_enabled = !!approvals;
+        // A page opened without a route goes to Setup while there is nothing to work on yet (no cloud, or no complete
+        // scan). A route in the address, or a server that does not answer or does not say `needed`, changes nothing.
+        if (!parseHash(window.location.hash).explicit) {
+          try {
+            const first = await api.setupState();
+            if (first && first.needed === true) navigate('#/setup', { replace: true });
+          } catch (e) { /* no Setup on this server: the workspace, as always */ }
+        }
         setConfig(cfg);
         // A run that changed a cloud since its last scan: say so again after a reload, as the page did right after the run.
         if (cfg.outdated && cfg.outdated.length) setOutdated({ remotes: cfg.outdated });
@@ -517,7 +534,7 @@ function App() {
   const ctx = {
     config, draft, toast, confirm: confirmDialog, prompt: promptDialog, reveal,
     stageMove, stageMkdir, stageMany, rename: renameItem, afterExecution, resolveClash,
-    outdated, markOutdated, catalogRefreshed,
+    outdated, markOutdated, catalogRefreshed, reloadConfig,
     plans: plansState, refreshPlans, openWorkspacePreview,
     nav: navigate, lang, switchLang, revealInWorkspace, openWorkspace: () => navigate('#/workspace'),
     compare: (a, b) => navigate(compareHash({ remote: a.remote, path: a.path }, { remote: b.remote, path: b.path })),

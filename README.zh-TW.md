@@ -6,7 +6,7 @@
 
 drive-merge 在你的電腦上執行。它透過 [rclone](https://rclone.org) 將每個雲端的 **中繼資料**（絕不包含檔案內容）彙整進本機 SQLite 資料庫，告訴你每一份內容存放在哪裡，證明哪些檔案是重複的，提出整潔的資料夾架構建議，並且——僅透過經過模擬且經人工核准的計畫——將所有內容整合到單一雲端。
 
-設計文件：[docs/DESIGN.zh-TW.md](docs/DESIGN.zh-TW.md) — 架構、安全模型，以及你可以調整的待決事項；[docs/WORKSPACE.zh-TW.md](docs/WORKSPACE.zh-TW.md) — 視覺化工作區；以及 [docs/EXPLORE.zh-TW.md](docs/EXPLORE.zh-TW.md) — 總覽、探索與比較三個檢視；以及 [docs/PLANS.zh-TW.md](docs/PLANS.zh-TW.md) — 計畫檢視。繁體中文版本位於 `docs/*.zh-TW.md`。
+設計文件：[docs/DESIGN.zh-TW.md](docs/DESIGN.zh-TW.md) — 架構、安全模型，以及你可以調整的待決事項；[docs/WORKSPACE.zh-TW.md](docs/WORKSPACE.zh-TW.md) — 視覺化工作區；以及 [docs/EXPLORE.zh-TW.md](docs/EXPLORE.zh-TW.md) — 總覽、探索與比較三個檢視；[docs/PLANS.zh-TW.md](docs/PLANS.zh-TW.md) — 計畫檢視；以及 [docs/SETUP.zh-TW.md](docs/SETUP.zh-TW.md) — 在瀏覽器裡完成第一次設定。繁體中文版本位於 `docs/*.zh-TW.md`。
 
 ## 設計理由
 
@@ -44,7 +44,10 @@ read = "dropbox:"
 
 ## 使用
 
+第一步可以直接在瀏覽器完成：`drivemerge ui` 在設定檔不存在時會自動建立，並開啟**設定**畫面，你可以在那裡連接雲端並執行第一次掃描（見下文）。也可以改在終端機做同樣的事：
+
 ```bash
+drivemerge ui                              # first step, in the browser: Setup connects clouds and scans them
 drivemerge scan --all                      # list every cloud into the catalog (read-only)
 drivemerge identity rebuild                # group identical content
 drivemerge stats
@@ -72,6 +75,8 @@ drivemerge ui                              # opens http://127.0.0.1:8765/ui/ (on
 頁面左側的導覽列還能開啟三個唯讀的檢視，它們都會通往工作區：**總覽**（各雲端的內容重疊多少：用交集圖呈現哪些內容在哪些雲端，以及哪些只存在於單一雲端）、**探索**（用名稱或像 `type:pdf not:gdrive copies:1` 這樣的查詢找檔案；內容相同的副本會歸成一列，每個雲端一欄）與**比較**（對任意雲端上的任意兩個資料夾做對齊的差異檢視：相同、不同、搬動過、只在一邊，並有按鈕可把合併加入你的草稿）。它們不會寫入任何雲端，也不會更動 catalog。請參閱 [docs/EXPLORE.zh-TW.md](docs/EXPLORE.zh-TW.md)。
 
 **計畫**檢視讓你直接在頁面上建立並審閱整批計畫：去重計畫（有即時預估，並可逐組選擇要保留哪一份）、整併計畫（預設只複製；清理來源藏在有防護的區塊後面），以及審閱任何計畫（包含 Claude 提出的），使用同樣的模擬與同樣的輸入確認碼核准。總覽也能橋接沒有可比對雜湊的檔案。請參閱 [docs/PLANS.zh-TW.md](docs/PLANS.zh-TW.md)。
+
+**設定**畫面（導覽列的第一個項目，`Alt+0`；開啟時如果還沒有東西可處理，頁面會直接停在這裡）帶你從 `pip install` 走到掃描好的目錄：檢查 rclone，在新分頁登入雲端服務來連接 Google Drive、Dropbox、OneDrive 或 iCloud（透過 rclone 在 `127.0.0.1:53682` 提供的登入輔助程式，所以 drive-merge 不會接觸到 token），加入你已經有的 rclone remote，測試它們，執行第一次掃描並即時顯示數量，之後也能逐個雲端開放變更。雲端一律以唯讀方式加入。只有從你自己的終端機啟動的 `drivemerge ui` 頁面才能連接與掃描；否則這個畫面是唯讀的，只會顯示該執行的指令。請參閱 [docs/SETUP.zh-TW.md](docs/SETUP.zh-TW.md)。
 
 API 與 MCP：
 
