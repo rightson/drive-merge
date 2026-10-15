@@ -16,14 +16,11 @@ import contextlib
 import dataclasses
 import datetime
 import getpass
-import importlib.resources
 import json
 import os
 import re
-import secrets
 import sqlite3
 import sys
-import tempfile
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -412,33 +409,12 @@ def _exec_progress(*args: Any, **kwargs: Any) -> None:
 
 # ---------------------------------------------------------------------------- commands: setup
 
-def _write_private(path: Path, text: str) -> None:
-    """Write `text` to `path` readable by the owner only, atomically."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(text)
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, path)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp)
-        raise
-
-
 def cmd_init(ctx: Ctx) -> int:
     path = ctx.config_path
     if path.exists() and not ctx.args.force:
         raise ValueError(f"{path} already exists; use --force to overwrite it (this also replaces the API token)")
-    template = importlib.resources.files("drivemerge").joinpath("config_template.toml").read_text(encoding="utf-8")
-    token = secrets.token_urlsafe(32)
-    text, count = re.subn(r'(?m)^token\s*=\s*"".*$', f'token = "{token}"', template, count=1)
-    if count != 1:
-        raise ValueError("config template has no empty [api] token line")
-    _write_private(path, text)
-    cfg = _load_config(path)  # make sure what we wrote parses
-    db.connect(cfg.db_path).close()
+    config_mod.write_new_config(path)
+    cfg = _load_config(path)
     db_path = str(Path(cfg.db_path).expanduser())
     if ctx.json:
         _dump({"config": str(path), "database": db_path, "api_token": "generated"})
@@ -947,12 +923,16 @@ def cmd_serve(ctx: Ctx) -> int:
 
 
 def cmd_ui(ctx: Ctx) -> int:
+    if config_mod.ensure_config(ctx.config_path):
+        print(f"Created {ctx.config_path} (mode 600, new API token): no clouds yet, so the page opens on Setup",
+              flush=True)
     cfg = ctx.config
     try:
         from . import ui_api
     except ImportError as e:
         raise ValueError(f"the web UI needs its optional dependencies: pip install 'drive-merge[api]' ({e})") from None
-    ui_api.run_ui(cfg, host=ctx.args.host, port=ctx.args.port, open_browser=not ctx.args.no_browser)
+    ui_api.run_ui(cfg, host=ctx.args.host, port=ctx.args.port, open_browser=not ctx.args.no_browser,
+                  config_path=ctx.config_path)
     return EXIT_OK
 
 

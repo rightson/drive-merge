@@ -16,7 +16,7 @@ drivemerge ui                      # no config yet: it is created, and the page 
 ```
 
 1. **Check**: the page shows the rclone version found (or how to install it, and the `[rclone] binary` setting).
-2. **Connect**: "Connect a cloud" → pick Google Drive / Dropbox / OneDrive / iCloud → a name (`gdrive`) → "Sign in". A new browser tab opens the provider's own sign-in page (served through rclone's sign-in helper on `127.0.0.1:53682`); after "Allow", the page continues by itself. Questions some providers ask after signing in (OneDrive: which drive; iCloud: the two-factor code) appear as a small form. The cloud is then listed as connected, read-only.
+2. **Connect**: "Connect a cloud" → pick Google Drive / Dropbox / OneDrive / iCloud → a name (`gdrive`) → "Sign in". A new browser tab opens the provider's own sign-in page (served through rclone's sign-in helper on `127.0.0.1:53682`); after "Allow", the page continues by itself. Questions some providers ask after signing in (OneDrive: which drive; iCloud: the two-factor code) appear as a small form. iCloud has no browser sign-in: its form asks for the Apple ID and password up front, because rclone needs them to start. The cloud is then listed as connected, read-only.
 3. **Adopt**: rclone remotes that already exist on this machine and are not yet in drive-merge are listed with "Add"; nothing needs to be signed in again.
 4. **Scan**: "Scan all" (or per cloud) runs the first scan and the identity rebuild as one job, with live counts per cloud.
 5. **Done**: "Open Overview".
@@ -84,6 +84,7 @@ Execution itself still needs `[safety] execution_enabled = true`, which this scr
 - One sign-in at a time (rclone's helper listens on one fixed port).
 - Removing a cloud from drive-merge, renaming it, and editing `extra_args` stay in the config file.
 - The config file is rewritten only by appending or updating one `[[remotes]]` block; comments elsewhere are kept, comments inside a block that is updated are not.
+- Answers and the iCloud password reach rclone as command-line arguments, as with `rclone config create` typed by hand: while that command runs, other accounts on a shared computer can read them from the process list. Use a single-user machine, or configure such clouds with `rclone config` in a terminal.
 
 ---
 
@@ -118,7 +119,7 @@ Add to `Rclone` (all honour the configured binary and `--config`):
 | Method & path | Channel | Body / query | Response |
 |---|---|---|---|
 | `GET /v1/ui/setup` | normal | | `Service.setup_state()` plus `"needed": bool` = no remotes configured, or `scanned` false |
-| `POST /v1/ui/setup/connect` | human | `{"provider": "drive"\|"dropbox"\|"onedrive"\|"iclouddrive", "name", "client_id"?, "client_secret"?}` | 202 `{"job_id"}`; refuses `BAD_NAME` (regex `^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$`), `REMOTE_EXISTS` (in rclone or in drive-merge), `RCLONE_MISSING`, `JOB_BUSY` |
+| `POST /v1/ui/setup/connect` | human | `{"provider": "drive"\|"dropbox"\|"onedrive"\|"iclouddrive", "name", "client_id"?, "client_secret"? (Drive only), "apple_id"?, "password"? (iCloud only, both required there), "remote_auth"?: bool}` | 202 `{"job_id"}`; refuses `BAD_NAME` (regex `^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$`), `MISSING_FIELD` `{field}`, `REMOTE_EXISTS` (in rclone or in drive-merge), `RCLONE_MISSING`, `JOB_BUSY`; a field sent for the wrong provider is `BAD_REQUEST` |
 | `POST /v1/ui/setup/connect/{job_id}/answer` | human | `{"result": str}` | `{"ok"}`; 409 `NOT_WAITING` when the job is not waiting for an answer |
 | `POST /v1/ui/setup/connect/{job_id}/cancel` | human | | `{"ok"}` |
 | `POST /v1/ui/setup/adopt` | human | `{"name"}` (an rclone remote not yet in drive-merge) | `{"remote": {...}}`; adds a read-only block |
@@ -128,7 +129,7 @@ Add to `Rclone` (all honour the configured binary and `--config`):
 
 The connect job (`kind: "connect"`) drives rclone's state machine in its own thread:
 1. `config_create` with the provider's preset options: Drive `scope=drive.readonly` (or `drive` for `-rw`) plus `client_id`/`client_secret` when given; others none.
-2. Loop over the returned states. For `config_is_local` answer `true` automatically (unless the request asked for remote authorisation). While rclone waits for the browser, the job's progress is `{"stage": "signin", "auth_url": "http://127.0.0.1:53682/auth?state=…"}` (only URLs on `127.0.0.1:53682` are passed through; anything else is dropped). For any other question, progress becomes `{"stage": "question", "question": {"name", "help", "default", "examples": [{"value", "help"}], "password": bool, "required": bool, "exclusive": bool, "type"}}` and the job waits (up to 10 minutes) for `/answer`.
+2. Loop over the returned states. For `config_is_local` answer `true` automatically (unless the request asked for remote authorisation). While rclone waits for the browser, the job's progress is `{"stage": "signin", "auth_url": "http://127.0.0.1:53682/auth?state=…"}` (only URLs on `127.0.0.1:53682` are passed through; anything else is dropped). For any other question, progress becomes `{"stage": "question", "question": {"name", "help", "default", "examples": [{"value", "help"}], "password": bool, "required": bool, "exclusive": bool, "type"}}` and the job waits (up to 10 minutes) for `/answer`; `"retry": true` is added when rclone rejected the previous answer (its error text is not forwarded). `remote_auth: true` answers `config_is_local` with `false`, so rclone asks for a token made by `rclone authorize` as an ordinary question. Every progress carries `{"stage", "name", "provider", "mode": "new" | "write"}`; stages are `starting`, `working`, `signin`, `question`, `saving`, `done`, `failed`.
 3. When `State` is empty: `add_remote_block` (read-only, or `set_remote_write` for an `-rw` job), `reload_config`, result `{"remote": {...}}`.
 4. On cancel, timeout, an rclone error or a config-writing error: `config_delete(name)` if this job created it, job fails with `{"code", "params"}` (`SIGNIN_TIMEOUT`, `CANCELLED`, `RCLONE_ERROR`, `CONFIG_WRITE`).
 
