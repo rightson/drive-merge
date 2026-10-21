@@ -1,0 +1,364 @@
+#!/usr/bin/env python3
+"""A fake `rclone` for tests (stdlib only).
+
+Implements by itself: `version`, `authorize`, `config create|delete|dump|show|file|userinfo`, `listremotes`.
+Every other subcommand (`lsjson`, `about`, `copyto`, `moveto`, `deletefile`, `hashsum`, ...) is passed to the
+real rclone after every `name:path` operand whose `name` is a remote of the --config file is rewritten to
+`<fake_root>/<path>`. A "cloud" is therefore a local folder, whatever its declared type (drive, dropbox...).
+
+Environment:
+  FAKE_RCLONE_AUTH_DIR   directory for sign-in coordination (required by `authorize`)
+  FAKE_RCLONE_AUTH_MODE  ok (default) | fail (exit 1 once triggered) | hang (never returns) | nourl (exit 1
+                         before printing a URL) | busy (exit 1 at once: address already in use)
+  FAKE_RCLONE_ROOT_BASE  default folder of a remote: <base>/<name without -ro/-rw>
+  FAKE_RCLONE_TEST_FAIL  non-empty: lsjson/about on a fake remote fail like an expired token
+  FAKE_RCLONE_REAL       path of the real rclone to pass through to (default: the next `rclone` on PATH)
+  FAKE_RCLONE_LOG        file that gets one JSON line per call: {"argv": [...]} (config secrets are masked)
+
+`authorize <type> ...` prints rclone's NOTICE lines (with an auth URL whose `state` is random) on stderr, then
+waits until the file $FAKE_RCLONE_AUTH_DIR/<state> or $FAKE_RCLONE_AUTH_DIR/ANY exists, then prints the token
+block on stdout. The file's content may be JSON: {"root": "/some/folder", "account": "me@example.com"}; both end up
+in the token (fake_root, fake_account) and from there in the remote that `config create` makes. The call is
+recorded in $FAKE_RCLONE_AUTH_DIR/<state>.started (JSON: type, client_id, flags; never the secret).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import secrets
+import shutil
+import sys
+import tempfile
+import time
+
+VERSION = "v1.75.2"
+VALUE_FLAGS = {"--config", "--state", "--result", "--template"}
+
+
+def log(msg: str) -> None:
+    sys.stderr.write(f"{time.strftime('%Y/%m/%d %H:%M:%S')} NOTICE: {msg}\n")
+    sys.stderr.flush()
+
+
+def die(msg: str, code: int = 1) -> None:
+    sys.stderr.write(f"{time.strftime('%Y/%m/%d %H:%M:%S')} CRITICAL: {msg}\n")
+    sys.exit(code)
+
+
+# ------------------------------------------------------------------------------ conf file
+
+def read_conf(path: str) -> dict[str, dict[str, str]]:
+    out: dict[str, dict[str, str]] = {}
+    cur = None
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.rstrip("\n")
+                m = re.match(r"^\[(.+)\]$", line)
+                if m:
+                    cur = out.setdefault(m.group(1), {})
+                elif cur is not None and " = " in line:
+                    k, v = line.split(" = ", 1)
+                    cur[k] = v
+    except FileNotFoundError:
+        pass
+    return out
+
+
+def write_conf(path: str, conf: dict[str, dict[str, str]]) -> None:
+    d = os.path.dirname(os.path.abspath(path))
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".rclone.conf.")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        for name, opts in conf.items():
+            f.write(f"[{name}]\n")
+            for k, v in opts.items():
+                f.write(f"{k} = {v}\n")
+            f.write("\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+# ------------------------------------------------------------------------------- argv
+
+def split_global(argv: list[str]) -> tuple[str | None, list[str]]:
+    """Pull --config out of argv wherever it is."""
+    conf, rest, i = None, [], 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--config" and i + 1 < len(argv):
+            conf = argv[i + 1]
+            i += 2
+            continue
+        if a.startswith("--config="):
+            conf = a.split("=", 1)[1]
+        else:
+            rest.append(a)
+        i += 1
+    return conf, rest
+
+
+def default_conf() -> str:
+    return os.environ.get("RCLONE_CONFIG") or os.path.expanduser("~/.config/rclone/rclone.conf")
+
+
+def record(argv: list[str]) -> None:
+    path = os.environ.get("FAKE_RCLONE_LOG")
+    if not path:
+        return
+    masked = [re.sub(r"^(token|client_secret)=.*", r"\1=<masked>", a) for a in argv]
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"argv": masked}) + "\n")
+
+
+# --------------------------------------------------------------------------- authorize
+
+def cmd_authorize(args: list[str]) -> int:
+    flags = [a for a in args if a.startswith("--")]
+    pos = [a for a in args if not a.startswith("--")]
+    if not pos:
+        die("authorize needs a backend name", 1)
+    typ, extra = pos[0], pos[1:]
+    client_id = extra[0] if len(extra) >= 2 else None
+    mode = os.environ.get("FAKE_RCLONE_AUTH_MODE", "ok")
+    auth_dir = os.environ.get("FAKE_RCLONE_AUTH_DIR")
+    if not auth_dir:
+        die("FAKE_RCLONE_AUTH_DIR is not set", 1)
+    os.makedirs(auth_dir, exist_ok=True)
+    log('Config file "%s" not found - using defaults' % default_conf())
+    if mode == "busy":
+        die("Failed to start auth webserver: listen tcp 127.0.0.1:53682: bind: address already in use", 1)
+    if mode == "nourl":
+        die("Failed to configure token: no such backend", 1)
+    state = secrets.token_urlsafe(16)
+    host = "localhost" if typ in ("dropbox", "onedrive") and not client_id else "127.0.0.1"
+    log('Make sure your Redirect URL is set to "http://%s:53682/" in your custom config.' % host)
+    log("Please go to the following link: http://127.0.0.1:53682/auth?state=%s" % state)
+    log("Log in and authorize rclone for access")
+    log("Waiting for code...")
+    with open(os.path.join(auth_dir, state + ".started"), "w", encoding="utf-8") as f:
+        json.dump({"type": typ, "client_id": client_id, "flags": flags}, f)
+    trigger, any_trigger = os.path.join(auth_dir, state), os.path.join(auth_dir, "ANY")
+    while not (os.path.exists(trigger) or os.path.exists(any_trigger)):
+        time.sleep(0.05)
+    if mode == "hang":
+        while True:
+            time.sleep(3600)
+    if mode == "fail":
+        die("Failed to configure token: failed to get code: access_denied", 1)
+    meta = {}
+    for p in (trigger, any_trigger):
+        if os.path.exists(p):
+            try:
+                with open(p, encoding="utf-8") as f:
+                    meta = json.loads(f.read() or "{}")
+            except (OSError, ValueError):
+                meta = {}
+            break
+    log("Got code")
+    token = {"access_token": "fake-at-" + secrets.token_hex(8), "token_type": "Bearer",
+             "refresh_token": "fake-rt-" + secrets.token_hex(8), "expiry": "2099-01-01T00:00:00Z"}
+    if meta.get("root"):
+        token["fake_root"] = meta["root"]
+    if meta.get("account"):
+        token["fake_account"] = meta["account"]
+    sys.stdout.write("Paste the following into your remote machine --->\n%s\n<---End paste\n"
+                     % json.dumps(token, separators=(",", ":")))
+    sys.stdout.flush()
+    return 0
+
+
+# ----------------------------------------------------------------------------- config
+
+def _question(state: str, name: str, help_: str, typ: str, default: str) -> dict:
+    return {"State": state, "Option": {"Name": name, "Help": help_, "Default": default == "true" if typ == "bool" else default,
+                                       "DefaultStr": default, "ValueStr": default, "Type": typ, "Exclusive": True},
+            "Error": "", "Result": ""}
+
+
+def _final() -> dict:
+    return {"State": "", "Option": None, "Error": "", "Result": ""}
+
+
+def cmd_config(args: list[str], conf_path: str) -> int:
+    if not args:
+        die("config needs a subcommand", 1)
+    sub, rest = args[0], args[1:]
+    conf = read_conf(conf_path)
+    if sub == "file":
+        print("Configuration file is stored at:\n" + conf_path)
+        return 0
+    if sub == "dump":
+        print(json.dumps(conf, indent=4))
+        return 0
+    if sub == "show":
+        names = [a for a in rest if not a.startswith("--")]
+        for n in (names or list(conf)):
+            if n not in conf:
+                die(f"Couldn't find section {n!r} in config file", 1) if names else None
+            print(f"[{n}]")
+            for k, v in conf[n].items():
+                print(f"{k} = {v}")
+            print()
+        return 0
+    if sub == "delete":
+        names = [a for a in rest if not a.startswith("--")]
+        for n in names:
+            conf.pop(n, None)
+        write_conf(conf_path, conf)
+        return 0
+    if sub == "userinfo":
+        n = [a for a in rest if not a.startswith("--")][0].rstrip(":")
+        acct = conf.get(n, {}).get("fake_account")
+        if not acct:
+            die("Dropbox root '' doesn't support UserInfo", 1)
+        print(json.dumps({"email": acct}))
+        return 0
+    if sub == "create":
+        return config_create(rest, conf, conf_path)
+    die(f"unsupported fake config subcommand {sub!r}", 1)
+    return 1
+
+
+def config_create(rest: list[str], conf: dict, conf_path: str) -> int:
+    pos, kv, flags, i = [], {}, {}, 0
+    while i < len(rest):
+        a = rest[i]
+        if a in VALUE_FLAGS and i + 1 < len(rest):
+            flags[a] = rest[i + 1]
+            i += 2
+            continue
+        if a.startswith("--"):
+            flags[a] = "1"
+        elif "=" in a and len(pos) >= 2:
+            k, v = a.split("=", 1)
+            kv[k] = v
+        else:
+            pos.append(a)
+        i += 1
+    if len(pos) < 2 and "--continue" not in flags:
+        die("config create needs name and type", 1)
+    name = pos[0]
+    interactive_off = "--non-interactive" in flags
+    if "--continue" in flags:
+        if name not in conf:
+            die(f"didn't find section {name!r} in config file", 1)
+        typ = conf[name].get("type", "")
+        state, result = flags.get("--state", ""), flags.get("--result", "")
+        out = _final()
+        if state.startswith("*oauth-confirm"):
+            if typ == "onedrive":
+                out = _question("choose_type_done", "config_type", "Type of connection", "string", "onedrive")
+            elif typ == "drive":
+                out = _question("teamdrive_ok", "config_change_team_drive",
+                                "Configure this as a Shared Drive (Team Drive)?", "bool", "false")
+        elif state == "choose_type_done":
+            out = _question("driveid", "config_driveid", "Select drive you want to use", "string", "fake-drive-id")
+        elif state == "driveid":
+            conf[name]["drive_id"] = result or "fake-drive-id"
+            conf[name]["drive_type"] = "personal"
+            out = _question("driveid_end", "config_drive_ok", "Drive OK?", "bool", "true")
+        elif state in ("driveid_end", "teamdrive_ok"):
+            out = _final()
+        else:
+            die(f'unknown state "{state}"', 1)
+        write_conf(conf_path, conf)
+        print(json.dumps(out, indent=4))
+        return 0
+    typ = pos[1]
+    kv.update(dict(a.split("=", 1) for a in pos[2:] if "=" in a))
+    section = {"type": typ}
+    for k, v in kv.items():
+        section[k] = v
+    token = {}
+    if "token" in kv:
+        try:
+            token = json.loads(kv["token"])
+        except ValueError:
+            die("bad token", 1)
+        for k in ("fake_root", "fake_account"):
+            if k in token:
+                section[k] = str(token.pop(k))
+        section["token"] = json.dumps(token, separators=(",", ":"))
+    if "fake_root" not in section:
+        base = os.environ.get("FAKE_RCLONE_ROOT_BASE")
+        if base:
+            section["fake_root"] = os.path.join(base, re.sub(r"-(ro|rw)$", "", name))
+    conf[name] = section
+    write_conf(conf_path, conf)
+    if interactive_off:
+        if "token" in kv:
+            first = {"onedrive": "*oauth-confirm,choose_type,,", "drive": "*oauth-confirm,teamdrive,oauth,"}.get(typ, "*oauth-confirm,,,")
+            print(json.dumps(_question(first, "config_refresh_token", "Token already configured - replace it?",
+                                       "bool", "true"), indent=4))
+        else:
+            print(json.dumps(_final(), indent=4))
+    return 0
+
+
+# -------------------------------------------------------------------------- pass-through
+
+def find_real() -> str:
+    env = os.environ.get("FAKE_RCLONE_REAL")
+    if env:
+        return env
+    me = os.path.dirname(os.path.realpath(__file__))
+    paths = [p for p in os.environ.get("PATH", "").split(os.pathsep)
+             if p and os.path.realpath(p) != me]
+    real = shutil.which("rclone", path=os.pathsep.join(paths))
+    if not real:
+        die("the real rclone is not on PATH (set FAKE_RCLONE_REAL)", 1)
+    return real
+
+
+def pass_through(argv: list[str], conf_path: str) -> int:
+    conf = read_conf(conf_path)
+    roots = {n: o["fake_root"] for n, o in conf.items() if "fake_root" in o}
+    if os.environ.get("FAKE_RCLONE_TEST_FAIL") and argv and argv[0] in ("lsjson", "about", "lsf", "size"):
+        if any(re.match(r"^([^:/]+):", a) and re.match(r"^([^:/]+):", a).group(1) in roots for a in argv):
+            die("couldn't login: HTTP error 401 (401 Unauthorized) returned body: invalid_access_token", 1)
+    out = []
+    for a in argv:
+        m = re.match(r"^([A-Za-z0-9_.+@-]+):(.*)$", a)
+        if m and m.group(1) in roots:
+            rel = m.group(2).lstrip("/")
+            out.append(os.path.join(roots[m.group(1)], rel) if rel else roots[m.group(1)])
+        else:
+            out.append(a)
+    real = find_real()
+    # no --config: everything is a local path now
+    os.execv(real, [real, "--config", os.devnull, *out])
+    return 1
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    conf_path, rest = split_global(argv)
+    conf_path = conf_path or default_conf()
+    record(argv)
+    # leading global flags (e.g. --fast-list) before the subcommand
+    idx = next((i for i, a in enumerate(rest) if not a.startswith("-")), None)
+    if idx is None:
+        if "--version" in rest or "version" in rest:
+            print(f"rclone {VERSION}")
+            return 0
+        die("no subcommand", 1)
+    sub, tail = rest[idx], rest[idx + 1:]
+    if sub == "version":
+        print(f"rclone {VERSION}\n- os/version: fake\n- os/kernel: fake\n- os/type: linux\n- go/version: go1.x")
+        return 0
+    if sub == "authorize":
+        return cmd_authorize(tail)
+    if sub == "config":
+        return cmd_config(tail, conf_path)
+    if sub == "listremotes":
+        for n in read_conf(conf_path):
+            print(n + ":")
+        return 0
+    return pass_through(rest, conf_path)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
