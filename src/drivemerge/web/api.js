@@ -29,7 +29,7 @@ async function call(method, path, { query, body, quiet401 = false } = {}) {
   }
   const headers = { Accept: 'application/json' };
   if (body !== undefined) headers['Content-Type'] = 'application/json';
-  if (method !== 'GET' && csrf) headers['X-CSRF-Token'] = csrf;
+  if (csrf) headers['X-CSRF-Token'] = csrf;
   let res;
   try {
     res = await fetch(url, {

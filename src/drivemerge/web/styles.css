@@ -480,6 +480,7 @@ input[type="text"]:focus, input[type="search"]:focus, input[type="password"]:foc
   .meta-size { min-width: 0; }
 }
 @container pane (max-width: 380px) {
+  .row { padding-right: 8px; gap: 4px; }
   .badge { padding: 0 5px; }
   .badge-dot { display: inline-block; }
   .badge-label {

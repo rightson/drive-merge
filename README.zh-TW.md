@@ -15,6 +15,19 @@ drive-merge 在你的電腦上執行。它透過 [rclone](https://rclone.org) �
 - **除非透過經核准的計畫，否則不會寫入任何雲端。** 計畫會先針對目錄進行模擬（不得使任何內容失去最後一份副本；每次刪除都必須有一份可證明完全相同、且會保留的見證副本；不覆寫；不得有大小寫衝突等）。核准與模擬摘要（digest）綁定，且需要互動式終端機。刪除的檔案會移至隔離資料夾，可以還原。
 - **由 LLM 提議，由人類核准。** Claude Code（透過 MCP）可以搜尋、讀取資料夾概況、撰寫版面規則，以及建立與模擬計畫。它無法核准或執行這些計畫。
 
+## 快速開始
+
+需要 Python 3.11 以上版本，以及 [rclone](https://rclone.org/install/) ≥ 1.69（頁面可以代為安裝）。不需要設定檔，也不需要 `rclone config`。
+
+```bash
+pip install 'drive-merge[api]'
+drivemerge ui                    # first run creates ~/.config/drive-merge/ and opens the page
+```
+
+1. **連接。** 頁面會先顯示歡迎畫面，每個雲端一張卡片。Dropbox 與 OneDrive 各按一個按鈕即可；Google Drive 需要你自己的 OAuth 用戶端，對話框會一步步帶你完成（約 5 分鐘，只需一次）。連線預設唯讀：卡片會顯示帳號、容量與「已連接，唯讀」。
+2. **同步。** 一個按鈕就會平行把每個已連接雲端的檔案清單讀進本機目錄，並顯示各雲端的進度。之後的一切（總覽、探索、比較）都是本機查詢。
+3. **釋放空間。** 在某個雲端按 **釋放空間…**：會顯示其中有多少內容*已證實*存在於你的其他雲端（位元組完全相同）、有多少只是*可能*（按一下 **驗證** 即可確定），以及有多少只存在於這裡。**允許變更**（第二次登入）讓 drive-merge 能建立釋放已證實部分的計畫；你檢視計畫、輸入核准碼、執行，再按 **立即清除** 就會把空間還給你。在此之前不會有任何變動。請參閱 [docs/ONBOARDING.zh-TW.md](docs/ONBOARDING.zh-TW.md)。
+
 ## 安裝
 
 需要 Python 3.11 以上版本，以及 rclone ≥ 1.69（用於 iCloud）。
@@ -24,7 +37,7 @@ pip install -e '.[api,mcp]'      # or: uv pip install -e '.[api,mcp]'
 drivemerge init                  # writes ~/.config/drive-merge/config.toml and an API token
 ```
 
-為每個雲端設定一個 rclone remote（`rclone config`）。建議：用於掃描的唯讀 remote（例如 scope 為 `drive.readonly` 的 Google Drive），以及僅在你想讓 drive-merge 變更該雲端時，才另外設定可寫入的 remote。注意：rclone 共用的 Google Drive client_id 正於 2026 年淘汰——[請建立你自己的](https://rclone.org/drive/#making-your-own-client-id)。
+頁面未提供的雲端（iCloud）或需要腳本化時走終端機路線：`drivemerge connect dropbox|onedrive|drive` 可在終端機登入，或自行為每個雲端設定一個 rclone remote（`rclone config`）。建議：用於掃描的唯讀 remote（例如 scope 為 `drive.readonly` 的 Google Drive），以及僅在你想讓 drive-merge 變更該雲端時，才另外設定可寫入的 remote。注意：rclone 共用的 Google Drive client_id 正於 2026 年淘汰——[請建立你自己的](https://rclone.org/drive/#making-your-own-client-id)。
 
 編輯設定檔（請參閱 [examples/config.toml](examples/config.toml)）：
 

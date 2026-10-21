@@ -798,6 +798,7 @@ def test_the_report_is_asked_for_the_folder_and_the_keep_order_in_the_address(ma
 def test_keep_copies_on_can_be_reordered_and_narrowed(make_onb):
     ui = free_ui(make_onb)
     order = lambda: ui.page.eval_on_selector_all('[data-testid="free-keep"] li', "els => els.map(e => e.dataset.testid)")  # noqa: E731
+    expect(ui.tid("free-keep").locator("li")).to_have_count(2)
     assert order() == ["keep-gdrive", "keep-onedrive"]
     assert "keep_on" not in ui.mock.last("GET", r"/v1/release/dropbox").query            # the default asks for nothing special
     ui.tid("keep-down-gdrive").click()

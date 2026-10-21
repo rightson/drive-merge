@@ -45,6 +45,38 @@ def _contradict(a: tuple, b: tuple) -> bool:
     return any(x and y and x.lower() != y.lower() for x, y in zip(a, b))
 
 
+class _Bridged:
+    """Every hash an entry is known to have: its own columns, completed from the hash_bridges row of a download
+    of these very bytes (found by the entry, or by an equal strong hash). Lets a verified file contradict a
+    candidate whose provider reports a hash the file's own provider does not (Dropbox vs Drive's SHA-256)."""
+
+    def __init__(self, conn: sqlite3.Connection):
+        self.by_entry: dict[int, tuple] = {}
+        self.by_strong: dict[tuple[int, str], tuple] = {}
+        rows = {r[0]: tuple(r[2:7]) + (r[1],) for r in conn.execute(
+            "SELECT id, size, md5, sha1, sha256, dropbox, quickxor FROM hash_bridges")}
+        for bid, row in rows.items():
+            for i, t in enumerate(_COLS):
+                if t in _STRONG and row[i]:
+                    self.by_strong[(i, row[i].lower())] = row
+        for bid, eid, size in conn.execute("SELECT bridge_id, entry_id, size FROM bridge_sources"):
+            row = rows.get(bid)
+            if row and row[5] == size:
+                self.by_entry[eid] = row
+
+    def hashes(self, entry_id: int, size: int, own: tuple) -> tuple:
+        row = self.by_entry.get(entry_id)
+        if row is None:
+            for i, v in enumerate(own):
+                if v and _COLS[i] in _STRONG:
+                    row = self.by_strong.get((i, v.lower()))
+                    if row:
+                        break
+        if row is None or row[5] != size:
+            return own
+        return tuple(o or b for o, b in zip(own, row[:5]))
+
+
 def _ambiguous(conn: sqlite3.Connection, rid: int) -> set[str]:
     return {r[0] for r in conn.execute(
         "SELECT path FROM entries WHERE remote_id = ? AND present = 1 GROUP BY path HAVING COUNT(*) > 1", (rid,))}
@@ -108,6 +140,7 @@ def _analyze(conn: sqlite3.Connection, remote: str, path_prefix: str | None, kee
                     if row[7 + i] and (row[4], i, row[7 + i]) in weakkeys:
                         by_weak[(row[4], i, row[7 + i])].append(row)
 
+    bridged = _Bridged(conn)
     amb_cache: dict[int, set[str]] = {}
 
     def usable(row: tuple) -> bool:
@@ -147,12 +180,12 @@ def _analyze(conn: sqlite3.Connection, remote: str, path_prefix: str | None, kee
             else:
                 unusable.append(t)
             continue
-        mine = t[6:11]
+        mine = bridged.hashes(t[0], size, t[6:11])
         cands = list(by_name.get((size, t[2]), ()))
         for i in _WEAK_IDX:
             if t[6 + i]:
                 cands.extend(by_weak.get((size, i, t[6 + i]), ()))
-        hits = {c[0]: c for c in cands if not _contradict(mine, c[7:12])}
+        hits = {c[0]: c for c in cands if not _contradict(mine, bridged.hashes(c[0], c[4], c[7:12]))}
         if hits:
             probable.append(t)
             candidate_remotes.update(c[1] for c in hits.values())
