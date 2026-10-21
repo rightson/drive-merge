@@ -128,13 +128,15 @@ export function ConnectDialog({ provider, purpose = 'read', conn = null, taken, 
   }
   const close = () => { if (phase === 'waiting') cancelFlow(); onClose(); };
   // Focus can be on the page body once the clicked button is gone; Escape must still close the dialog.
-  const closeRef = useRef(close);
-  closeRef.current = close;
+  // The handler reads the latest render through a ref: a listener re-bound in an effect would still hold the
+  // previous phase (e.g. 'starting', busy) for a moment after the waiting view is already on screen.
+  const keyRef = useRef(null);
+  keyRef.current = { busy, close };
   useEffect(() => {
-    const onKey = (e) => { if (e.key === 'Escape' && !busy) closeRef.current(); };
+    const onKey = (e) => { const k = keyRef.current; if (e.key === 'Escape' && !k.busy) k.close(); };
     document.addEventListener('keydown', onKey);
     return () => document.removeEventListener('keydown', onKey);
-  }, [phase]);
+  }, []);
 
   async function finish(id) {
     setPhase('finishing');
