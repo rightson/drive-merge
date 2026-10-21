@@ -2641,6 +2641,9 @@ def test_a_rescan_from_the_finished_run_dialog_clears_the_banner_and_it_does_not
 def test_a_preview_made_while_the_catalog_is_out_of_date_cannot_be_approved_until_a_rescan(make_ui):
     ui = make_ui().open()
     _run_to_done(ui).get_by_test_id("preview-close").click()
+    # Closing the finished run swaps the applied draft for a fresh one and reloads both trees; a drag that starts
+    # meanwhile is swallowed (the layout moves under the mouse), so wait until the page is on the new draft.
+    expect(ui.page.get_by_test_id("draft-select")).to_have_value("2")
     ui.drag(("left", "gdrive:Photos"), ("right", "dropbox:Archive"))
     ui.page.get_by_test_id("preview-button").click()
     modal = ui.page.get_by_test_id("preview-modal")
