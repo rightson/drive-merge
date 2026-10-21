@@ -9,6 +9,7 @@ from __future__ import annotations
 import hmac
 import re
 import threading
+import time
 from collections.abc import Callable
 from typing import Any, Literal
 
@@ -18,13 +19,53 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from . import __version__, builders, plans
+from . import __version__, builders, connections, plans
 from .compare import CompareError
 from .config import Config
 from .service import Service, ServiceError, scrub_secrets
 
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 _NO_PLAN = re.compile(r"no plan \d+")
+QUOTA_TTL = 600.0          # seconds a quota from test_connection is reused
+QUOTA_FAIL_TTL = 60.0      # a failed lookup is not retried for this long
+_CONNECT_STATUS = {"NOT_FOUND": 404, "BAD_NAME": 400, "NEEDS_CLIENT": 400}
+
+
+class QuotaCache:
+    """Per-cloud used/total/free from `connections.test_connection`, kept for ten minutes so a page that shows
+    several clouds does not call every provider on each view. None means unknown (not a connection, or it failed)."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._by_name: dict[str, tuple[float, dict | None]] = {}
+
+    def put(self, name: str, result: dict) -> None:
+        quota = result.get("quota") if result.get("ok") else None
+        with self._lock:
+            self._by_name[name] = (time.monotonic() + (QUOTA_TTL if quota else QUOTA_FAIL_TTL), quota)
+
+    def drop(self, name: str) -> None:
+        with self._lock:
+            self._by_name.pop(name, None)
+
+    def get(self, config: Config, name: str) -> dict | None:
+        """The cached quota; looks it up through test_connection when the cache is empty or old. Never raises."""
+        with self._lock:
+            hit = self._by_name.get(name)
+        if hit is not None and hit[0] > time.monotonic():
+            return hit[1]
+        try:
+            remote = config.remote(name)
+        except KeyError:
+            return None
+        if not getattr(remote, "connection", False):
+            return None
+        try:
+            result = connections.test_connection(config, name)
+        except Exception:  # unknown quota is not an error for the report
+            result = {"ok": False}
+        self.put(name, result)
+        return result.get("quota") if result.get("ok") else None
 
 
 class _Body(BaseModel):
@@ -116,6 +157,12 @@ def install_error_handlers(app: FastAPI, *, coded: bool = False) -> None:
         missing = _NO_PLAN.fullmatch(str(exc))
         return _error(404 if missing else 400, str(exc), code=code("NOT_FOUND" if missing else "BAD_REQUEST"))
 
+    def connect_error(_: Request, exc: connections.ConnectError) -> JSONResponse:
+        # Always coded: the facts of a failed sign-in are the same for a script and for the page. Messages come
+        # from connections.py, which never carries a token.
+        status = _CONNECT_STATUS.get(exc.code, 409)
+        return _error(status, _message(exc), code=exc.code, params=getattr(exc, "params", None))
+
     def compare_error(_: Request, exc: CompareError) -> JSONResponse:
         # Always coded: compare, coverage and explore refusals are the same facts for a script and for the page.
         return _error(exc.status, str(exc), code=exc.code, params=exc.params)
@@ -125,6 +172,7 @@ def install_error_handlers(app: FastAPI, *, coded: bool = False) -> None:
         app.add_exception_handler(exc_type, bad_request)
     app.add_exception_handler(builders.BuildError, build_error)
     app.add_exception_handler(CompareError, compare_error)
+    app.add_exception_handler(connections.ConnectError, connect_error)
     app.add_exception_handler(plans.PlanError, plan_error)
     app.add_exception_handler(KeyError, not_found)
 
@@ -154,13 +202,29 @@ def create_app(service: Service, *, token: str) -> FastAPI:
 
 
 def build_router(service: Service, lock: threading.Lock, *, dependencies: list[Any],
-                 created_by: Callable[[Request], str] | None = None) -> APIRouter:
+                 created_by: Callable[[Request], str] | None = None,
+                 quotas: QuotaCache | None = None) -> APIRouter:
     """The /v1 catalog and plan routes. `dependencies` is the auth the including app requires;
     `lock` serialises use of the service's single SQLite connection. Plan responses leave here scrubbed of
     the digest, the approval code and the snapshot: every caller of these routes is a bearer client or a
     page, and the code reaches a human only through the workspace preview, the plan review or the CLI.
     `created_by(request)` names who proposes a plan (default "api"; the UI app says "ui" for a browser session)."""
     api = APIRouter(dependencies=dependencies)
+    quotas = quotas if quotas is not None else QuotaCache()
+
+    @api.get("/v1/setup")
+    def setup() -> dict:
+        """First-run state, rclone status and the connections (names, accounts, access; never a token)."""
+        with lock:
+            return service.setup_status()
+
+    @api.get("/v1/release/{remote}")
+    def release(remote: str, path: str | None = None, keep_on: str | None = None) -> dict:
+        """How much of `remote` provably exists on the other clouds, plus the cloud's cached quota (or null)."""
+        with lock:
+            report = service.release_report(remote, path_prefix=path or None, keep_on=_csv(keep_on) or None)
+            config = service.config
+        return {**report, "quota": quotas.get(config, remote)}
 
     @api.get("/v1/stats")
     def stats() -> dict:
@@ -304,9 +368,9 @@ def serve(config: Config, *, allow_remote: bool = False) -> None:
     if host not in LOOPBACK_HOSTS and not allow_remote:
         raise ValueError(f"refusing to bind {host!r}: the API is loopback-only unless allow_remote=True")
     _check_token(config.api.token)
-    app = create_app(Service(config), token=config.api.token)
+    app = create_app(Service(config, config_path=config.config_path), token=config.api.token)
     uvicorn.run(app, host=host, port=config.api.port)
 
 
-__all__ = ["create_app", "build_router", "install_error_handlers", "bearer_ok", "scrub_secrets", "serve",
+__all__ = ["create_app", "build_router", "QuotaCache", "install_error_handlers", "bearer_ok", "scrub_secrets", "serve",
            "LOOPBACK_HOSTS"]

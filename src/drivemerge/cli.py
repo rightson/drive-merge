@@ -225,7 +225,7 @@ class Ctx:
     @property
     def service(self) -> service_mod.Service:
         if self._service is None:
-            self._service = service_mod.Service(self.config)
+            self._service = service_mod.Service(self.config, config_path=self.config_path)
         return self._service
 
 

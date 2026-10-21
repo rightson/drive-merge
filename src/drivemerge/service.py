@@ -24,6 +24,7 @@ from . import (
 )
 from .config import DEFAULT_CONFIG_PATH, Config, load_config, sync_remotes
 from .models import Plan
+from .connections import make_rclone
 from .rclone import Rclone
 from .scanner import scan_remote
 
@@ -76,12 +77,10 @@ class Service:
     def __init__(self, config: Config, conn: sqlite3.Connection | None = None, rclone: Rclone | None = None,
                  config_path: str | Path | None = None):
         self.config = config
-        self.config_path = config_path
+        self.config_path = config_path if config_path is not None else config.config_path
         self.conn = conn if conn is not None else db.connect(config.db_path)
         sync_remotes(self.conn, config)
-        self.rclone = rclone or Rclone(
-            config.rclone_binary, config=config.rclone_config, extra_args=config.rclone_extra_args
-        )
+        self.rclone = rclone or make_rclone(config)
 
     def reload_config(self) -> Config:
         """Re-read the merged config (config.toml plus connections.toml) so connections added while the service
@@ -94,8 +93,7 @@ class Service:
             for f in dataclasses.fields(Config):
                 setattr(self.config, f.name, getattr(fresh, f.name))
         sync_remotes(self.conn, self.config)
-        self.rclone = Rclone(self.config.rclone_binary, config=self.config.rclone_config,
-                             extra_args=self.config.rclone_extra_args)
+        self.rclone = make_rclone(self.config)
         return self.config
 
     # ---------------------------------------------------------------- read

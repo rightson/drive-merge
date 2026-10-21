@@ -108,6 +108,12 @@ def resolve_binary(config: Config) -> str | None:
     return str(managed) if managed.is_file() else None
 
 
+def make_rclone(config: Config) -> Rclone:
+    """The Rclone every scan, sync and execution uses: the configured binary, else the one drive-merge installed."""
+    return Rclone(resolve_binary(config) or config.rclone_binary, config=config.rclone_config,
+                  extra_args=config.rclone_extra_args)
+
+
 def _parse_version(text: str) -> tuple[int, ...] | None:
     m = re.search(r"v?(\d+)\.(\d+)(?:\.(\d+))?", text or "")
     return tuple(int(g) for g in m.groups() if g is not None) if m else None

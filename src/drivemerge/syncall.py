@@ -15,7 +15,7 @@ from typing import Callable
 
 from . import db, dirstats, identity
 from .config import Config, sync_remotes
-from .rclone import Rclone
+from .connections import make_rclone
 from .scanner import scan_remote
 
 Progress = Callable[[str, str, int, int, int], None]
@@ -61,8 +61,7 @@ def sync_all(config: Config, *, remotes: list[str] | None = None, progress: Prog
         conn = None
         try:
             conn = db.connect(config.db_path)
-            rclone = Rclone(config.rclone_binary, config=config.rclone_config,
-                            extra_args=config.rclone_extra_args)
+            rclone = make_rclone(config)
             emit(name, "listing")
 
             def on_batch(files: int, dirs: int, size: int) -> None:
