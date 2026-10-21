@@ -1,6 +1,7 @@
 // The rail and the router (docs/EXPLORE.md section F). The route lives in location.hash:
 //   #/overview   #/explore?q=...   #/compare?l=remote:path&r=remote:path   #/workspace
 //   #/plans   #/plans/<id>   #/plans/new/dedupe?...   #/plans/new/consolidate?...   (docs/PLANS.md)
+//   #/clouds   #/free/<remote>?path=...&keep=a,b   (docs/ONBOARDING.md)
 // No route (or the token exchange's #token=) means the workspace, so a page opened as before shows the workspace.
 import { html, useEffect, useState } from './vendor/htm-preact-standalone.mjs';
 import { t } from './i18n.js';
@@ -10,12 +11,15 @@ import { Overview } from './overview.js';
 import { Explore } from './explore.js';
 import { Compare } from './compare.js';
 import { Plans } from './plans.js';
+import { Clouds } from './onboarding.js';
+import { Free } from './free.js';
 
 // The keys Alt+1 ... Alt+5 select, in order; the rail shows Plans between Compare and the workspace.
 export const VIEWS = ['overview', 'explore', 'compare', 'workspace', 'plans'];
-export const RAIL = ['overview', 'explore', 'compare', 'plans', 'workspace'];
-const VIEW_ICON = { overview: 'chart', explore: 'search', compare: 'swap', workspace: 'columns', plans: 'plans' };
-const ROUTE = /^\/(overview|explore|compare|workspace)(?:\?(.*))?$/;
+export const RAIL = ['clouds', 'overview', 'explore', 'compare', 'plans', 'workspace'];
+const VIEW_ICON = { clouds: 'cloud', overview: 'chart', explore: 'search', compare: 'swap', workspace: 'columns', plans: 'plans' };
+const ROUTE = /^\/(clouds|overview|explore|compare|workspace)(?:\?(.*))?$/;
+const FREE_ROUTE = /^\/free\/([^/?]+)(?:\?(.*))?$/;
 const PLANS_ROUTE = /^\/plans((?:\/[^?]*)?)(?:\?(.*))?$/;
 
 /** Where a plans route points: the list, one plan's review, or a form that creates a plan. */
@@ -32,6 +36,12 @@ export function parseHash(hash) {
   const h = String(hash || '').replace(/^#/, '');
   const m = ROUTE.exec(h);
   if (m) return { view: m[1], params: new URLSearchParams(m[2] || ''), hash: `#${h}`, explicit: true };
+  const f = FREE_ROUTE.exec(h);
+  if (f) {
+    let remote = f[1];
+    try { remote = decodeURIComponent(remote); } catch (e) { /* keep the raw text */ }
+    return { view: 'free', remote, params: new URLSearchParams(f[2] || ''), hash: `#${h}`, explicit: true };
+  }
   const p = PLANS_ROUTE.exec(h);
   if (p) return { view: 'plans', params: new URLSearchParams(p[2] || ''), hash: `#${h}`, explicit: true, ...plansPage(p[1] || '') };
   return { view: 'workspace', params: new URLSearchParams(), hash: '', explicit: false };
@@ -101,7 +111,7 @@ export function Rail({ route, waiting = 0 }) {
   return html`<nav class="rail" aria-label=${t('nav.label')} data-testid="rail">
     ${RAIL.map((view) => html`<a key=${view} class=${'rail-item' + (route.view === view ? ' on' : '')} href=${`#/${view}`}
       data-testid=${'rail-' + view} aria-current=${route.view === view ? 'page' : undefined}
-      title=${`${t(`nav.${view}Tip`)} (Alt+${VIEWS.indexOf(view) + 1})`}
+      title=${VIEWS.includes(view) ? `${t(`nav.${view}Tip`)} (Alt+${VIEWS.indexOf(view) + 1})` : t(`nav.${view}Tip`)}
       onClick=${(e) => { if (e.ctrlKey || e.metaKey || e.shiftKey || e.button) return; e.preventDefault(); navigate(remembered[view] || `#/${view}`); }}>
       <${Icon} name=${VIEW_ICON[view]} size=${20} /><span class="rail-label">${t(`nav.${view}`)}</span>
       ${view === 'plans' && waiting > 0 && html`<span class="rail-badge" data-testid="rail-plans-badge" data-count=${waiting}
@@ -112,6 +122,8 @@ export function Rail({ route, waiting = 0 }) {
 
 /** The read-only views; the workspace is not here: it stays mounted by the App and is only hidden. */
 export function ViewHost({ route }) {
+  if (route.view === 'clouds') return html`<${Clouds} />`;
+  if (route.view === 'free') return html`<${Free} key=${route.remote} remote=${route.remote} params=${route.params} />`;
   if (route.view === 'overview') return html`<${Overview} />`;
   if (route.view === 'explore') return html`<${Explore} params=${route.params} />`;
   if (route.view === 'compare') return html`<${Compare} params=${route.params} />`;

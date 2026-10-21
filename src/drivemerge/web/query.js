@@ -28,6 +28,12 @@ export function plansHash(sub = '', obj = {}) {
   return '#/plans' + sub + (s ? '?' + s : '');
 }
 
+/** `#/free/<remote>?path=...&keep=a,b` (docs/ONBOARDING.md section 6): the free-space view of one cloud. */
+export function freeHash(remote, { path, keep } = {}) {
+  const s = pairs({ path: (path || '').replace(/^\/+|\/+$/g, ''), keep: Array.isArray(keep) ? keep.join(',') : keep });
+  return `#/free/${encodeURIComponent(remote)}` + (s ? '?' + s : '');
+}
+
 /** "remote:path" -> {remote, path}; null when it names no remote. Remote names cannot contain ':'. */
 export function parsePlace(text) {
   if (!text) return null;

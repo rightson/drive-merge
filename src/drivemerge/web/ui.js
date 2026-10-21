@@ -3,6 +3,7 @@ import { html, useContext, useEffect, useLayoutEffect, useRef, useState } from '
 import { AppCtx } from './ctx.js';
 import { t } from './i18n.js';
 import { Icon } from './icons.js';
+import { SyncControl } from './sync.js';
 
 const FOCUSABLE = 'a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])';
 
@@ -113,6 +114,7 @@ export function ViewHeader({ title, hint, children }) {
     <div class="view-title"><h1>${title}</h1>${hint && html`<p>${hint}</p>`}</div>
     <span class="spacer"></span>
     ${children}
+    <${SyncControl} />
     <button class="btn btn-small" data-testid="view-lang" onClick=${ctx.switchLang} title=${t('app.language')}>
       ${ctx.lang === 'zh-TW' ? 'EN' : '中文'}</button>
   </header>`;

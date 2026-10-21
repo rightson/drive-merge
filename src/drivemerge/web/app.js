@@ -16,6 +16,7 @@ import {
 } from './shell.js';
 import { compareHash, plansHash } from './query.js';
 import { isWaiting } from './plans.js';
+import { SyncControl, useSyncJob } from './sync.js';
 import {
   baseName, errorText, fmtBytes, fmtLoc, fmtNum, keepBothName, lastMove, parentOf, safeStorage, todayStamp, wordParams,
 } from './util.js';
@@ -61,6 +62,9 @@ function App() {
   const [dialog, setDialog] = useState(null);
   // The clouds the last run changed while the catalog still shows what they held before ({remotes}); null once rescanned.
   const [outdated, setOutdated] = useState(null);
+  // Connections (docs/ONBOARDING.md): what /v1/setup says, and a counter that moves whenever a sync has changed the catalog.
+  const [setup, setSetup] = useState({ loaded: false, data: null, error: null });
+  const [syncEpoch, setSyncEpoch] = useState(0);
   // The plan list (docs/PLANS.md section 7): polled while the page is visible, for the rail badge, the list view and
   // the "proposed by Claude" toast. `seen` holds the ids the page already knows, so only a new plan raises the toast.
   const [plansState, setPlansState] = useState({ list: [], loaded: false, error: null });
@@ -85,6 +89,19 @@ function App() {
   const route = useRoute();
   useShortcuts(route);
   const onWorkspace = route.view === 'workspace';
+  const sync = useSyncJob({
+    names: ((config && config.remotes) || []).map((r) => r.name),
+    onFinished: (r) => {
+      setSyncEpoch((n) => n + 1);
+      setTick((x) => x + 1);
+      if (r.all && r.ok) setOutdated(null);
+      refreshSetupRef.current();
+      if (r.ok) toast('success', t('sync.toast.done'));
+      else if (r.failed.length) toast('warn', t('sync.toast.failed', { clouds: r.failed.join(', ') }));
+      else toast('error', r.error || t('sync.pill.failed'));
+    },
+  });
+  const refreshSetupRef = useRef(() => {});
 
   useEffect(() => { safeStorage('set', SPLIT_KEY, String(frac)); }, [frac]);
 
@@ -380,6 +397,20 @@ function App() {
     setPreviewOpen(true);
   }
 
+  /** Re-read the connections and the cloud list (a connection made or removed while the server runs is visible at once). */
+  async function refreshSetup() {
+    try {
+      const [data, cfg] = await Promise.all([api.setup(), api.config()]);
+      setSetup({ loaded: true, data, error: null });
+      setConfig((old) => ({ ...cfg, csrf: undefined, approvals_enabled: cfg.approvals_enabled === undefined && old ? old.approvals_enabled : cfg.approvals_enabled }));
+      return data;
+    } catch (e) {
+      setSetup((x) => ({ ...x, loaded: true, error: e }));
+      return null;
+    }
+  }
+  refreshSetupRef.current = refreshSetup;
+
   // ---------------------------------------------------------------- start up
   useEffect(() => {
     (async () => {
@@ -402,6 +433,13 @@ function App() {
         setConfig(cfg);
         // A run that changed a cloud since its last scan: say so again after a reload, as the page did right after the run.
         if (cfg.outdated && cfg.outdated.length) setOutdated({ remotes: cfg.outdated });
+        // The connections decide where the page opens (no route, nothing connected: the Welcome screen). A server that
+        // does not know the route (older, or a test double) leaves the page as it was.
+        try {
+          const data = await api.setup();
+          setSetup({ loaded: true, data, error: null });
+          if (!window.location.hash && (data.first_run || (!(data.connections || []).length && !(cfg.remotes || []).length))) navigate('#/clouds', { replace: true });
+        } catch (e) { setSetup({ loaded: true, data: null, error: e }); }
         const list = await api.listDrafts();
         setDrafts(list);
         const saved = Number(safeStorage('get', DRAFT_KEY));
@@ -474,6 +512,7 @@ function App() {
   const refreshPlansRef = useRef(refreshPlans);
   refreshPlansRef.current = refreshPlans;
   const ready = !!config && !!draft;
+  useEffect(() => { if (ready) sync.resume(); }, [ready]);
   useEffect(() => {
     if (!ready) return undefined;
     refreshPlansRef.current();
@@ -518,6 +557,7 @@ function App() {
     config, draft, toast, confirm: confirmDialog, prompt: promptDialog, reveal,
     stageMove, stageMkdir, stageMany, rename: renameItem, afterExecution, resolveClash,
     outdated, markOutdated, catalogRefreshed,
+    setup, refreshSetup, sync, syncEpoch,
     plans: plansState, refreshPlans, openWorkspacePreview,
     nav: navigate, lang, switchLang, revealInWorkspace, openWorkspace: () => navigate('#/workspace'),
     compare: (a, b) => navigate(compareHash({ remote: a.remote, path: a.path }, { remote: b.remote, path: b.path })),
@@ -571,6 +611,7 @@ function App() {
         <span class="spacer"></span>
         ${sum.moved_files > 0 && html`<span class="topbar-summary" data-testid="draft-summary">
           ${t('draft.summary', { files: fmtNum(sum.moved_files), bytes: fmtBytes(sum.moved_bytes) })}</span>`}
+        ${onWorkspace && html`<${SyncControl} />`}
         <button class="btn btn-small" data-testid="lang-toggle" onClick=${switchLang} title=${t('app.language')}>
           ${lang === 'zh-TW' ? 'EN' : '中文'}</button>
         <button class="btn btn-primary" data-testid="preview-button" disabled=${active.length === 0}

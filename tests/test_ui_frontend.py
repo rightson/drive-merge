@@ -548,6 +548,15 @@ class MockApi:
                 return 401, {"error": "missing or invalid credentials", "code": "UNAUTHENTICATED"}
             return 200, {"approvals_enabled": self.approvals_enabled, "execution_enabled": self.execution_enabled,
                          "remotes": self.remotes, "version": "0.1.0", "csrf": self.CSRF, "outdated": self.outdated}
+        if (method, path) == ("GET", "/v1/setup"):       # docs/ONBOARDING.md section D (tests/test_ui_onboarding.py mocks it in depth)
+            return 200, {"first_run": False, "config_path": "/home/u/.config/drive-merge/config.toml",
+                         "rclone": {"found": True, "path": "/usr/bin/rclone", "version": "1.75.0", "ok": True, "managed": False},
+                         "connections": [{"name": r["name"], "provider": r["provider"], "account": f"me@{r['name']}.example",
+                                          "read": True, "write": r["writable"], "writable": r["writable"], "created_at": "2024-01-01T00:00:00Z"}
+                                         for r in self.remotes],
+                         "providers": [{"key": "drive", "label": "Google Drive", "needs_client": True},
+                                       {"key": "onedrive", "label": "OneDrive", "needs_client": False},
+                                       {"key": "dropbox", "label": "Dropbox", "needs_client": False}]}
         if (method, path) == ("GET", "/v1/tree/roots"):
             return 200, {"roots": self.roots()}
         if (method, path) == ("GET", "/v1/tree"):
@@ -3672,7 +3681,7 @@ def _query(ui: Ui) -> dict:
 def test_plans_sits_between_compare_and_the_workspace_and_alt_5_opens_it(make_ui):
     ui = make_ui(locale="en-US").open()
     order = ui.page.eval_on_selector_all('[data-testid="rail"] a', "els => els.map(e => e.dataset.testid)")
-    assert order == ["rail-overview", "rail-explore", "rail-compare", "rail-plans", "rail-workspace"]
+    assert order == ["rail-clouds", "rail-overview", "rail-explore", "rail-compare", "rail-plans", "rail-workspace"]
     ui.page.keyboard.press("Alt+5")
     expect(ui.tid("rail-plans")).to_have_attribute("aria-current", "page")
     expect(ui.tid("view-plans")).to_be_visible()
