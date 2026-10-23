@@ -15,6 +15,19 @@ Design documents: [docs/DESIGN.md](docs/DESIGN.md) — architecture, safety mode
 - **Nothing is written to a cloud except by an approved plan.** Plans are simulated against the catalog (no content may lose its last copy, every delete needs a provably identical surviving witness, no overwrites, case collisions, ...). Approval is bound to the simulation digest and needs an interactive terminal. Deletes go to a quarantine folder and can be restored.
 - **LLMs propose, humans approve.** Claude Code (via MCP) can search, read folder profiles, write layout rules, create and simulate plans. It cannot approve or execute them.
 
+## Quick start
+
+Requires Python 3.11+ and [rclone](https://rclone.org/install/) ≥ 1.69 (the page can install it for you). No config file and no `rclone config`.
+
+```bash
+pip install 'drive-merge[api]'
+drivemerge ui                    # first run creates ~/.config/drive-merge/ and opens the page
+```
+
+1. **Connect.** The page opens on a Welcome screen with one card per cloud. Dropbox and OneDrive are one button each; Google Drive needs your own OAuth client, and the dialog walks you through it (about 5 minutes, once). A connection is read-only: the card shows the account, the quota and "connected, read-only".
+2. **Sync.** One button lists every connected cloud in parallel into the local catalog, with progress per cloud. Everything after that (Overview, Explore, Compare) is a local query.
+3. **Free space.** Open **Free space…** on a cloud: it shows how much of it is *proven* to exist on your other clouds (identical bytes), what is only *probable* (one click, **Verify**, settles it) and what exists only there. **Allow changes** (a second sign-in) lets drive-merge create a plan that frees the proven part; you review it, type the approval code, run it, and **Purge now** returns the space. Nothing is changed before that. See [docs/ONBOARDING.md](docs/ONBOARDING.md).
+
 ## Install
 
 Requires Python 3.11+ and rclone ≥ 1.69 (for iCloud).
@@ -24,7 +37,7 @@ pip install -e '.[api,mcp]'      # or: uv pip install -e '.[api,mcp]'
 drivemerge init                  # writes ~/.config/drive-merge/config.toml and an API token
 ```
 
-Configure one rclone remote per cloud (`rclone config`). Recommended: a read-only remote for scanning (e.g. Google Drive with scope `drive.readonly`) and a separate writable remote only if/when you want drive-merge to change that cloud. Note: rclone's shared Google Drive client_id is being retired in 2026 — [create your own](https://rclone.org/drive/#making-your-own-client-id).
+The terminal route for clouds the page does not offer (iCloud), or for scripting: `drivemerge connect dropbox|onedrive|drive` signs in from the terminal, or configure one rclone remote per cloud yourself (`rclone config`). Recommended: a read-only remote for scanning (e.g. Google Drive with scope `drive.readonly`) and a separate writable remote only if/when you want drive-merge to change that cloud. Note: rclone's shared Google Drive client_id is being retired in 2026 — [create your own](https://rclone.org/drive/#making-your-own-client-id).
 
 Edit the config (see [examples/config.toml](examples/config.toml)):
 

@@ -57,3 +57,60 @@ def test_the_key_must_be_a_real_boolean(value):
     """The string "false" is truthy in Python: accepting it would silently flip the meaning."""
     with pytest.raises(ValueError, match="case_insensitive"):
         parse_config({"remotes": [_remote("disk", "local", case_insensitive=value)]})
+
+
+# ----------------------------------------------------------- connections.toml and rclone.conf
+
+def test_load_config_defaults_rclone_conf_next_to_the_config_and_merges_connections(tmp_path):
+    from drivemerge.config import load_config
+    main = tmp_path / "c" / "config.toml"
+    main.parent.mkdir()
+    main.write_text('[[remotes]]\nname = "mine"\nprovider = "local"\nread = "/x"\n')
+    (main.parent / "connections.toml").write_text(
+        '[[remotes]]\nname = "dropbox"\nprovider = "dropbox"\nread = "dropbox-ro:"\nconnection = true\n'
+        'account = "a@b.c"\ncreated_at = "2026-01-01T00:00:00Z"\n')
+    cfg = load_config(main)
+    assert cfg.rclone_config == str(main.parent / "rclone.conf")
+    assert [r.name for r in cfg.remotes] == ["mine", "dropbox"]            # main first, then connections
+    assert [r.connection for r in cfg.remotes] == [False, True]
+    assert cfg.config_path == main and cfg.connections_path == main.parent / "connections.toml"
+
+
+def test_an_explicit_rclone_config_is_kept(tmp_path):
+    from drivemerge.config import load_config
+    main = tmp_path / "config.toml"
+    main.write_text('[rclone]\nconfig = "/home/me/.config/rclone/rclone.conf"\n')
+    assert load_config(main).rclone_config == "/home/me/.config/rclone/rclone.conf"
+    assert parse_config({}).rclone_config is None                          # parse_config alone knows no directory
+
+
+def test_duplicate_between_the_two_files_names_both(tmp_path):
+    from drivemerge.config import load_config
+    main = tmp_path / "config.toml"
+    main.write_text('[[remotes]]\nname = "dbx"\nprovider = "dropbox"\nread = "dbx:"\n')
+    (tmp_path / "connections.toml").write_text('[[remotes]]\nname = "dbx"\nprovider = "dropbox"\nread = "dbx-ro:"\n')
+    with pytest.raises(ValueError, match=r"'dbx'.*config\.toml.*connections\.toml"):
+        load_config(main)
+
+
+def test_a_broken_connections_toml_is_a_clear_error(tmp_path):
+    from drivemerge.config import load_config
+    main = tmp_path / "config.toml"
+    main.write_text("")
+    (tmp_path / "connections.toml").write_text("[[remotes]\n")
+    with pytest.raises(ValueError, match="connections.toml"):
+        load_config(main)
+    (tmp_path / "connections.toml").write_text('[[remotes]]\nname = "x"\nprovider = "bogus"\nread = "x:"\n')
+    with pytest.raises(ValueError, match="unknown provider"):
+        load_config(main)
+
+
+def test_write_private_is_atomic_and_mode_600(tmp_path):
+    import stat
+    from drivemerge.config import write_private
+    p = tmp_path / "sub" / "f"
+    write_private(p, "a")
+    p.chmod(0o644)
+    write_private(p, "b")
+    assert p.read_text() == "b" and stat.S_IMODE(p.stat().st_mode) == 0o600
+    assert [x.name for x in p.parent.iterdir()] == ["f"]

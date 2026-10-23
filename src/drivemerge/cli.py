@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any
 
 from . import config as config_mod
+from . import connections
 from . import db, executor, plans
 from . import service as service_mod
 from .rclone import RcloneError
@@ -224,7 +225,7 @@ class Ctx:
     @property
     def service(self) -> service_mod.Service:
         if self._service is None:
-            self._service = service_mod.Service(self.config)
+            self._service = service_mod.Service(self.config, config_path=self.config_path)
         return self._service
 
 
@@ -414,22 +415,12 @@ def _exec_progress(*args: Any, **kwargs: Any) -> None:
 
 def _write_private(path: Path, text: str) -> None:
     """Write `text` to `path` readable by the owner only, atomically."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(text)
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, path)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp)
-        raise
+    config_mod.write_private(path, text)
 
 
-def cmd_init(ctx: Ctx) -> int:
-    path = ctx.config_path
-    if path.exists() and not ctx.args.force:
+def _init_config(path: Path, *, force: bool = False) -> tuple[config_mod.Config, str]:
+    """Write a new config (fresh API token, no remotes) and create the catalog; returns (config, database path)."""
+    if path.exists() and not force:
         raise ValueError(f"{path} already exists; use --force to overwrite it (this also replaces the API token)")
     template = importlib.resources.files("drivemerge").joinpath("config_template.toml").read_text(encoding="utf-8")
     token = secrets.token_urlsafe(32)
@@ -439,17 +430,23 @@ def cmd_init(ctx: Ctx) -> int:
     _write_private(path, text)
     cfg = _load_config(path)  # make sure what we wrote parses
     db.connect(cfg.db_path).close()
-    db_path = str(Path(cfg.db_path).expanduser())
+    return cfg, str(Path(cfg.db_path).expanduser())
+
+
+def cmd_init(ctx: Ctx) -> int:
+    path = ctx.config_path
+    _, db_path = _init_config(path, force=ctx.args.force)
     if ctx.json:
         _dump({"config": str(path), "database": db_path, "api_token": "generated"})
         return EXIT_OK
     print(f"Wrote {path} (mode 600, new API token) and created the catalog {db_path}")
     print()
     print("Next steps:")
-    print("  1. Configure one rclone remote per cloud:   rclone config")
-    print("     (use a read-only remote for scanning, e.g. Google Drive scope drive.readonly)")
-    print(f"  2. Edit the [[remotes]] entries in {path} to match your rclone remotes")
-    print("  3. Check them, then scan:                   drivemerge remotes && drivemerge scan --all")
+    print("  1. Connect your clouds in the browser:      drivemerge ui")
+    print("     or in this terminal:                     drivemerge connect dropbox   (also: onedrive, drive)")
+    print("  2. Check them, then scan:                   drivemerge connections && drivemerge scan --all")
+    print(f"  (clouds you connect are kept next to {path.name}: connections.toml and rclone.conf, mode 600;"
+          " you can still add [[remotes]] of your own)")
     return EXIT_OK
 
 
@@ -931,6 +928,84 @@ def cmd_changes(ctx: Ctx) -> int:
     return EXIT_OK
 
 
+def _connect_gate(action: str) -> None:
+    refusal = _human_refusal(action)
+    if refusal:
+        raise GateRefused(refusal)
+
+
+def _wait_for_sign_in(flow: connections.AuthFlow) -> None:
+    print("Open this link in a browser on this machine and sign in:", file=sys.stderr)
+    print(f"  {flow.auth_url}", file=sys.stderr)
+    print("Waiting for the sign-in to finish (Ctrl-C to cancel)...", file=sys.stderr)
+    try:
+        while not flow.wait(0.5):
+            pass
+    except KeyboardInterrupt:
+        connections.cancel_flow(flow.id)
+        raise
+    if flow.status != "succeeded":
+        code = "FLOW_TIMEOUT" if flow.status == "timeout" else "FLOW_FAILED"
+        raise connections.ConnectError(code, flow.error or f"the sign-in {flow.status}")
+
+
+def _show_connection(ctx: Ctx, conn: dict, verb: str) -> int:
+    if ctx.json:
+        _dump(conn)
+        return EXIT_OK
+    access = "changes allowed" if conn["writable"] else "read-only"
+    account = f" ({conn['account']})" if conn.get("account") else ""
+    print(f"{verb} {conn['name']}{account}: {access}")
+    return EXIT_OK
+
+
+def cmd_connect(ctx: Ctx) -> int:
+    a = ctx.args
+    _connect_gate("connect a cloud")
+    cfg = ctx.config
+    if a.enable_writes:
+        match = next((c for c in connections.list_connections(cfg) if c["name"] == a.enable_writes), None)
+        if match is None:
+            raise connections.ConnectError("NOT_FOUND", f"no connection named {a.enable_writes!r}")
+        flow = connections.start_flow(cfg, match["provider"], purpose="write", name=a.enable_writes,
+                                      client_id=a.client_id, client_secret=a.client_secret)
+        _wait_for_sign_in(flow)
+        return _show_connection(ctx, connections.finish_enable_writes(cfg, flow.id, a.enable_writes), "Enabled changes on")
+    if not a.provider:
+        raise ValueError("say which cloud: drivemerge connect drive|onedrive|dropbox (or --enable-writes NAME)")
+    connections.check_name(cfg, a.provider, a.name)     # before the person signs in, not after
+    flow = connections.start_flow(cfg, a.provider, client_id=a.client_id, client_secret=a.client_secret)
+    _wait_for_sign_in(flow)
+    return _show_connection(ctx, connections.finish_connect(cfg, flow.id, name=a.name), "Connected")
+
+
+def cmd_disconnect(ctx: Ctx) -> int:
+    _connect_gate("disconnect a cloud")
+    connections.disconnect(ctx.config, ctx.args.name)
+    if ctx.json:
+        _dump({"ok": True, "name": ctx.args.name})
+    else:
+        print(f"Disconnected {ctx.args.name}; the catalog keeps its files as last seen.")
+    return EXIT_OK
+
+
+def cmd_connections(ctx: Ctx) -> int:
+    rows = connections.list_connections(ctx.config)
+    if ctx.args.test:
+        for r in rows:
+            r["test"] = connections.test_connection(ctx.config, r["name"])
+    if ctx.json:
+        _dump(rows)
+        return EXIT_OK
+    if not rows:
+        print("No connections yet; run `drivemerge connect dropbox|onedrive|drive` or `drivemerge ui`.")
+        return EXIT_OK
+    table = [[r["name"], r["provider"], r["account"] or "-", "changes allowed" if r["writable"] else "read-only",
+              *(["ok" if r["test"]["ok"] else f"FAILED: {r['test']['error']}"] if ctx.args.test else [])] for r in rows]
+    print("\n".join(_table(["NAME", "PROVIDER", "ACCOUNT", "ACCESS", *(["TEST"] if ctx.args.test else [])], table)))
+    return EXIT_OK
+
+
 def cmd_serve(ctx: Ctx) -> int:
     cfg = ctx.config
     if ctx.args.host:
@@ -947,6 +1022,10 @@ def cmd_serve(ctx: Ctx) -> int:
 
 
 def cmd_ui(ctx: Ctx) -> int:
+    if not ctx.config_path.exists():
+        _init_config(ctx.config_path)
+        print(f"No config found: wrote {ctx.config_path} and created the catalog. "
+              "Connect your clouds on the page that opens.", file=sys.stderr)
     cfg = ctx.config
     try:
         from . import ui_api
@@ -1020,6 +1099,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--force", action="store_true", help="overwrite an existing config (replaces the token)")
 
     add(sub, "remotes", cmd_remotes, "list configured remotes")
+
+    p = add(sub, "connect", cmd_connect,
+            "sign in to a cloud and add it as a read-only connection (human, interactive terminal only)")
+    p.add_argument("provider", nargs="?", choices=sorted(connections.PROVIDER_SPECS), help="the cloud to connect")
+    p.add_argument("--name", metavar="N", help="connection name (default: gdrive, onedrive, dropbox; then -2, -3)")
+    p.add_argument("--client-id", metavar="ID", help="your own OAuth client id (required for drive)")
+    p.add_argument("--client-secret", metavar="SECRET", help="your own OAuth client secret (required for drive)")
+    p.add_argument("--enable-writes", metavar="NAME",
+                   help="sign in again with write access for an existing connection (needed before a plan can change it)")
+    p = add(sub, "disconnect", cmd_disconnect, "remove a connection and its rclone remotes (human, interactive terminal only)")
+    p.add_argument("name", metavar="NAME")
+    p = add(sub, "connections", cmd_connections, "list the clouds connected with `drivemerge connect`")
+    p.add_argument("--test", action="store_true", help="also list each cloud's top level to check the sign-in")
 
     p = add(sub, "scan", cmd_scan, "list a remote into the catalog (read-only)")
     p.add_argument("remote", nargs="?", help="remote name from the config")

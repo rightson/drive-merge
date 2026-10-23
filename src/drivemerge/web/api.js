@@ -29,7 +29,7 @@ async function call(method, path, { query, body, quiet401 = false } = {}) {
   }
   const headers = { Accept: 'application/json' };
   if (body !== undefined) headers['Content-Type'] = 'application/json';
-  if (method !== 'GET' && csrf) headers['X-CSRF-Token'] = csrf;
+  if (csrf) headers['X-CSRF-Token'] = csrf;
   let res;
   try {
     res = await fetch(url, {
@@ -91,6 +91,8 @@ export const suggestions = async (kind, { remote, limit = 20 } = {}) =>
 export const approve = (planId, code) => call('POST', `/v1/ui/plans/${planId}/approve`, { body: { code } });
 export const execute = (planId) => call('POST', `/v1/ui/plans/${planId}/execute`);
 export const rescan = (remotes) => call('POST', '/v1/ui/rescan', { body: { remotes } });
+/** Sync (docs/ONBOARDING.md section 5): list the given clouds (default all) into the catalog. Returns {job_id}. */
+export const sync = (remotes) => call('POST', '/v1/ui/sync', { body: remotes && remotes.length ? { remotes } : {} });
 export const job = (id) => call('GET', `/v1/jobs/${id}`);
 export const progress = (planId) => call('GET', `/v1/plans/${planId}/progress`);
 
@@ -120,4 +122,22 @@ export const createPlan = (body) => call('POST', '/v1/plans', { body });
 export const reviewPlan = (id) => call('POST', `/v1/ui/plans/${id}/review`);
 export const cancelPlan = (id) => call('POST', `/v1/ui/plans/${id}/cancel`);
 export const bridgeCandidates = ({ maxBytes, limit } = {}) => call('GET', '/v1/ui/bridge/candidates', { query: { max_bytes: maxBytes, limit } });
-export const startBridge = ({ maxBytes, limit } = {}) => call('POST', '/v1/ui/bridge', { body: { max_bytes: maxBytes, limit } });
+export const startBridge = ({ maxBytes, limit, entryIds } = {}) => call('POST', '/v1/ui/bridge', {
+  body: entryIds ? { entry_ids: entryIds } : { max_bytes: maxBytes, limit },
+});
+
+// Connections (docs/ONBOARDING.md section D). All of these but `setup` are human-channel routes.
+export const setup = () => call('GET', '/v1/setup');
+export const connectStart = (body) => call('POST', '/v1/ui/connect/start', { body });
+export const connectFlow = (id) => call('GET', `/v1/ui/connect/flows/${encodeURIComponent(id)}`);
+export const connectFinish = (id, name) => call('POST', `/v1/ui/connect/flows/${encodeURIComponent(id)}/finish`, { body: name ? { name } : {} });
+export const connectCancel = (id) => call('POST', `/v1/ui/connect/flows/${encodeURIComponent(id)}/cancel`, { body: {} });
+export const testConnection = (name) => call('POST', `/v1/ui/connections/${encodeURIComponent(name)}/test`, { body: {} });
+export const disconnect = (name) => call('DELETE', `/v1/ui/connections/${encodeURIComponent(name)}`);
+export const installRclone = () => call('POST', '/v1/ui/rclone/install', { body: {} });
+
+// Free space (docs/ONBOARDING.md section 6).
+export const release = (remote, { path, keep } = {}) => call('GET', `/v1/release/${encodeURIComponent(remote)}`, {
+  query: { path: path || undefined, keep_on: keep && keep.length ? keep.join(',') : undefined },
+});
+export const purge = (planId, body) => call('POST', `/v1/ui/plans/${planId}/purge`, { body });

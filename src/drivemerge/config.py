@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sqlite3
+import tempfile
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -13,6 +15,24 @@ from .db import set_quarantine_dir, utcnow
 
 DEFAULT_CONFIG_PATH = Path(os.environ.get("DRIVEMERGE_CONFIG", "~/.config/drive-merge/config.toml")).expanduser()
 DEFAULT_DB_PATH = "~/.local/share/drive-merge/catalog.db"
+RCLONE_CONF_NAME = "rclone.conf"            # drive-merge's own rclone config, next to the main config
+CONNECTIONS_NAME = "connections.toml"       # [[remotes]] written by `drivemerge connect` / the page
+
+
+def write_private(path: str | Path, text: str) -> None:
+    """Write `text` to `path` atomically (temp file + rename) with mode 600."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
 
 
 @dataclass
@@ -24,6 +44,7 @@ class RemoteConfig:
     hash_types: tuple[str, ...] | None = None  # override provider.native_hashes when scanning
     extra_args: tuple[str, ...] = ()        # extra rclone flags for this remote
     case_insensitive: bool | None = None    # override provider.case_insensitive (a local disk can be either)
+    connection: bool = False                # created by drivemerge connect (lives in connections.toml)
 
     @property
     def scan_hash_types(self) -> tuple[str, ...]:
@@ -64,6 +85,19 @@ class Config:
     remotes: list[RemoteConfig] = field(default_factory=list)
     safety: SafetyConfig = field(default_factory=SafetyConfig)
     api: ApiConfig = field(default_factory=ApiConfig)
+    config_path: Path | None = None         # the main config file this was loaded from
+
+    @property
+    def config_dir(self) -> Path:
+        return (self.config_path.parent if self.config_path else DEFAULT_CONFIG_PATH.parent)
+
+    @property
+    def connections_path(self) -> Path:
+        return self.config_dir / CONNECTIONS_NAME
+
+    @property
+    def own_rclone_conf(self) -> Path:
+        return self.config_dir / RCLONE_CONF_NAME
 
     def remote(self, name: str) -> RemoteConfig:
         for r in self.remotes:
@@ -98,6 +132,7 @@ def parse_config(data: dict) -> Config:
             hash_types=tuple(r["hash_types"]) if "hash_types" in r else None,
             extra_args=tuple(r.get("extra_args", ())),
             case_insensitive=_optional_bool(r, "case_insensitive"),
+            connection=bool(r.get("connection", False)),
         ))
     names = [r.name for r in remotes]
     if len(names) != len(set(names)):
@@ -115,9 +150,35 @@ def parse_config(data: dict) -> Config:
 
 
 def load_config(path: str | Path | None = None) -> Config:
+    """The main config plus `connections.toml` next to it.
+
+    A remote name defined in both files is an error naming both. `rclone_config` defaults to drive-merge's own
+    `rclone.conf` next to the config file when the config does not set `[rclone] config`.
+    """
     p = Path(path).expanduser() if path else DEFAULT_CONFIG_PATH
     with open(p, "rb") as f:
-        return parse_config(tomllib.load(f))
+        cfg = parse_config(tomllib.load(f))
+    cfg.config_path = p
+    if not cfg.rclone_config:
+        cfg.rclone_config = str(cfg.own_rclone_conf)
+    cpath = cfg.connections_path
+    if cpath.exists():
+        try:
+            with open(cpath, "rb") as f:
+                extra = parse_config({"remotes": tomllib.load(f).get("remotes", [])}).remotes
+        except tomllib.TOMLDecodeError as e:
+            raise ValueError(f"invalid {cpath}: {e}") from None
+        except (KeyError, TypeError, ValueError) as e:
+            raise ValueError(f"invalid {cpath}: {e.args[0] if isinstance(e, KeyError) else e}") from None
+        have = {r.name for r in cfg.remotes}
+        for r in extra:
+            if r.name in have:
+                raise ValueError(f"remote {r.name!r} is defined in both {p} and {cpath}; "
+                                 f"rename or remove one of them")
+            have.add(r.name)
+            r.connection = True
+            cfg.remotes.append(r)
+    return cfg
 
 
 def sync_remotes(conn: sqlite3.Connection, config: Config) -> None:

@@ -249,7 +249,7 @@ def test_every_route_but_the_open_ones_needs_credentials(app):
     routes = [r for r in _routes(client.app.routes) if r.path not in OPEN]
     paths = {r.path for r in routes}
     assert {"/v1/stats", "/v1/plans", "/v1/tree", "/v1/drafts", "/v1/suggestions", "/v1/jobs/{job_id}",
-            "/v1/plans/{plan_id}/progress", "/v1/ui/plans/{plan_id}/approve", "/v1/ui/rescan"} <= paths
+            "/v1/plans/{plan_id}/progress", "/v1/ui/plans/{plan_id}/approve", "/v1/ui/rescan", "/v1/ui/sync"} <= paths
     checked = 0
     for route in routes:
         for method in route.methods:
@@ -788,10 +788,10 @@ def test_execute_needs_execution_enabled(service, config, monkeypatch):
     assert not fake.calls
 
 
-# ----------------------------------------------------------------- rescan
+# ----------------------------------------------------------------- sync (and its alias, rescan)
 
-class _ScanLog(list):
-    """Calls made by the rescan job; `fail` names the remotes whose scan raises."""
+class _SyncLog(list):
+    """Calls made by the sync job; `fail` names the remotes whose listing fails."""
 
     def __init__(self):
         super().__init__()
@@ -799,65 +799,90 @@ class _ScanLog(list):
 
 
 @pytest.fixture
-def scans(monkeypatch):
-    """Record Service.scan / rebuild_identity as the rescan job calls them (both refresh dir_stats themselves)."""
-    log = _ScanLog()
+def syncs(monkeypatch):
+    """Record Service.sync as the sync job calls it (the real one lists clouds with rclone)."""
+    log = _SyncLog()
 
-    def scan(self, remote, *, root="", progress=None, force=False):
-        log.append(("scan", remote, self.conn))
-        if progress:
-            progress(10, 2, 1234)
-        if remote in log.fail:
-            raise RuntimeError(f"{remote} is unreachable")
-        return {"status": "complete", "files": 10, "dirs": 2, "bytes": 1234}
+    def sync(self, remotes=None, progress=None):
+        log.append(("sync", list(remotes), self.conn))
+        out = {}
+        for name in remotes:
+            progress(name, "queued", 0, 0, 0)
+        for name in remotes:
+            progress(name, "listing", 10, 2, 1234)
+            if name in log.fail:
+                progress(name, "failed", 10, 2, 1234)
+                out[name] = {"status": "failed", "files": 10, "bytes": 1234, "seconds": 0.1, "error": "unreachable"}
+            else:
+                progress(name, "done", 10, 2, 1234)
+                out[name] = {"status": "complete", "files": 10, "bytes": 1234, "seconds": 0.1, "error": None}
+        return {"remotes": out, "seconds": 0.2, "identity": {"groups": 1}}
 
-    monkeypatch.setattr(Service, "scan", scan)
-    monkeypatch.setattr(Service, "rebuild_identity", lambda self: log.append(("identity", self.conn)) or {"groups": 1})
+    monkeypatch.setattr(Service, "sync", sync)
     return log
 
 
-def test_rescan_scans_each_remote_then_rebuilds_identity(browser, service, scans):
+@pytest.mark.parametrize("route", ["/v1/ui/sync", "/v1/ui/rescan"])
+def test_sync_is_one_job_with_progress_per_remote(browser, service, syncs, route):
     client, headers = browser
-    r = client.post("/v1/ui/rescan", headers=headers, json={})
+    r = client.post(route, headers=headers, json={})
     assert r.status_code == 202
     job = _wait(client, r.json()["job_id"])
-    assert job["status"] == "done" and job["kind"] == "rescan" and job["error"] is None
-    assert [e[:2] if e[0] == "scan" else e[:1] for e in scans] == [
-        ("scan", "gdrive"), ("scan", "dropbox"), ("identity",)]
-    conns = {id(e[-1]) for e in scans}
-    assert len(conns) == 1 and id(service.conn) not in conns  # one private connection for the whole job
+    assert job["status"] == "done" and job["kind"] == "sync" and job["error"] is None
+    assert [(e[0], e[1]) for e in syncs] == [("sync", ["gdrive", "dropbox"])]
+    assert id(syncs[0][2]) != id(service.conn)               # a private connection for the job
     assert job["result"]["identity"] == {"groups": 1}
-    assert [(s["remote"], s["status"]) for s in job["result"]["scans"]] == [("gdrive", "complete"),
-                                                                           ("dropbox", "complete")]
-    assert job["progress"]["files"] == 10 and job["progress"]["remote"] == "dropbox"
-    assert job["progress"]["remotes_total"] == 2
+    p = job["progress"]
+    assert p["remotes_total"] == 2 and p["remotes_done"] == 2 and p["files"] == 20
+    assert p["remotes"]["gdrive"] == {"state": "done", "files": 10, "dirs": 2, "bytes": 1234}
 
 
-def test_rescan_can_be_limited_to_some_remotes(browser, scans):
+def test_sync_can_be_limited_to_some_remotes(browser, syncs):
     client, headers = browser
-    job = _wait(client, client.post("/v1/ui/rescan", headers=headers,
+    job = _wait(client, client.post("/v1/ui/sync", headers=headers,
                                     json={"remotes": ["dropbox", "dropbox"]}).json()["job_id"])
     assert job["status"] == "done"
-    assert [e[1] for e in scans if e[0] == "scan"] == ["dropbox"]
+    assert syncs[0][1] == ["dropbox"]
 
 
-def test_rescan_rejects_an_unknown_remote_before_starting(browser, scans):
+def test_sync_rejects_an_unknown_remote_before_starting(browser, syncs):
     client, headers = browser
-    r = client.post("/v1/ui/rescan", headers=headers, json={"remotes": ["gdrive", "icloud"]})
+    r = client.post("/v1/ui/sync", headers=headers, json={"remotes": ["gdrive", "icloud"]})
     assert r.status_code == 404 and "icloud" in r.json()["error"]
-    assert client.post("/v1/ui/rescan", headers=headers, json={"remotes": "gdrive"}).status_code == 422
-    assert not scans
+    assert client.post("/v1/ui/sync", headers=headers, json={"remotes": "gdrive"}).status_code == 422
+    assert not syncs
 
 
-def test_a_failed_scan_fails_the_job_but_the_other_remotes_still_finish(browser, scans):
+def test_sync_with_nothing_connected_says_so(service, config, syncs):
+    config.remotes.clear()
+    client, headers = _login(_app(service, config))
+    r = client.post("/v1/ui/sync", headers=headers, json={})
+    assert r.status_code == 400 and r.json()["code"] == "BAD_REQUEST"
+
+
+def test_a_failed_listing_fails_the_job_but_keeps_the_result_of_the_others(browser, syncs):
     client, headers = browser
-    scans.fail.add("gdrive")
-    job = _wait(client, client.post("/v1/ui/rescan", headers=headers, json={}).json()["job_id"])
+    syncs.fail.add("gdrive")
+    job = _wait(client, client.post("/v1/ui/sync", headers=headers, json={}).json()["job_id"])
     assert job["status"] == "failed" and "gdrive" in job["error"]
-    by_remote = {s["remote"]: s for s in job["result"]["scans"]}
-    assert by_remote["gdrive"]["status"] == "failed" and "unreachable" in by_remote["gdrive"]["error"]
-    assert by_remote["dropbox"]["status"] == "complete"
-    assert [e[0] for e in scans] == ["scan", "scan", "identity"]
+    assert job["result"]["remotes"]["gdrive"]["status"] == "failed"
+    assert job["result"]["remotes"]["dropbox"]["status"] == "complete"
+    assert job["progress"]["remotes"]["gdrive"]["state"] == "failed"
+
+
+def test_jobs_get_the_config_path_of_the_service(browser, service, syncs, tmp_path, monkeypatch):
+    service.config_path = tmp_path / "config.toml"
+    seen = []
+    real = Service.__init__
+
+    def spy(self, *a, **kw):
+        seen.append(kw.get("config_path"))
+        real(self, *a, **kw)
+
+    monkeypatch.setattr(Service, "__init__", spy)
+    client, headers = browser
+    _wait(client, client.post("/v1/ui/sync", headers=headers, json={}).json()["job_id"])
+    assert seen == [tmp_path / "config.toml"]
 
 
 # ----------------------------------------------------------------- plan progress
