@@ -196,11 +196,11 @@
 
 ## C. `rulestore.py`（新增）與目錄
 
-- 結構描述（`schema.sql`），`SCHEMA_VERSION = 3`（沒有東西需要遷移：資料表由 `CREATE TABLE IF NOT EXISTS` 建立；`_upgrade_after` 只記錄版本）：
+- 結構描述（`schema.sql`），`SCHEMA_VERSION = 3`（沒有東西需要遷移：資料表由 `CREATE TABLE IF NOT EXISTS` 建立，一開始就帶有 `AUTOINCREMENT`，所以草稿刪除後 id 不會被重複使用；版本 3 尚未發行，因此沒有任何目錄含有不帶它的資料表；`_upgrade_after` 只記錄版本）：
 
 ```sql
 CREATE TABLE IF NOT EXISTS rule_versions (
-    id           INTEGER PRIMARY KEY,
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,   -- never reused: a stale tab holding a deleted draft must not hit a new one
     status       TEXT NOT NULL CHECK (status IN ('draft', 'proposed', 'active', 'retired', 'dismissed')),
     text         TEXT NOT NULL,
     sha256       TEXT NOT NULL,                 -- of the UTF-8 text, exactly as stored

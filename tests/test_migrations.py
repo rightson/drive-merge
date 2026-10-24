@@ -517,3 +517,20 @@ def test_rule_versions_allows_one_active_row_and_known_statuses(tmp_path):
         add("active")
     with pytest.raises(sqlite3.IntegrityError):
         add("bogus")
+
+
+def test_rule_versions_ids_are_never_reused_in_fresh_and_migrated_catalogs(tmp_path):
+    fresh = db.connect(tmp_path / "new.db")
+    _make_v2_catalog(tmp_path / "v2.db")
+    migrated = db.connect(tmp_path / "v2.db")
+    for conn in (fresh, migrated):
+        assert "AUTOINCREMENT" in conn.execute("SELECT sql FROM sqlite_master WHERE name = 'rule_versions'").fetchone()[0]
+        now = db.utcnow()
+        ids = []
+        for _ in range(2):
+            ids.append(conn.execute("INSERT INTO rule_versions(status, text, sha256, ok, created_by, created_at, updated_at) "
+                                    "VALUES ('draft', '', 'x', 1, 'ui', ?, ?)", (now, now)).lastrowid)
+        conn.execute("DELETE FROM rule_versions WHERE id = ?", (ids[-1],))
+        again = conn.execute("INSERT INTO rule_versions(status, text, sha256, ok, created_by, created_at, updated_at) "
+                             "VALUES ('draft', '', 'x', 1, 'ui', ?, ?)", (now, now)).lastrowid
+        assert again > ids[-1]

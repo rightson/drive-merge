@@ -196,11 +196,11 @@ Everything below is binding. Read first: [DESIGN.md](DESIGN.md) §6, §7.4, [PLA
 
 ## C. `rulestore.py` (new) and the catalog
 
-- Schema (`schema.sql`), `SCHEMA_VERSION = 3` (nothing to migrate: the table is created by `CREATE TABLE IF NOT EXISTS`; `_upgrade_after` only records the version):
+- Schema (`schema.sql`), `SCHEMA_VERSION = 3` (nothing to migrate: the table is created by `CREATE TABLE IF NOT EXISTS`, with `AUTOINCREMENT` from the start, so an id is never reused after a draft is deleted; version 3 has not been released, so no catalog holds the table without it; `_upgrade_after` only records the version):
 
 ```sql
 CREATE TABLE IF NOT EXISTS rule_versions (
-    id           INTEGER PRIMARY KEY,
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,   -- never reused: a stale tab holding a deleted draft must not hit a new one
     status       TEXT NOT NULL CHECK (status IN ('draft', 'proposed', 'active', 'retired', 'dismissed')),
     text         TEXT NOT NULL,
     sha256       TEXT NOT NULL,                 -- of the UTF-8 text, exactly as stored

@@ -293,6 +293,16 @@ def test_only_the_browser_session_edits_drafts(plain, browser, bearer):
     _err(browser.put("/v1/rules/versions/999", json={"text": ACTIVE, "revision": 0}), 404, "RULES_VERSION_NOT_FOUND")
 
 
+def test_a_deleted_drafts_id_is_not_reused_and_a_stale_put_gets_not_found(browser):
+    browser.post("/v1/rules/versions", json={"text": ACTIVE})
+    old = browser.post("/v1/rules/versions", json={"text": ACTIVE}).json()
+    assert browser.delete(f"/v1/rules/versions/{old['id']}").json() == {"ok": True}
+    new = browser.post("/v1/rules/versions", json={"text": EDITED}).json()
+    assert new["id"] != old["id"]
+    _err(browser.put(f"/v1/rules/versions/{old['id']}", json={"text": ACTIVE, "revision": 0}), 404, "RULES_VERSION_NOT_FOUND")
+    assert browser.get(f"/v1/rules/versions/{new['id']}").json()["text"] == EDITED
+
+
 def test_deleting_drafts_and_dismissing_proposals(plain, browser, bearer, service):
     d = browser.post("/v1/rules/versions", json={"text": ACTIVE}).json()
     for client in (plain, bearer):

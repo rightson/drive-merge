@@ -1144,6 +1144,28 @@ def test_activating_shows_the_file_the_diff_and_the_count_and_sends_the_sha_it_s
     assert ui.mock.active_text == d["text"]
 
 
+def test_escape_closes_the_activation_dialog_even_when_focus_is_outside_it(make_r):
+    ui = make_r()
+    editor(ui, ui.mock.add_draft(ACTIVE_TEXT.replace("Photos/", "Pictures/")))
+    ui.tid("rules-activate").click()
+    dialog = ui.tid("rules-activate-dialog")
+    expect(dialog).to_be_visible()
+    ui.page.evaluate("document.activeElement.blur()")                                # focus on the page body
+    assert ui.page.evaluate("document.activeElement === document.body")
+    ui.page.keyboard.press("Escape")
+    expect(dialog).to_have_count(0)
+    assert not calls(ui, "POST", r"/activate")
+    ui.tid("rules-activate").click()                                                # and an Escape from inside still closes it once
+    expect(dialog).to_be_visible()
+    ui.page.keyboard.press("Escape")
+    expect(dialog).to_have_count(0)
+    ui.tid("rules-activate").click()                                                # an Escape that belongs to an IME composition does not
+    expect(dialog).to_be_visible()
+    ui.page.evaluate("document.activeElement.blur()")
+    ui.page.evaluate("document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', isComposing: true, bubbles: true}))")
+    expect(dialog).to_be_visible()
+
+
 def test_activate_is_disabled_for_a_text_with_errors(make_r):
     ui = make_r()
     editor(ui, ui.mock.add_draft(ACTIVE_TEXT.replace('["photo"]\ntarget', '["foto"]\ntarget', 1)))

@@ -247,7 +247,7 @@ CREATE TABLE IF NOT EXISTS dir_stats (
 -- API client. The active rules themselves are a file (config.rules_file); a row is `active` while its sha256 is the
 -- file's. A version is immutable once it is not a draft.
 CREATE TABLE IF NOT EXISTS rule_versions (
-    id           INTEGER PRIMARY KEY,
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,   -- never reused: a stale tab holding a deleted draft must not hit a new one
     status       TEXT NOT NULL CHECK (status IN ('draft', 'proposed', 'active', 'retired', 'dismissed')),
     text         TEXT NOT NULL,
     sha256       TEXT NOT NULL,                 -- of the UTF-8 text, exactly as stored

@@ -507,6 +507,21 @@ function ActivateDialog({ id, onClose, onDone }) {
   const [failure, setFailure] = useState(null);
   const seq = useRef(0);
 
+  // Focus can be on the page body (the clicked button is gone, or the person clicked the page); Escape must still close
+  // the dialog, as in every other Modal. Inside the dialog Modal handles it and stops the event, so this never runs twice.
+  // An Escape that cancels an IME composition belongs to the composition. Busy blocks it like `dismissable` does.
+  const keyRef = useRef(null);
+  keyRef.current = { busy, onClose };
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.key !== 'Escape' || e.isComposing || e.keyCode === 229 || e.defaultPrevented) return;
+      const k = keyRef.current;
+      if (!k.busy) k.onClose();
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, []);
+
   async function load() {
     seq.current += 1;
     const mine = seq.current;

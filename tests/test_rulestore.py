@@ -252,6 +252,18 @@ def test_discard_deletes_a_draft_and_dismisses_a_proposal(conn):
     assert any(json.loads(r[0])["version"] == p["id"] for r in conn.execute("SELECT detail FROM journal WHERE action = 'rules_dismiss'"))
 
 
+def test_a_deleted_drafts_id_is_never_reused_so_a_stale_save_cannot_hit_a_new_draft(conn):
+    rulestore.create_version(conn, A, created_by="ui")
+    newest = rulestore.create_version(conn, B, created_by="ui")
+    rulestore.discard(conn, newest["id"], by="ui")
+    fresh = rulestore.create_version(conn, C, created_by="ui")
+    assert fresh["id"] != newest["id"]
+    with pytest.raises(RulesError) as exc:                       # the stale tab still holds the deleted draft at revision 0
+        rulestore.update_draft(conn, newest["id"], A, revision=0)
+    assert exc.value.code == "RULES_VERSION_NOT_FOUND" and exc.value.status == 404
+    assert rulestore.get_version(conn, fresh["id"])["text"] == C and rulestore.get_version(conn, fresh["id"])["revision"] == 0
+
+
 def test_active_and_retired_versions_cannot_be_discarded(conn, config):
     a = rulestore.observe(conn, config)
     with pytest.raises(RulesError) as exc:

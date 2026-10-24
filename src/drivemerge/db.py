@@ -107,7 +107,9 @@ def _upgrade_before(conn: sqlite3.Connection) -> None:
 def _upgrade_after(conn: sqlite3.Connection) -> None:
     """Fill what schema.sql just created from the old data, then record the new version.
 
-    Version 3 only adds the rule_versions table, which schema.sql creates empty: from 2 there is nothing to fill.
+    Version 3 only adds the rule_versions table, which schema.sql creates empty (with AUTOINCREMENT, so ids of deleted
+    drafts are never reused): from 2 there is nothing to fill. Version 3 is unreleased (main is at 2), so no catalog
+    holds the table in an earlier shape and no rebuild is needed.
     """
     if (_schema_version(conn) or 0) < 2:              # still the old version: it is written last
         _fill_version_2(conn)
