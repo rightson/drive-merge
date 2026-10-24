@@ -441,9 +441,9 @@ function ConnCard({
 }) {
   const ctx = useContext(AppCtx);
   const result = test && !test.loading ? test : null;
-  const rawState = conn.state === 'needs_login' ? 'relogin' : conn.state;
+  // The server sends no per-connection state: the Test decides ("relogin" when the sign-in has expired).
   const expired = !!result && result.ok === false && result.code === 'AUTH_EXPIRED';
-  const state = ['signing', 'relogin', 'error'].includes(rawState) ? rawState : expired ? 'relogin' : result && result.ok === false ? 'error' : conn.writable ? 'rw' : 'ro';
+  const state = expired ? 'relogin' : result && result.ok === false ? 'error' : conn.writable ? 'rw' : 'ro';
   const account = (result && result.account) || conn.account;
   const quota = (result && result.quota) || conn.quota;
   const spec = providers.find((p) => p.key === conn.provider);

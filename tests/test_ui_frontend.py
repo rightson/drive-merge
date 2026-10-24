@@ -13,6 +13,7 @@ import json
 import os
 import re
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -4037,7 +4038,14 @@ def test_a_hidden_page_does_not_poll_the_plan_list(make_ui):
     ui.page.clock.install()
     ui.page.reload()
     expect(ui.tid("rail")).to_be_visible()
+    # The rail can be on screen before the app's first plan-list request has even left (it starts in an effect once the
+    # config and draft are loaded): wait for that request, then for the page to be idle, before counting.
+    deadline = time.monotonic() + 15
+    while not ui.mock.calls_to("GET", "/v1/plans/summaries") and time.monotonic() < deadline:
+        ui.page.wait_for_timeout(50)
+    ui.page.wait_for_load_state("networkidle")
     n = len(ui.mock.calls_to("GET", "/v1/plans/summaries"))
+    assert n >= 1
     ui.page.evaluate("""() => { Object.defineProperty(document, 'hidden', { get: () => true, configurable: true }); }""")
     ui.page.clock.fast_forward(35_000)
     assert len(ui.mock.calls_to("GET", "/v1/plans/summaries")) == n

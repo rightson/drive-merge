@@ -98,7 +98,9 @@ def test_connection_facade_delegates(svc, monkeypatch):
     wflow = types.SimpleNamespace(id="f2", provider="dropbox", purpose="write", status="succeeded",
                                   auth_url=None, error=None)
     mod = types.ModuleType("drivemerge.connections")
-    mod.PROVIDER_SPECS = {"dropbox": types.SimpleNamespace(label="Dropbox", needs_client=False)}
+    mod.PROVIDER_SPECS = {"dropbox": types.SimpleNamespace(
+        label="Dropbox", needs_client=False, kind="authorize", fields=())}
+    mod.authorize_command = lambda k, purpose, client_id=None: ["rclone", "authorize", k, purpose]
     mod.rclone_status = lambda c: {"found": True, "ok": True}
     mod.list_connections = lambda c: [{"name": "db", "provider": "dropbox"}]
     mod.start_flow = lambda c, p, **kw: log.append(("start", p, kw)) or flow
@@ -113,7 +115,10 @@ def test_connection_facade_delegates(svc, monkeypatch):
     monkeypatch.setattr(svc, "reload_config", lambda: log.append("reload"))
 
     st = svc.setup_status()
-    assert st["providers"] == [{"key": "dropbox", "label": "Dropbox", "needs_client": False}]
+    assert st["providers"] == [{"key": "dropbox", "label": "Dropbox", "needs_client": False, "kind": "authorize",
+                                "fields": [], "authorize": {"read": ["rclone", "authorize", "dropbox", "read"],
+                                                            "write": ["rclone", "authorize", "dropbox", "write"]}}]
+    assert st["needed"] is True and [m["name"] for m in st["manual_remotes"]] == ["a"]
     assert st["rclone"]["ok"] and st["connections"][0]["name"] == "db" and st["first_run"] is False
     assert svc.start_connect("dropbox")["flow_id"] == "f1"
     assert svc.connect_flow("f1")["auth_url"] == "http://x"

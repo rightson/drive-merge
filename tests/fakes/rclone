@@ -13,7 +13,24 @@ Environment:
   FAKE_RCLONE_ROOT_BASE  default folder of a remote: <base>/<name without -ro/-rw>
   FAKE_RCLONE_TEST_FAIL  non-empty: lsjson/about on a fake remote fail like an expired token
   FAKE_RCLONE_REAL       path of the real rclone to pass through to (default: the next `rclone` on PATH)
-  FAKE_RCLONE_LOG        file that gets one JSON line per call: {"argv": [...]} (config secrets are masked)
+  FAKE_RCLONE_LOG        file that gets one JSON line per call: {"argv": [...]}; the value of every `key=value`
+                         option of `config create` and every `--result` is masked (secrets never reach the log)
+  FAKE_RCLONE_DRIVES     number of OneDrive drives the account has (default 1: `config_driveid` has a default and no
+                         examples; 2 or more: it lists them, has no default, and the answer is stored as drive_id)
+  FAKE_RCLONE_FAIL_CREATE    non-empty: `config create` writes the remote, then exits 1 (boom)
+  FAKE_RCLONE_FAIL_CONTINUE  non-empty: `config create --continue` exits 1 (boom)
+  FAKE_RCLONE_ECHO_ANSWER    non-empty: an answer to a question of the person (2FA code, drive choice) is echoed
+                             in an error on stderr, like a careless rclone would
+  FAKE_RCLONE_ECHO_CREATE    non-empty: `config create` echoes every key=value (token, password) in an error
+  FAKE_RCLONE_HANG_LSJSON    non-empty: `lsjson` sleeps for a minute (a Test that never answers)
+
+A remote section with `fake_error = auth|network|other` makes lsjson/about on it fail like an expired token, a dead
+network or something unknown.
+
+`config create NAME iclouddrive apple_id=... password=... --non-interactive` contacts nothing: it stores the remote
+(the password obscured unless --no-obscure) and asks `config_2fa`; the code 123456 is accepted, anything else asks
+again with an Error. `--no-obscure` stores values as given. `config file` prints the --config path (or RCLONE_CONFIG,
+or ~/.config/rclone/rclone.conf).
 
 `authorize <type> ...` prints rclone's NOTICE lines (with an auth URL whose `state` is random) on stderr, then
 waits until the file $FAKE_RCLONE_AUTH_DIR/<state> or $FAKE_RCLONE_AUTH_DIR/ANY exists, then prints the token
@@ -108,7 +125,20 @@ def record(argv: list[str]) -> None:
     path = os.environ.get("FAKE_RCLONE_LOG")
     if not path:
         return
-    masked = [re.sub(r"^(token|client_secret)=.*", r"\1=<masked>", a) for a in argv]
+    masked, in_create, after_result = [], False, False
+    for a in argv:
+        in_create = in_create or a == "create"
+        if after_result:
+            a = "<masked>"
+        elif in_create and not a.startswith("-") and "=" in a:
+            a = a.split("=", 1)[0] + "=<masked>"
+        after_result = a == "--result"
+        masked.append(a)
+    if "authorize" in masked:                     # authorize TYPE CLIENT_ID CLIENT_SECRET [flags]
+        at = masked.index("authorize")
+        positional = [i for i in range(at + 1, len(masked)) if not masked[i].startswith("-")]
+        if len(positional) >= 3:
+            masked[positional[2]] = "<masked>"
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps({"argv": masked}) + "\n")
 
@@ -172,10 +202,33 @@ def cmd_authorize(args: list[str]) -> int:
 
 # ----------------------------------------------------------------------------- config
 
-def _question(state: str, name: str, help_: str, typ: str, default: str) -> dict:
-    return {"State": state, "Option": {"Name": name, "Help": help_, "Default": default == "true" if typ == "bool" else default,
-                                       "DefaultStr": default, "ValueStr": default, "Type": typ, "Exclusive": True},
-            "Error": "", "Result": ""}
+def _question(state: str, name: str, help_: str, typ: str, default: str, *, examples=None, password=False,
+              required=False, error: str = "") -> dict:
+    opt = {"Name": name, "Help": help_, "Default": default == "true" if typ == "bool" else default,
+           "DefaultStr": default, "ValueStr": default, "Type": typ, "Exclusive": True,
+           "IsPassword": password, "Required": required}
+    if examples:
+        opt["Examples"] = examples
+    return {"State": state, "Option": opt, "Error": error, "Result": ""}
+
+
+def _drives() -> list[dict]:
+    n = int(os.environ.get("FAKE_RCLONE_DRIVES", "1") or 1)
+    names = ["drive-personal", "drive-docs", "drive-team", "drive-more"]
+    return [{"Value": names[i % 4] + ("" if i < 4 else str(i)), "Help": f"OneDrive drive {i + 1}"} for i in range(n)]
+
+
+def _ask_drive() -> dict:
+    drives = _drives()
+    if len(drives) > 1:
+        return _question("driveid", "config_driveid", "Select drive you want to use", "string", "",
+                         examples=drives, required=True)
+    return _question("driveid", "config_driveid", "Select drive you want to use", "string", "fake-drive-id")
+
+
+def _ask_2fa(error: str = "") -> dict:
+    return _question("fake-2fa", "config_2fa", "Enter the two-factor code sent to your devices.", "string", "",
+                     required=True, error=error)
 
 
 def _final() -> dict:
@@ -248,6 +301,10 @@ def config_create(rest: list[str], conf: dict, conf_path: str) -> int:
         typ = conf[name].get("type", "")
         state, result = flags.get("--state", ""), flags.get("--result", "")
         out = _final()
+        if os.environ.get("FAKE_RCLONE_FAIL_CONTINUE"):
+            die("Failed to configure: boom", 1)
+        if os.environ.get("FAKE_RCLONE_ECHO_ANSWER") and state in ("fake-2fa", "driveid"):
+            die("bad answer " + result, 1)
         if state.startswith("*oauth-confirm"):
             if typ == "onedrive":
                 out = _question("choose_type_done", "config_type", "Type of connection", "string", "onedrive")
@@ -255,11 +312,17 @@ def config_create(rest: list[str], conf: dict, conf_path: str) -> int:
                 out = _question("teamdrive_ok", "config_change_team_drive",
                                 "Configure this as a Shared Drive (Team Drive)?", "bool", "false")
         elif state == "choose_type_done":
-            out = _question("driveid", "config_driveid", "Select drive you want to use", "string", "fake-drive-id")
+            out = _ask_drive()
         elif state == "driveid":
             conf[name]["drive_id"] = result or "fake-drive-id"
             conf[name]["drive_type"] = "personal"
             out = _question("driveid_end", "config_drive_ok", "Drive OK?", "bool", "true")
+        elif state == "fake-2fa":
+            if result == "123456":
+                conf[name]["trust_token"] = "FAKE-TRUST"
+                out = _final()
+            else:
+                out = _ask_2fa("that code was not accepted")
         elif state in ("driveid_end", "teamdrive_ok"):
             out = _final()
         else:
@@ -269,9 +332,15 @@ def config_create(rest: list[str], conf: dict, conf_path: str) -> int:
         return 0
     typ = pos[1]
     kv.update(dict(a.split("=", 1) for a in pos[2:] if "=" in a))
+    if os.environ.get("FAKE_RCLONE_ECHO_CREATE"):
+        die("bad options " + " ".join(f"{k}={v}" for k, v in kv.items()), 1)
+    if typ == "iclouddrive" and not kv.get("apple_id"):
+        die("a apple ID is required", 1)
     section = {"type": typ}
     for k, v in kv.items():
         section[k] = v
+    if "password" in section and "--no-obscure" not in flags:
+        section["password"] = "OBSCURED-" + section["password"][::-1]      # rclone obscures what it is given
     token = {}
     if "token" in kv:
         try:
@@ -288,8 +357,12 @@ def config_create(rest: list[str], conf: dict, conf_path: str) -> int:
             section["fake_root"] = os.path.join(base, re.sub(r"-(ro|rw)$", "", name))
     conf[name] = section
     write_conf(conf_path, conf)
+    if os.environ.get("FAKE_RCLONE_FAIL_CREATE"):
+        die("Failed to create remote: boom", 1)
     if interactive_off:
-        if "token" in kv:
+        if typ == "iclouddrive":
+            print(json.dumps(_ask_2fa(), indent=4))
+        elif "token" in kv:
             first = {"onedrive": "*oauth-confirm,choose_type,,", "drive": "*oauth-confirm,teamdrive,oauth,"}.get(typ, "*oauth-confirm,,,")
             print(json.dumps(_question(first, "config_refresh_token", "Token already configured - replace it?",
                                        "bool", "true"), indent=4))
@@ -316,9 +389,21 @@ def find_real() -> str:
 def pass_through(argv: list[str], conf_path: str) -> int:
     conf = read_conf(conf_path)
     roots = {n: o["fake_root"] for n, o in conf.items() if "fake_root" in o}
+    broken = [conf[m.group(1)].get("fake_error") for a in argv
+              for m in [re.match(r"^([^:/]+):", a)] if m and m.group(1) in conf and conf[m.group(1)].get("fake_error")]
+    if broken and argv and argv[0] in ("lsjson", "about", "lsf", "size"):
+        kind = broken[0]
+        if kind == "auth":
+            die("Failed to create file system: couldn't fetch token - maybe it has expired? - refresh with "
+                "\"rclone config reconnect\": oauth2: token expired and refresh token is not set", 1)
+        if kind == "network":
+            die("error listing: Get \"https://www.googleapis.com\": dial tcp: lookup www.googleapis.com: no such host", 1)
+        die("something odd happened", 1)
     if os.environ.get("FAKE_RCLONE_TEST_FAIL") and argv and argv[0] in ("lsjson", "about", "lsf", "size"):
         if any(re.match(r"^([^:/]+):", a) and re.match(r"^([^:/]+):", a).group(1) in roots for a in argv):
             die("couldn't login: HTTP error 401 (401 Unauthorized) returned body: invalid_access_token", 1)
+    if os.environ.get("FAKE_RCLONE_HANG_LSJSON") and argv and argv[0] == "lsjson":
+        time.sleep(60)
     out = []
     for a in argv:
         m = re.match(r"^([A-Za-z0-9_.+@-]+):(.*)$", a)

@@ -30,7 +30,9 @@ AUTH = {"Authorization": f"Bearer {API}"}
 def _env(tmp_path, monkeypatch):
     monkeypatch.setenv("FAKE_RCLONE_AUTH_DIR", str(tmp_path / "auth"))
     monkeypatch.setenv("FAKE_RCLONE_ROOT_BASE", str(tmp_path / "clouds"))
-    for var in ("FAKE_RCLONE_AUTH_MODE", "FAKE_RCLONE_TEST_FAIL", "FAKE_RCLONE_REAL", "FAKE_RCLONE_LOG"):
+    for var in ("FAKE_RCLONE_AUTH_MODE", "FAKE_RCLONE_TEST_FAIL", "FAKE_RCLONE_REAL", "FAKE_RCLONE_LOG",
+                "FAKE_RCLONE_DRIVES", "FAKE_RCLONE_FAIL_CREATE", "FAKE_RCLONE_FAIL_CONTINUE",
+                "FAKE_RCLONE_ECHO_ANSWER", "FAKE_RCLONE_ECHO_CREATE", "FAKE_RCLONE_HANG_LSJSON", "RCLONE_CONFIG"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setattr(connections, "MANAGED_BIN_DIR", tmp_path / "managed-bin")
@@ -38,6 +40,7 @@ def _env(tmp_path, monkeypatch):
     for f in list(connections._FLOWS.values()):
         connections.cancel_flow(f.id)
     connections._FLOWS.clear()
+    connections._RESERVED.clear()
 
 
 @pytest.fixture
@@ -147,7 +150,8 @@ def test_full_connect_sync_release_disconnect_flow_never_exposes_a_token(browser
     setup = rec.call("GET", "/v1/setup").json()
     assert setup["first_run"] is True and setup["connections"] == [] and setup["rclone"]["ok"] is True
     assert {p["key"]: p["needs_client"] for p in setup["providers"]} == {
-        "drive": True, "onedrive": False, "dropbox": False}
+        "drive": True, "onedrive": False, "dropbox": False, "iclouddrive": False}
+    assert setup["needed"] is True and setup["manual_remotes"] == []
     assert brec.call("GET", "/v1/setup").json()["first_run"] is True          # bearer may read it too
 
     # Dropbox: a click, a sign-in, done. Its content is the same as the Drive's, so there is something to free.
@@ -166,7 +170,8 @@ def test_full_connect_sync_release_disconnect_flow_never_exposes_a_token(browser
 
     r = rec.call("POST", "/v1/ui/connect/start", json={"provider": "dropbox"})
     flow_id, url = r.json()["flow_id"], r.json()["auth_url"]
-    assert url.startswith("http://127.0.0.1:53682/auth?state=") and set(r.json()) == {"flow_id", "auth_url"}
+    assert url.startswith("http://127.0.0.1:53682/auth?state=") and set(r.json()) == {"flow_id", "auth_url", "status"}
+    assert r.json()["status"] == "waiting"
     assert rec.call("GET", f"/v1/ui/connect/flows/{flow_id}").json()["status"] == "waiting"
     _sign_in(url, tmp_path / "clouds" / "dropbox", "me@example.com")
     assert _flow_done(client, flow_id, headers)["status"] == "succeeded"
@@ -246,7 +251,10 @@ HUMAN_ROUTES = [
     ("POST", "/v1/ui/connect/start", {"provider": "dropbox"}),
     ("GET", "/v1/ui/connect/flows/abc", None),
     ("POST", "/v1/ui/connect/flows/abc/finish", {}),
+    ("POST", "/v1/ui/connect/flows/abc/answer", {"result": "x"}),
     ("POST", "/v1/ui/connect/flows/abc/cancel", None),
+    ("POST", "/v1/ui/connect/paste", {"provider": "dropbox", "token": "x"}),
+    ("POST", "/v1/ui/connect/import", {"source": "x"}),
     ("POST", "/v1/ui/connections/dropbox/test", None),
     ("DELETE", "/v1/ui/connections/dropbox", None),
     ("POST", "/v1/ui/rclone/install", None),
@@ -279,10 +287,10 @@ def test_without_approvals_the_human_routes_are_off(service, method, url, body):
     assert r.status_code == 403 and r.json()["code"] == "APPROVALS_DISABLED"
 
 
-def test_setup_and_release_are_readable_with_either_credential_but_not_anonymously(browser, bearer, app, service,
-                                                                                     catalog_with_two_remotes):
+def test_setup_importable_and_release_are_readable_with_either_credential_but_not_anonymously(
+        browser, bearer, app, service, catalog_with_two_remotes):
     client, _ = browser
-    for url in ("/v1/setup", "/v1/release/gdrive"):
+    for url in ("/v1/setup", "/v1/release/gdrive", "/v1/ui/connect/importable"):
         assert bearer.get(url).status_code == 200
         assert client.get(url).status_code == 200
         assert TestClient(app).get(url).status_code == 401
@@ -528,3 +536,438 @@ def test_quota_is_null_when_unknown(bearer, service, catalog_with_two_remotes, m
 
     monkeypatch.setattr(connections, "test_connection", boom)
     assert bearer.get("/v1/release/gdrive").json()["quota"] is None
+
+
+# ======================================================================================================
+# docs/ONBOARDING.md section G: questions, iCloud, pasted tokens, import, coded Test, `needed`
+# ======================================================================================================
+
+import logging  # noqa: E402
+
+PASSWORD = "pw-SECRET-4711"
+CODE = "123456"
+
+
+def _clouds(tmp_path, name, files=None):
+    root = tmp_path / "clouds" / name
+    root.mkdir(parents=True, exist_ok=True)
+    for rel, data in (files or {"a.txt": "hello"}).items():
+        (root / rel).write_text(data)
+    return root
+
+
+def _icloud_start(rec, tmp_path, *, name=None, password=PASSWORD, **extra):
+    _clouds(tmp_path, name or "icloud")
+    return rec.call("POST", "/v1/ui/connect/start", json={
+        "provider": "iclouddrive", "apple_id": "me@example.com", "password": password,
+        **({"name": name} if name else {}), **extra})
+
+
+def _pasted(root: Path, **extra):
+    token = {"access_token": "pasted-at-a1b2c3d4", "token_type": "Bearer", "refresh_token": "pasted-rt-e5f6a7b8",
+             "expiry": "2099-01-01T00:00:00Z", "fake_root": str(root), **extra}
+    return token, "Paste the following into your remote machine --->\n" + json.dumps(token) + "\n<---End paste\n"
+
+
+# ---- GET /v1/setup: needed, manual_remotes, providers
+
+def test_setup_reports_the_providers_and_the_command_for_another_computer(bearer):
+    setup = bearer.get("/v1/setup").json()
+    by = {p["key"]: p for p in setup["providers"]}
+    assert by["iclouddrive"] == {"key": "iclouddrive", "label": "iCloud Drive", "needs_client": False, "kind": "config",
+                                 "fields": ["apple_id", "password"], "authorize": {"read": [], "write": []}}
+    assert by["drive"]["kind"] == "authorize" and by["drive"]["fields"] == []
+    assert by["drive"]["authorize"] == {"read": ["rclone", "authorize", "drive", "--drive-scope=drive.readonly"],
+                                        "write": ["rclone", "authorize", "drive", "--drive-scope=drive"]}
+    assert by["onedrive"]["authorize"]["read"][-1].startswith("--onedrive-access-scopes=Files.Read")
+    assert by["dropbox"]["authorize"] == {"read": ["rclone", "authorize", "dropbox"],
+                                          "write": ["rclone", "authorize", "dropbox"]}
+
+
+def test_needed_is_true_with_nothing_and_with_a_never_scanned_cloud_and_false_once_scanned(browser, bearer, tmp_path):
+    client, headers = browser
+    rec = Recorder(client, headers)
+    assert bearer.get("/v1/setup").json()["needed"] is True                              # nothing configured
+    _connect(rec, "dropbox", tmp_path / "clouds" / "dropbox")
+    setup = bearer.get("/v1/setup").json()
+    assert setup["needed"] is True and setup["first_run"] is False                        # configured, never scanned
+    job = _wait(client, rec.call("POST", "/v1/ui/sync", json={}).json()["job_id"])
+    assert job["status"] == "done", job
+    assert bearer.get("/v1/setup").json()["needed"] is False                              # every cloud scanned
+    _connect(rec, "dropbox", tmp_path / "clouds" / "dropbox-2", name="second")
+    assert bearer.get("/v1/setup").json()["needed"] is True                               # a new, never-scanned one
+
+
+def test_sync_of_a_never_scanned_connection_has_no_setup_page_extras(browser, tmp_path):
+    client, headers = browser
+    rec = Recorder(client, headers)
+    _clouds(tmp_path, "dropbox", {"a.txt": "one", "b.txt": "two"})
+    _connect(rec, "dropbox", tmp_path / "clouds" / "dropbox")
+    job_id = rec.call("POST", "/v1/ui/rescan", json={}).json()["job_id"]
+    job = _wait(client, job_id)
+    assert job["status"] == "done" and job["result"]["remotes"]["dropbox"]["files"] == 2
+    assert "remote" not in job["progress"] and "remote_index" not in job["progress"]       # PR #5's extras are gone
+    assert "scans" not in job["result"]
+    assert job["progress"]["remotes_total"] == 1 and job["progress"]["remotes_done"] == 1
+
+
+def test_a_cloud_of_config_toml_is_a_manual_remote_and_can_be_tested_and_synced(browser, bearer, service, tmp_path):
+    client, headers = browser
+    disk = _clouds(tmp_path, "disk", {"f.txt": "x"})
+    path = service.config.config_path
+    path.write_text(path.read_text() + f'[[remotes]]\nname = "disk"\nprovider = "local"\nread = "{disk}"\n'
+                    f'[[remotes]]\nname = "w"\nprovider = "local"\nread = "{disk}"\nwrite = "{disk}"\n')
+    service.reload_config()
+    setup = bearer.get("/v1/setup").json()
+    assert setup["manual_remotes"] == [{"name": "disk", "provider": "local", "writable": False},
+                                       {"name": "w", "provider": "local", "writable": True}]
+    assert setup["connections"] == [] and setup["needed"] is True and setup["first_run"] is False
+    r = client.post("/v1/ui/connections/disk/test", headers=headers)
+    assert r.status_code == 200 and r.json()["ok"] is True and r.json()["code"] is None
+    r = client.post("/v1/ui/connections/nobody/test", headers=headers)
+    assert r.status_code == 404 and r.json()["code"] == "NOT_FOUND"
+    assert _wait(client, client.post("/v1/ui/sync", headers=headers, json={"remotes": ["disk"]}).json()["job_id"]
+                 )["status"] == "done"
+    assert client.delete("/v1/ui/connections/disk", headers=headers).status_code == 404   # not a connection
+
+
+def test_a_connection_made_by_the_terminal_while_the_server_runs_is_seen_on_the_next_setup(browser, bearer, service,
+                                                                                         config, tmp_path):
+    cli_config = config_mod.load_config(config.config_path)            # `drivemerge connect` runs in its own process
+    flow = connections.start_flow(cli_config, "dropbox")
+    _sign_in(flow.auth_url, tmp_path / "clouds" / "dropbox", "term@example.com")
+    assert flow.wait(10)
+    connections.finish_connect(cli_config, flow.id)
+    assert [r.name for r in service.config.remotes] == []                # the server has not looked yet
+    setup = bearer.get("/v1/setup").json()
+    assert [c["name"] for c in setup["connections"]] == ["dropbox"] and setup["first_run"] is False
+    assert [r.name for r in service.config.remotes] == ["dropbox"]       # reloaded, rclone and catalog remotes too
+    assert service.conn.execute("SELECT 1 FROM remotes WHERE name = 'dropbox'").fetchone()
+    connections.disconnect(cli_config, "dropbox")
+    assert bearer.get("/v1/setup").json()["connections"] == []
+
+
+# ---- iCloud Drive over HTTP
+
+def test_icloud_start_is_a_202_question_then_the_answer_is_a_200_connection(browser, bearer, service, tmp_path, caplog,
+                                                                           capsys, monkeypatch):
+    caplog.set_level(logging.DEBUG)
+    log = tmp_path / "calls.log"
+    monkeypatch.setenv("FAKE_RCLONE_LOG", str(log))
+    client, headers = browser
+    rec, brec = Recorder(client, headers), Recorder(bearer, {})
+    r = _icloud_start(rec, tmp_path)
+    assert r.status_code == 202
+    body = r.json()
+    assert set(body) == {"flow_id", "status", "question", "retry", "auth_url"} and body["auth_url"] is None
+    assert body["status"] == "question" and body["retry"] is False and body["question"]["name"] == "config_2fa"
+    flow_id = body["flow_id"]
+    view = rec.call("GET", f"/v1/ui/connect/flows/{flow_id}").json()
+    assert view["status"] == "question" and view["question"] == body["question"] and view["name"] == "icloud"
+    assert set(view) == {"id", "provider", "purpose", "status", "auth_url", "error", "code", "params", "name",
+                         "question", "retry", "connection"}
+    assert brec.call("GET", "/v1/setup").json()["connections"] == []                      # nothing recorded yet
+
+    wrong = rec.call("POST", f"/v1/ui/connect/flows/{flow_id}/answer", json={"result": "000000"})
+    assert wrong.status_code == 202 and wrong.json()["retry"] is True and wrong.json()["flow_id"] == flow_id
+    assert "not accepted" not in wrong.text
+    ok = rec.call("POST", f"/v1/ui/connect/flows/{flow_id}/answer", json={"result": CODE})
+    assert ok.status_code == 200 and "flow_id" not in ok.json()
+    conn = ok.json()
+    assert conn["name"] == "icloud" and conn["provider"] == "iclouddrive" and conn["scoped"] is False
+    assert conn["writable"] is False and conn["imported_from"] is None
+    assert rec.call("GET", f"/v1/ui/connect/flows/{flow_id}").json()["status"] == "done"
+    assert [r.name for r in service.config.remotes] == ["icloud"]                          # visible without a restart
+    again = rec.call("POST", f"/v1/ui/connect/flows/{flow_id}/answer", json={"result": CODE})
+    assert again.status_code == 409 and again.json()["code"] == "NOT_WAITING"
+    assert brec.call("GET", "/v1/setup").json()["connections"][0]["scoped"] is False
+
+    out = capsys.readouterr()
+    blob = "\n".join(rec.bodies + brec.bodies + [out.out, out.err, caplog.text, log.read_text()])
+    blob += (tmp_path / "conf" / "connections.toml").read_text() + (tmp_path / "conf" / "config.toml").read_text()
+    for secret in (PASSWORD, CODE, "000000"):
+        assert secret not in blob
+
+
+def test_icloud_body_validation(browser, tmp_path):
+    client, headers = browser
+    rec = Recorder(client, headers)
+    r = rec.call("POST", "/v1/ui/connect/start", json={"provider": "iclouddrive", "apple_id": "me@example.com"})
+    assert r.status_code == 400 and r.json()["code"] == "MISSING_FIELD" and r.json()["params"] == {"field": "password"}
+    r = rec.call("POST", "/v1/ui/connect/start", json={"provider": "iclouddrive", "password": "pw"})
+    assert r.status_code == 400 and r.json()["params"] == {"field": "apple_id"}
+    r = rec.call("POST", "/v1/ui/connect/start", json={"provider": "iclouddrive", "apple_id": "a@b.c", "password": "pw",
+                                                       "client_id": "x", "client_secret": "y"})
+    assert r.status_code == 400 and r.json()["code"] == "BAD_REQUEST"
+    for provider in ("dropbox", "onedrive"):
+        for extra in ({"apple_id": "a@b.c"}, {"password": "pw"}):
+            r = rec.call("POST", "/v1/ui/connect/start", json={"provider": provider, **extra})
+            assert r.status_code == 400 and r.json()["code"] == "BAD_REQUEST", (provider, extra)
+    r = rec.call("POST", "/v1/ui/connect/start", json={"provider": "onedrive", "client_id": "c", "client_secret": "s"})
+    assert r.status_code == 400 and r.json()["code"] == "BAD_REQUEST"
+    r = rec.call("POST", "/v1/ui/connect/start", json={"provider": "iclouddrive", "apple_id": "a@b.c", "password": "p",
+                                                       "extra": 1})
+    assert r.status_code == 422
+    assert rec.call("GET", "/v1/setup").json()["connections"] == []
+    assert not [f for f in connections._FLOWS.values() if f.status in connections._BUSY]
+
+
+def test_icloud_enable_changes_reuses_read(browser, tmp_path):
+    client, headers = browser
+    rec = Recorder(client, headers)
+    flow_id = _icloud_start(rec, tmp_path).json()["flow_id"]
+    rec.call("POST", f"/v1/ui/connect/flows/{flow_id}/answer", json={"result": CODE})
+    r = rec.call("POST", "/v1/ui/connect/start", json={"purpose": "write", "name": "icloud"})
+    assert r.status_code == 200 and r.json()["auth_url"] is None and r.json()["status"] == "succeeded"
+    flow = r.json()["flow_id"]
+    sections = connections._conf_sections(tmp_path / "conf" / "rclone.conf")
+    r = rec.call("POST", f"/v1/ui/connect/flows/{flow}/finish", json={"name": "icloud"})
+    assert r.status_code == 200 and r.json()["write"] == r.json()["read"] == "icloud-ro:" and r.json()["writable"]
+    assert connections._conf_sections(tmp_path / "conf" / "rclone.conf") == sections
+    assert rec.call("DELETE", "/v1/ui/connections/icloud").json() == {"ok": True}
+
+
+# ---- OneDrive with several drives
+
+def test_finish_answers_202_with_the_drive_question_and_the_answer_makes_the_connection(browser, tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_RCLONE_DRIVES", "2")
+    client, headers = browser
+    rec = Recorder(client, headers)
+    r = rec.call("POST", "/v1/ui/connect/start", json={"provider": "onedrive"})
+    flow_id = r.json()["flow_id"]
+    _sign_in(r.json()["auth_url"], _clouds(tmp_path, "onedrive"), "me@outlook.com")
+    assert _flow_done(client, flow_id, headers)["status"] == "succeeded"
+    r = rec.call("POST", f"/v1/ui/connect/flows/{flow_id}/finish", json={})
+    assert r.status_code == 202
+    q = r.json()
+    assert q["status"] == "question" and q["flow_id"] == flow_id and q["retry"] is False
+    assert q["question"]["name"] == "config_driveid" and [e["value"] for e in q["question"]["examples"]] == [
+        "drive-personal", "drive-docs"]
+    assert rec.call("GET", "/v1/setup").json()["connections"] == []
+    r = rec.call("POST", f"/v1/ui/connect/flows/{flow_id}/answer", json={"result": "drive-docs"})
+    assert r.status_code == 200 and r.json()["name"] == "onedrive"
+    assert connections._conf_sections(tmp_path / "conf" / "rclone.conf")["onedrive-ro"]["drive_id"] == "drive-docs"
+
+
+def test_cancel_during_a_question_removes_the_remote(browser, tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_RCLONE_DRIVES", "2")
+    client, headers = browser
+    rec = Recorder(client, headers)
+    r = rec.call("POST", "/v1/ui/connect/start", json={"provider": "onedrive"})
+    flow_id = r.json()["flow_id"]
+    _sign_in(r.json()["auth_url"], _clouds(tmp_path, "onedrive"))
+    _flow_done(client, flow_id, headers)
+    assert rec.call("POST", f"/v1/ui/connect/flows/{flow_id}/finish", json={}).status_code == 202
+    assert "onedrive-ro" in connections._conf_sections(tmp_path / "conf" / "rclone.conf")
+    assert rec.call("POST", f"/v1/ui/connect/flows/{flow_id}/cancel").json() == {"ok": True}
+    assert rec.call("GET", f"/v1/ui/connect/flows/{flow_id}").json()["status"] == "cancelled"
+    assert connections._conf_sections(tmp_path / "conf" / "rclone.conf") == {}
+    assert not (tmp_path / "conf" / "connections.toml").exists()
+    r = rec.call("POST", f"/v1/ui/connect/flows/{flow_id}/answer", json={"result": "drive-docs"})
+    assert r.status_code == 409 and r.json()["code"] == "NOT_WAITING"
+
+
+def test_an_answer_is_validated(browser):
+    client, headers = browser
+    rec = Recorder(client, headers)
+    url = "/v1/ui/connect/flows/nope/answer"
+    assert rec.call("POST", url, json={}).status_code == 422
+    assert rec.call("POST", url, json={"result": 5}).status_code == 422
+    assert rec.call("POST", url, json={"result": "x", "extra": 1}).status_code == 422
+    assert rec.call("POST", url, json={"result": "x"}).status_code == 404
+    r = rec.call("POST", "/v1/ui/connect/start", json={"provider": "dropbox"})
+    flow_id = r.json()["flow_id"]
+    r = rec.call("POST", f"/v1/ui/connect/flows/{flow_id}/answer", json={"result": "x"})
+    assert r.status_code == 409 and r.json()["code"] == "NOT_WAITING"                  # no question was asked
+    rec.call("POST", f"/v1/ui/connect/flows/{flow_id}/cancel")
+
+
+# ---- a token from another computer
+
+def test_a_pasted_token_makes_a_flow_that_finishes_like_a_browser_sign_in(browser, bearer, tmp_path, caplog, capsys):
+    caplog.set_level(logging.DEBUG)
+    client, headers = browser
+    rec, brec = Recorder(client, headers), Recorder(bearer, {})
+    _, block = _pasted(_clouds(tmp_path, "dropbox"), fake_account="me@example.com")
+    r = rec.call("POST", "/v1/ui/connect/paste", json={"provider": "dropbox", "token": block})
+    assert r.status_code == 200 and set(r.json()) == {"flow_id", "status"} and r.json()["status"] == "succeeded"
+    flow_id = r.json()["flow_id"]
+    view = rec.call("GET", f"/v1/ui/connect/flows/{flow_id}").json()
+    assert view["status"] == "succeeded" and view["auth_url"] is None
+    r = rec.call("POST", f"/v1/ui/connect/flows/{flow_id}/finish", json={})
+    assert r.status_code == 200 and r.json()["name"] == "dropbox" and r.json()["account"] == "me@example.com"
+    assert [c["name"] for c in brec.call("GET", "/v1/setup").json()["connections"]] == ["dropbox"]
+    out = capsys.readouterr()
+    blob = "\n".join(rec.bodies + brec.bodies + [out.out, out.err, caplog.text,
+                                                 (tmp_path / "conf" / "connections.toml").read_text()])
+    assert "pasted-at-a1b2c3d4" not in blob and "pasted-rt-e5f6a7b8" not in blob and "access_token" not in blob
+
+
+def test_paste_errors_are_coded_and_never_quote_the_token(browser, tmp_path):
+    client, headers = browser
+    rec = Recorder(client, headers)
+    r = rec.call("POST", "/v1/ui/connect/paste", json={"provider": "dropbox", "token": "SECRET-GIBBERISH-NOT-A-TOKEN"})
+    assert r.status_code == 400 and r.json()["code"] == "TOKEN_UNREADABLE" and "GIBBERISH" not in r.text
+    _, block = _pasted(tmp_path)
+    r = rec.call("POST", "/v1/ui/connect/paste", json={"provider": "drive", "token": block})
+    assert r.status_code == 400 and r.json()["code"] == "NEEDS_CLIENT" and "pasted-rt" not in r.text
+    r = rec.call("POST", "/v1/ui/connect/paste", json={"provider": "nope", "token": block})
+    assert r.status_code == 404 and r.json()["code"] == "NOT_FOUND"
+    r = rec.call("POST", "/v1/ui/connect/paste", json={"provider": "iclouddrive", "token": block})
+    assert r.status_code == 400 and r.json()["code"] == "BAD_REQUEST"
+    r = rec.call("POST", "/v1/ui/connect/paste", json={"provider": "dropbox"})
+    assert r.status_code == 422
+    r = rec.call("POST", "/v1/ui/connect/paste", json={"provider": "dropbox", "token": block, "x": 1})
+    assert r.status_code == 422 and "pasted-rt" not in r.text
+    r = rec.call("POST", "/v1/ui/connect/paste", json={"purpose": "write", "name": "ghost", "provider": "dropbox",
+                                                       "token": block})
+    assert r.status_code == 404 and r.json()["code"] == "NOT_FOUND"
+    assert all("pasted-rt" not in b and "pasted-at" not in b for b in rec.bodies)
+
+
+# ---- import
+
+def _personal(tmp_path, monkeypatch):
+    path = tmp_path / "personal.conf"
+    path.write_text(
+        f'[work]\ntype = dropbox\ntoken = {{"access_token":"imp-at-1234","refresh_token":"imp-rt-5678",'
+        f'"expiry":"2099-01-01T00:00:00Z"}}\nfake_root = {_clouds(tmp_path, "work")}\n\n'
+        f'[priv]\ntype = crypt\nremote = work:enc\n\n[box1]\ntype = box\n\n'
+        f'[spare]\ntype = dropbox\nfake_root = {_clouds(tmp_path, "spare")}\n')
+    monkeypatch.setenv("RCLONE_CONFIG", str(path))
+    return path
+
+
+def test_importable_and_import_over_http(browser, bearer, service, tmp_path, monkeypatch, caplog, capsys):
+    caplog.set_level(logging.DEBUG)
+    path = _personal(tmp_path, monkeypatch)
+    before = path.read_bytes()
+    client, headers = browser
+    rec, brec = Recorder(client, headers), Recorder(bearer, {})
+    got = brec.call("GET", "/v1/ui/connect/importable").json()                             # readable with the API token
+    assert got["encrypted"] is False and got["config_path"] == str(path)
+    assert {r["name"]: (r["supported"], r["imported"]) for r in got["remotes"]} == {
+        "work": (True, False), "priv": (False, False), "box1": (False, False), "spare": (True, False)}
+    r = rec.call("POST", "/v1/ui/connect/import", json={"source": "work"})
+    assert r.status_code == 200
+    conn = r.json()
+    assert conn["name"] == "work" and conn["scoped"] is False and conn["imported_from"] == "work"
+    assert conn["writable"] is False and conn["read"] == "work-ro:"
+    assert path.read_bytes() == before
+    assert [r.name for r in service.config.remotes] == ["work"]
+    assert {r["name"]: r["imported"] for r in client.get("/v1/ui/connect/importable").json()["remotes"]}["work"] is True
+    r = rec.call("POST", "/v1/ui/connect/import", json={"source": "work"})
+    assert r.status_code == 409 and r.json()["code"] == "NAME_TAKEN"
+    r = rec.call("POST", "/v1/ui/connect/import", json={"source": "priv"})
+    assert r.status_code == 400 and r.json()["code"] == "IMPORT_UNSUPPORTED" and r.json()["params"] == {"type": "crypt"}
+    r = rec.call("POST", "/v1/ui/connect/import", json={"source": "ghost"})
+    assert r.status_code == 404 and r.json()["code"] == "NOT_FOUND"
+    r = rec.call("POST", "/v1/ui/connect/import", json={"source": "box1"})
+    assert r.status_code == 400 and r.json()["code"] == "IMPORT_UNSUPPORTED" and r.json()["params"] == {"type": "box"}
+    r = rec.call("POST", "/v1/ui/connect/import", json={"source": "spare", "name": "Bad Name"})
+    assert r.status_code == 400 and r.json()["code"] == "BAD_NAME"
+    r = rec.call("POST", "/v1/ui/connect/import", json={"name": "x"})
+    assert r.status_code == 422
+    out = capsys.readouterr()
+    blob = "\n".join(rec.bodies + brec.bodies + [out.out, out.err, caplog.text])
+    assert "imp-at-1234" not in blob and "imp-rt-5678" not in blob
+
+
+def test_an_encrypted_personal_config_is_reported_and_refused(browser, tmp_path, monkeypatch):
+    path = tmp_path / "enc.conf"
+    path.write_text("# Encrypted rclone configuration File\n\nRCLONE_ENCRYPT_V0:\nabcdefgh\n")
+    monkeypatch.setenv("RCLONE_CONFIG", str(path))
+    client, headers = browser
+    got = client.get("/v1/ui/connect/importable").json()
+    assert got["encrypted"] is True and got["remotes"] == []
+    r = client.post("/v1/ui/connect/import", headers=headers, json={"source": "x"})
+    assert r.status_code == 409 and r.json()["code"] == "IMPORT_ENCRYPTED"
+
+
+def test_import_can_ask_a_question_too(browser, tmp_path, monkeypatch):
+    path = tmp_path / "personal.conf"
+    path.write_text(f"[icl]\ntype = iclouddrive\napple_id = me@example.com\npassword = OBSCURED-xyz\n"
+                    f"fake_root = {_clouds(tmp_path, 'icl')}\n")
+    monkeypatch.setenv("RCLONE_CONFIG", str(path))
+    client, headers = browser
+    r = client.post("/v1/ui/connect/import", headers=headers, json={"source": "icl"})
+    assert r.status_code == 202 and r.json()["question"]["name"] == "config_2fa" and "OBSCURED-xyz" not in r.text
+    r2 = client.post(f"/v1/ui/connect/flows/{r.json()['flow_id']}/answer", headers=headers, json={"result": CODE})
+    assert r2.status_code == 200 and r2.json()["imported_from"] == "icl" and r2.json()["scoped"] is False
+
+
+# ---- Test results are coded
+
+def test_connection_test_is_worded_from_a_code(browser, tmp_path):
+    client, headers = browser
+    rec = Recorder(client, headers)
+    _connect(rec, "dropbox", tmp_path / "clouds" / "dropbox")
+    ok = rec.call("POST", "/v1/ui/connections/dropbox/test").json()
+    assert ok["ok"] is True and ok["code"] is None and ok["params"] == {}
+    conf = tmp_path / "conf" / "rclone.conf"
+    conf.write_text(conf.read_text().replace("[dropbox-ro]\n", "[dropbox-ro]\nfake_error = auth\n"))
+    bad = rec.call("POST", "/v1/ui/connections/dropbox/test").json()
+    assert bad["ok"] is False and bad["code"] == "AUTH_EXPIRED" and bad["error"]
+    conf.write_text(conf.read_text().replace("fake_error = auth", "fake_error = network"))
+    assert rec.call("POST", "/v1/ui/connections/dropbox/test").json()["code"] == "NETWORK"
+    conf.write_text(conf.read_text().replace("fake_error = network", "fake_error = other"))
+    other = rec.call("POST", "/v1/ui/connections/dropbox/test").json()
+    assert other["code"] == "RCLONE_ERROR" and "something odd happened" in other["params"]["detail"]
+
+
+# ---- the whole thing never shows a secret, and failed flows leave nothing
+
+def test_failed_and_cancelled_flows_leave_no_remote_and_no_entry(browser, tmp_path, monkeypatch):
+    client, headers = browser
+    rec = Recorder(client, headers)
+    conf, toml = tmp_path / "conf" / "rclone.conf", tmp_path / "conf" / "connections.toml"
+
+    monkeypatch.setenv("FAKE_RCLONE_FAIL_CREATE", "1")                           # iCloud: rclone fails on create
+    r = _icloud_start(rec, tmp_path)
+    assert r.status_code == 409 and r.json()["code"] == "FLOW_FAILED" and PASSWORD not in r.text
+    monkeypatch.delenv("FAKE_RCLONE_FAIL_CREATE")
+    assert connections._conf_sections(conf) == {} and not toml.exists()
+
+    flow_id = _icloud_start(rec, tmp_path).json()["flow_id"]                     # a question, then rclone blows up
+    monkeypatch.setenv("FAKE_RCLONE_ECHO_ANSWER", "1")
+    r = rec.call("POST", f"/v1/ui/connect/flows/{flow_id}/answer", json={"result": "654321-SECRET"})
+    assert r.status_code == 409 and r.json()["code"] == "FLOW_FAILED" and "654321-SECRET" not in r.text
+    view = rec.call("GET", f"/v1/ui/connect/flows/{flow_id}").json()
+    assert view["status"] == "failed" and view["code"] == "FLOW_FAILED" and view["question"] is None
+    monkeypatch.delenv("FAKE_RCLONE_ECHO_ANSWER")
+    assert connections._conf_sections(conf) == {} and not toml.exists()
+
+    flow_id = _icloud_start(rec, tmp_path).json()["flow_id"]                     # cancelled while asking
+    assert rec.call("POST", f"/v1/ui/connect/flows/{flow_id}/cancel").json() == {"ok": True}
+    assert connections._conf_sections(conf) == {} and not toml.exists()
+    assert not any(PASSWORD in b or "654321-SECRET" in b for b in rec.bodies)
+
+
+def test_a_connections_toml_write_failure_over_http_is_coded_and_leaves_nothing(browser, tmp_path, monkeypatch):
+    client, headers = browser
+    rec = Recorder(client, headers)
+    r = rec.call("POST", "/v1/ui/connect/start", json={"provider": "dropbox"})
+    flow_id = r.json()["flow_id"]
+    _sign_in(r.json()["auth_url"], _clouds(tmp_path, "dropbox"))
+    _flow_done(client, flow_id, headers)
+    monkeypatch.setattr(connections, "_write_entries", lambda c, e: (_ for _ in ()).throw(OSError("disk on fire")))
+    r = rec.call("POST", f"/v1/ui/connect/flows/{flow_id}/finish", json={})
+    assert r.status_code == 409 and r.json()["code"] == "CONFIG_WRITE" and "disk on fire" not in r.text
+    assert connections._conf_sections(tmp_path / "conf" / "rclone.conf") == {}
+
+
+def test_nothing_secret_is_ever_logged_by_the_server(browser, tmp_path, caplog, capsys, monkeypatch):
+    caplog.set_level(logging.DEBUG)
+    log = tmp_path / "calls.log"
+    monkeypatch.setenv("FAKE_RCLONE_LOG", str(log))
+    client, headers = browser
+    rec = Recorder(client, headers)
+    flow_id = _icloud_start(rec, tmp_path).json()["flow_id"]
+    rec.call("POST", f"/v1/ui/connect/flows/{flow_id}/answer", json={"result": CODE})
+    _, block = _pasted(_clouds(tmp_path, "dropbox"))
+    pid = rec.call("POST", "/v1/ui/connect/paste", json={"provider": "dropbox", "token": block}).json()["flow_id"]
+    rec.call("POST", f"/v1/ui/connect/flows/{pid}/finish", json={})
+    out = capsys.readouterr()
+    blob = "\n".join([out.out, out.err, caplog.text, log.read_text()])
+    for secret in (PASSWORD, CODE, "pasted-at-a1b2c3d4", "pasted-rt-e5f6a7b8"):
+        assert secret not in blob

@@ -38,7 +38,7 @@ PROVIDERS = [
      "authorize": {"read": ["rclone", "authorize", "drive", "--drive-scope=drive.readonly"],
                    "write": ["rclone", "authorize", "drive", "--drive-scope=drive"]}},
     {"key": "onedrive", "label": "OneDrive", "needs_client": False, "kind": "authorize", "fields": [],
-     "authorize": {"read": ["rclone", "authorize", "onedrive", "--onedrive-access-scopes=Files.Read Files.Read.All offline_access"],
+     "authorize": {"read": ["rclone", "authorize", "onedrive", "--onedrive-access-scopes=Files.Read Files.Read.All Sites.Read.All offline_access"],
                    "write": ["rclone", "authorize", "onedrive"]}},
     {"key": "dropbox", "label": "Dropbox", "needs_client": False, "kind": "authorize", "fields": [],
      "authorize": {"read": ["rclone", "authorize", "dropbox"], "write": ["rclone", "authorize", "dropbox"]}},
@@ -46,8 +46,8 @@ PROVIDERS = [
      "authorize": {"read": [], "write": []}},
 ]
 DEFAULT_NAME = {"drive": "gdrive", "onedrive": "onedrive", "dropbox": "dropbox", "iclouddrive": "icloud"}
-TWO_FACTOR = {"name": "config_2fa", "help": "2FA code\nEnter the code Apple sent to your devices", "default": "", "examples": [],
-              "password": False, "required": True, "exclusive": False, "type": "string"}
+TWO_FACTOR = {"name": "config_2fa", "help": "Enter the two-factor code sent to your devices.", "default": "", "examples": [],
+              "password": False, "required": True, "exclusive": True, "type": "string"}
 DRIVE_CHOICE = {"name": "config_driveid", "help": "Select a drive.\nSecond line", "default": "", "required": True, "exclusive": True,
                 "password": False, "type": "string",
                 "examples": [{"value": "b!personal", "help": "OneDrive (personal)"}, {"value": "b!library", "help": "Documents (team site)"}]}
@@ -92,6 +92,7 @@ class OnbMock(MockApi):
         self.rclone_after_install: dict = dict(self.rclone)
         self.flow_script = ["waiting", "succeeded"]     # the status each poll of a flow returns, the last one repeats
         self.flow_error = "oauth2: cannot fetch token: 400 Bad Request"
+        self.flow_code: str | None = None           # the `code` a failed flow view carries (default FLOW_FAILED / FLOW_TIMEOUT)
         self.start_error: tuple[int, str, str] | None = None     # (status, code, message) for connect/start
         self.finish_error: tuple[int, str, str] | None = None
         self.flows: dict[str, dict] = {}
@@ -115,7 +116,7 @@ class OnbMock(MockApi):
 
     def _add_conn(self, name: str, provider: str, writable: bool, id_: int | None = None, **extra: Any) -> dict:
         conn = {"name": name, "provider": provider, "account": f"me@{name}.example", "read": True, "write": writable,
-                "writable": writable, "created_at": "2025-01-01T00:00:00Z", **extra}
+                "writable": writable, "created_at": "2025-01-01T00:00:00Z", "scoped": True, "imported_from": None, **extra}
         self.conns.append(conn)
         self.remotes.append({"id": id_ or len(self.remotes) + 1, "name": name, "provider": provider, "writable": writable,
                              "case_insensitive": False})
@@ -227,8 +228,13 @@ class OnbMock(MockApi):
                 status = "cancelled"
             else:
                 status = self.flow_script[min(flow["polls"], len(self.flow_script)) - 1]
-            return 200, {"flow_id": fid, "provider": flow["provider"], "purpose": flow["purpose"], "status": status,
-                         "auth_url": self.auth_override or f"{HELPER}{fid}", "error": self.flow_error if status == "failed" else None}
+            # AuthFlow.public(): there is NO `flow_id` key in the view (start / answer / import / paste results have one)
+            failed = status in ("failed", "timeout")
+            return 200, {"id": fid, "provider": flow["provider"], "purpose": flow["purpose"], "status": status,
+                         "auth_url": None if flow.get("pasted") else (self.auth_override or f"{HELPER}{fid}"),
+                         "error": self.flow_error if failed else None,
+                         "code": (self.flow_code or ("FLOW_TIMEOUT" if status == "timeout" else "FLOW_FAILED")) if failed else None,
+                         "params": {}, "name": flow.get("name"), "question": None, "retry": False, "connection": None}
         m = re.fullmatch(r"/v1/ui/connections/([a-z0-9-]+)(/test)?", path)
         if m:
             name = m.group(1)
@@ -237,7 +243,8 @@ class OnbMock(MockApi):
                 self.remotes = [r for r in self.remotes if r["name"] != name]
                 return 200, {"ok": True}
             return 200, self.test_results.get(name) or {
-                "ok": True, "account": f"me@{name}.example", "quota": {"used": 412 * GB, "total": 1000 * GB, "free": 588 * GB}, "error": None}
+                "ok": True, "account": f"me@{name}.example", "quota": {"used": 412 * GB, "total": 1000 * GB, "free": 588 * GB},
+                "error": None, "code": None, "params": {}}
         if (method, path) == ("POST", "/v1/ui/rclone/install"):
             self.install_polls = 0
             return 202, {"job_id": "job-r1"}
@@ -650,8 +657,9 @@ def test_dropbox_has_a_one_button_flow_and_a_use_my_own_app_disclosure(make_onb)
 def test_cards_show_state_account_quota_last_sync_and_the_actions(make_onb):
     ui = make_onb()
     ui.mock.connect_clouds("gdrive", "dropbox", "onedrive", writable=("gdrive",))
-    ui.mock.conns[2]["state"] = "relogin"
-    ui.mock.test_results["dropbox"] = {"ok": False, "account": None, "quota": None, "error": "lsjson: 401 unauthorized"}
+    ui.mock.test_results["onedrive"] = {"ok": False, "account": None, "quota": None, "error": "token expired", "code": "AUTH_EXPIRED", "params": {}}
+    ui.mock.test_results["dropbox"] = {"ok": False, "account": None, "quota": None, "error": "lsjson: 401 unauthorized",
+                                       "code": "RCLONE_ERROR", "params": {"detail": "lsjson: 401 unauthorized"}}
     ui.mock.scan_at = {"gdrive": _iso(timedelta(minutes=3)), "dropbox": _iso(timedelta(days=3)), "onedrive": None}
     start(ui, "#/clouds")
     expect(ui.tid("conn-card-gdrive")).to_have_attribute("data-state", "rw")
@@ -661,7 +669,8 @@ def test_cards_show_state_account_quota_last_sync_and_the_actions(make_onb):
     expect(ui.tid("conn-age-gdrive")).to_have_attribute("data-stale", "false")
     expect(ui.tid("conn-allow-gdrive")).to_have_count(0)                  # changes are allowed already
     expect(ui.tid("conn-card-dropbox")).to_have_attribute("data-state", "error")
-    expect(ui.tid("conn-error-dropbox")).to_contain_text("The connection test failed: lsjson: 401 unauthorized")
+    expect(ui.tid("conn-error-dropbox")).to_contain_text("The connection test failed: rclone reported an error")
+    expect(ui.tid("conn-error-detail-dropbox")).to_contain_text("lsjson: 401 unauthorized")
     expect(ui.tid("conn-age-dropbox")).to_have_attribute("data-stale", "true")
     expect(ui.tid("conn-age-dropbox")).to_contain_text("Synced 3 d ago")
     expect(ui.tid("conn-card-onedrive")).to_have_attribute("data-state", "relogin")
@@ -1499,7 +1508,7 @@ def test_the_paste_disclosure_shows_the_exact_command_and_sends_the_token_once(m
     expect(ui.tid("conn-paste-token")).not_to_be_visible()                 # a disclosure, closed
     ui.tid("conn-paste-toggle").click()
     expect(ui.tid("conn-paste-command")).to_have_text(
-        "rclone authorize onedrive '--onedrive-access-scopes=Files.Read Files.Read.All offline_access'")
+        "rclone authorize onedrive '--onedrive-access-scopes=Files.Read Files.Read.All Sites.Read.All offline_access'")
     expect(ui.tid("conn-paste-scope")).to_contain_text("cannot check what a pasted token is allowed to do")
     expect(ui.tid("conn-paste-submit")).to_be_disabled()
     ui.tid("conn-paste-token").fill(TOKEN_BLOCK)

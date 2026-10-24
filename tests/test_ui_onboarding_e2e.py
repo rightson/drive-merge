@@ -23,6 +23,7 @@ import shutil
 import socket
 import threading
 import time
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -86,14 +87,14 @@ def _live(root: Path) -> dict[str, bytes]:
 class Onboarding:
     """The temp home, the clouds on disk, the server in a thread, and the sign-in approvals."""
 
-    def __init__(self, tmp: Path, monkeypatch):
+    def __init__(self, tmp: Path, monkeypatch, files: dict[str, dict[str, bytes]] | None = None):
         self.tmp = tmp
         self.home = tmp / "home"
         self.config_path = self.home / ".config" / "drive-merge" / "config.toml"
         self.auth_dir = tmp / "auth"
         self.auth_dir.mkdir()
-        self.roots = {n: tmp / "clouds" / n for n in ("dropbox", "gdrive")}
-        self.files = _blobs()
+        self.files = files if files is not None else _blobs()
+        self.roots = {n: tmp / "clouds" / n for n in self.files}
         for name, root in self.roots.items():
             root.mkdir(parents=True)
             for rel, data in self.files[name].items():
@@ -423,3 +424,193 @@ def test_first_start_to_freed_space_with_no_config(browser, world):
 
 def test_the_welcome_screen_in_traditional_chinese(browser, world):
     _run_story(browser, world, "zh-TW")
+
+
+# --------------------------------------------------------------------------- iCloud, import and a pasted token
+
+APPLE_ID = "me@icloud.example"
+APPLE_PASSWORD = "Hunter2-iCloud-Pw!"
+GOOD_CODE = "123456"
+WRONG_CODE = "000000"
+PERSONAL_AT = "fake-at-aaaaaaaaaaaaaaaa"
+PERSONAL_RT = "fake-rt-bbbbbbbbbbbbbbbb"
+PASTED_AT = "fake-at-cccccccccccccccc"
+PASTED_RT = "fake-rt-dddddddddddddddd"
+
+
+@pytest.fixture
+def world3(tmp_path, monkeypatch):
+    """Three clouds nobody has connected yet: an iCloud (Apple ID + 2FA), a remote the person already has in their own
+    rclone config ("work"), and a OneDrive reached with a token made on another computer."""
+    files = {name: {f"{name}/file-{i}.bin": bytes([i]) * (500 + 100 * i) for i in range(3)} for name in ("icloud", "work", "onedrive")}
+    monkeypatch.setenv("FAKE_RCLONE_ROOT_BASE", str(tmp_path / "clouds"))     # an iCloud has no sign-in file to say where it is
+    monkeypatch.setenv("FAKE_RCLONE_LOG", str(tmp_path / "rclone.log"))
+    w = Onboarding(tmp_path, monkeypatch, files)
+    personal = w.home / ".config" / "rclone" / "rclone.conf"
+    personal.parent.mkdir(parents=True)
+    personal.write_text(
+        "[work]\ntype = dropbox\n"
+        f'token = {{"access_token":"{PERSONAL_AT}","token_type":"bearer","refresh_token":"{PERSONAL_RT}","expiry":"2030-01-01T00:00:00Z"}}\n'
+        f"fake_root = {w.roots['work']}\n\n"
+        "[vault]\ntype = crypt\nremote = work:vault\npassword = OBSCURED-secret\n", encoding="utf-8")
+    w.personal = personal
+    w.personal_before = personal.read_bytes()
+    w.config_before = w.config_path.read_text(encoding="utf-8")
+    yield w
+    w.stop()
+
+
+def test_icloud_an_imported_remote_and_a_pasted_token_end_to_end(browser, world3):
+    world = world3
+    SHOTS.mkdir(parents=True, exist_ok=True)
+    ctx = browser.new_context(viewport={"width": 1440, "height": 900}, locale="en-US")
+    page = ctx.new_page()
+    page.set_default_timeout(30_000)
+    errors: list[str] = []
+    bodies: list[tuple[str, str]] = []
+    requested: list[str] = []
+    page.on("pageerror", lambda e: errors.append(str(e)))
+    page.on("console", lambda m: errors.append(m.text) if m.type == "error" else None)
+    page.on("request", lambda r: requested.append(r.url))
+
+    def keep(response) -> None:
+        try:
+            bodies.append((response.url, response.text()))
+        except Exception:
+            pass
+    page.on("response", keep)
+    pages_html: list[str] = []
+
+    def tid(name: str):
+        return page.get_by_test_id(name)
+
+    def where_it_could_leak() -> str:
+        """Everything on the page a secret could be left in: text, address, storage, cookies, titles."""
+        storage = page.evaluate("() => JSON.stringify([Object.entries(localStorage), Object.entries(sessionStorage), document.cookie])")
+        pages_html.append(page.content())
+        return "\n".join([page.inner_text("body"), page.url, storage, page.title(), *requested])
+
+    # ---------------------------------------------------------------- the page offers all four providers and the import list
+    page.goto(f"{world.url}/ui/#token={UI_TOKEN}")
+    expect(tid("welcome")).to_be_visible()
+    expect(tid("provider-iclouddrive")).to_be_visible()
+    expect(tid("import-list")).to_be_visible()
+    expect(tid("import-work")).to_have_attribute("data-supported", "true")
+    expect(tid("import-vault")).to_have_attribute("data-supported", "false")      # a crypt remote wraps another one
+    expect(tid("import-add-vault")).to_be_disabled()
+    page.screenshot(path=str(SHOTS / "final-icloud-0-welcome.png"))
+
+    # ---------------------------------------------------------------- iCloud: Apple ID + password, then the 2FA question
+    tid("connect-iclouddrive").click()
+    expect(tid("connect-icloud")).to_be_visible()
+    expect(tid("connect-start")).to_be_disabled()
+    tid("connect-apple-id").fill(APPLE_ID)
+    tid("connect-apple-password").fill(APPLE_PASSWORD)
+    tid("connect-start").click()
+    expect(tid("connect-question")).to_be_visible()
+    expect(tid("connect-q-name")).to_have_text("config_2fa")
+    expect(tid("connect-q-retry")).to_have_count(0)
+    expect(tid("connect-apple-password")).to_have_count(0)
+    leak = where_it_could_leak()
+    assert APPLE_PASSWORD not in leak
+    page.screenshot(path=str(SHOTS / "final-icloud-1-question.png"))
+    tid("connect-q-input").fill(WRONG_CODE)
+    tid("connect-q-continue").click()
+    expect(tid("connect-q-retry")).to_be_visible()                  # rclone refused: the same question again, with the retry line
+    expect(tid("connect-q-input")).to_have_value("")
+    assert WRONG_CODE not in where_it_could_leak() and APPLE_PASSWORD not in where_it_could_leak()
+    page.screenshot(path=str(SHOTS / "final-icloud-2-retry.png"))
+    tid("connect-q-input").fill(GOOD_CODE)
+    tid("connect-q-continue").click()
+    expect(tid("conn-card-icloud")).to_be_visible(timeout=30_000)
+    expect(tid("connect-dialog")).to_have_count(0)
+    expect(tid("conn-card-icloud")).to_have_attribute("data-state", "ro")
+    expect(tid("conn-unscoped-icloud")).to_be_visible()
+    expect(tid("conn-quota-icloud")).not_to_contain_text("unknown", timeout=30_000)       # the automatic Test listed the fake folder
+    leak = where_it_could_leak()
+    assert APPLE_PASSWORD not in leak and GOOD_CODE not in leak and WRONG_CODE not in leak
+
+    # ---------------------------------------------------------------- import the remote from the person's own rclone config
+    tid("import-add-work").click()
+    expect(tid("conn-card-work")).to_be_visible(timeout=30_000)
+    expect(tid("conn-card-work")).to_have_attribute("data-state", "ro")
+    expect(tid("conn-unscoped-work")).to_be_visible()
+    expect(tid("import-add-work")).to_have_count(0)                      # imported: no second copy offered
+    expect(tid("import-done-work")).to_be_visible()
+    expect(tid("conn-quota-work")).not_to_contain_text("unknown", timeout=30_000)
+    leak = where_it_could_leak()
+    assert PERSONAL_AT not in leak and PERSONAL_RT not in leak
+
+    # ---------------------------------------------------------------- OneDrive with a token made on another computer
+    tid("connect-onedrive").click()
+    tid("conn-paste-toggle").click()
+    command = tid("conn-paste-command").inner_text()
+    assert command.startswith("rclone authorize onedrive "), command
+    assert "'--onedrive-access-scopes=Files.Read Files.Read.All Sites.Read.All offline_access'" in command      # quoted: the value has spaces
+    assert "CLIENT_SECRET" not in command           # no client pair for OneDrive
+    expect(tid("conn-paste-scope")).to_be_visible()
+    expect(tid("conn-paste-submit")).to_be_disabled()
+    block = (
+        "2026/10/24 10:00:00 NOTICE: Make sure your Redirect URL is set to \"http://localhost:53682/\" in your custom config.\n"
+        "Paste the following into your remote machine --->\n"
+        + json.dumps({"access_token": PASTED_AT, "token_type": "bearer", "refresh_token": PASTED_RT,
+                      "expiry": "2030-01-01T00:00:00Z", "fake_root": str(world.roots["onedrive"]), "fake_account": "me@outlook.example"})
+        + "\n<---End paste\n")
+    tid("conn-paste-token").fill(block)
+    expect(tid("conn-paste-submit")).to_be_enabled()
+    tid("conn-paste-submit").click()
+    expect(tid("conn-card-onedrive")).to_be_visible(timeout=30_000)
+    expect(tid("connect-dialog")).to_have_count(0)
+    expect(tid("conn-card-onedrive")).to_have_attribute("data-state", "ro")
+    expect(tid("conn-account-onedrive")).to_have_text("me@outlook.example", timeout=30_000)
+    leak = where_it_could_leak()
+    assert PASTED_AT not in leak and PASTED_RT not in leak
+    page.screenshot(path=str(SHOTS / "final-icloud-3-three-cards.png"))
+
+    # ---------------------------------------------------------------- sync all three clouds
+    tid("welcome-sync").click()
+    expect(page.get_by_test_id("view-overview")).to_be_visible(timeout=60_000)
+    for name in ("icloud", "work", "onedrive"):
+        expect(tid(f"cloud-card-{name}")).to_be_visible()
+        expect(tid(f"cloud-card-{name}").get_by_test_id("cloud-files")).to_have_text("3")
+    leak = where_it_could_leak()
+
+    # ---------------------------------------------------------------- the files drive-merge wrote
+    conns = tomllib.loads((world.config_path.parent / "connections.toml").read_text(encoding="utf-8"))
+    entries = {e["name"]: e for e in conns["remotes"]}
+    assert set(entries) == {"icloud", "work", "onedrive"}
+    assert entries["icloud"]["provider"] == "iclouddrive" and entries["icloud"]["read"] == "icloud-ro:"
+    assert entries["icloud"]["scoped"] is False and "write" not in entries["icloud"] and "imported_from" not in entries["icloud"]
+    assert entries["work"]["provider"] == "dropbox" and entries["work"]["read"] == "work-ro:"
+    assert entries["work"]["scoped"] is False and entries["work"]["imported_from"] == "work" and "write" not in entries["work"]
+    assert entries["onedrive"]["provider"] == "onedrive" and entries["onedrive"]["read"] == "onedrive-ro:"
+    assert entries["onedrive"].get("scoped", True) is True and "write" not in entries["onedrive"]
+    conf_text = (world.config_path.parent / "rclone.conf").read_text(encoding="utf-8")
+    sections = set(re.findall(r"^\[(.+)\]$", conf_text, re.M))
+    assert sections == {"icloud-ro", "work-ro", "onedrive-ro"}, sections            # no half-made remote, no -rw, nothing from crypt
+    assert APPLE_PASSWORD not in conf_text                                       # rclone stores it obscured
+    assert PERSONAL_AT in conf_text and PASTED_AT in conf_text                    # the tokens live in drive-merge's own rclone.conf
+    assert world.personal.read_bytes() == world.personal_before                   # the person's own config is never written
+    assert APPLE_ID in conf_text
+    toml_text = (world.config_path.parent / "connections.toml").read_text(encoding="utf-8")
+    assert APPLE_PASSWORD not in toml_text and PERSONAL_AT not in toml_text and PASTED_AT not in toml_text and GOOD_CODE not in toml_text
+    assert world.config_path.read_text(encoding="utf-8") == world.config_before      # config.toml is the person's file: untouched
+
+    # ---------------------------------------------------------------- no secret anywhere
+    secrets_ = {APPLE_PASSWORD, GOOD_CODE, WRONG_CODE, PERSONAL_AT, PERSONAL_RT, PASTED_AT, PASTED_RT}
+    for s_ in secrets_ - {GOOD_CODE, WRONG_CODE}:
+        assert s_ not in leak, "a secret is on the page, in the address or in storage"
+    for html_ in pages_html:
+        for s_ in secrets_ - {PASTED_AT, PASTED_RT, GOOD_CODE, WRONG_CODE}:      # (the pasted token sat in the textarea until sent)
+            assert s_ not in html_, "a secret is in the page"
+    for url, body in bodies:
+        for s_ in secrets_ - {GOOD_CODE, WRONG_CODE}:
+            assert s_ not in body, f"a secret is in the response of {url}"
+    for url in requested:
+        for s_ in secrets_:
+            assert s_ not in url, "a secret is in a request address"
+    log = Path(os.environ["FAKE_RCLONE_LOG"]).read_text(encoding="utf-8")
+    for s_ in secrets_ - {GOOD_CODE, WRONG_CODE}:
+        assert s_ not in log, "a secret reached the rclone call log"
+    assert not errors, f"JavaScript or network errors: {errors}"
+    ctx.close()

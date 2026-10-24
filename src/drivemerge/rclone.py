@@ -16,7 +16,6 @@ import os
 import re
 import subprocess
 import threading
-import time
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Sequence
 
@@ -24,6 +23,28 @@ Runner = Callable[[list[str]], tuple[int, str, str]]
 
 # rclone exit codes meaning "directory not found" / "file not found".
 _NOT_FOUND_CODES = frozenset({3, 4})
+
+_AUTH_EXPIRED = re.compile(
+    r"invalid_grant|token (?:has )?(?:expired|been revoked)|expired.{0,20}token|couldn.t fetch token|oauth2:|"
+    r"unauthori[sz]ed|\b401\b|invalid_client|refresh token|authentication failed|invalid (?:access )?token|"
+    r"AuthenticationFailed|reauth", re.I)
+_NETWORK = re.compile(
+    r"no such host|dial tcp|i/o timeout|connection (?:refused|reset)|network is unreachable|TLS handshake|"
+    r"timed out|context deadline exceeded|temporary failure in name resolution|server misbehaving|"
+    r"unexpected EOF|proxyconnect", re.I)
+_NOT_FOUND = re.compile(r"didn.t find section in config file|directory not found|object not found|"
+                        r"couldn.t find root|unknown (?:remote|backend)", re.I)
+
+
+def classify_failure(returncode: int, stderr: str) -> str:
+    """AUTH_EXPIRED, NETWORK, NOT_FOUND or RCLONE_ERROR for a failed rclone call, from its exit code and stderr."""
+    if _NOT_FOUND.search(stderr):
+        return "NOT_FOUND"
+    if _AUTH_EXPIRED.search(stderr):
+        return "AUTH_EXPIRED"
+    if _NETWORK.search(stderr):
+        return "NETWORK"
+    return "NOT_FOUND" if returncode in _NOT_FOUND_CODES else "RCLONE_ERROR"
 _STDERR_TAIL_LINES = 200
 _ABOUT_UNSUPPORTED = re.compile(r"doesn.t support about|about.*not (?:supported|implemented)", re.I)
 
@@ -47,56 +68,6 @@ class RcloneError(Exception):
 
     def __reduce__(self):
         return (RcloneError, (str(self), self.returncode, self.stderr, self._argv))
-
-
-class RcloneCancelled(RcloneError):
-    """A streamed `rclone config` call was stopped through its cancel event."""
-
-    def __reduce__(self):
-        return (RcloneCancelled, (str(self), self.returncode, self.stderr, self._argv))
-
-
-class RcloneTimeout(RcloneError):
-    """A streamed `rclone config` call did not finish within its timeout and was killed."""
-
-    def __reduce__(self):
-        return (RcloneTimeout, (str(self), self.returncode, self.stderr, self._argv))
-
-
-# rclone remote names this wrapper will pass to `config create/update/delete`: no leading '-', no ':' or '/'.
-_REMOTE_NAME = re.compile(r"[A-Za-z0-9_.+@][A-Za-z0-9_.+@-]*")
-MIN_RCLONE = (1, 69)
-TEST_TIMEOUT_S = 30.0
-# Where rclone's sign-in helper listens; only a URL there is ever handed to a browser.
-AUTH_URL = re.compile(r"http://127\.0\.0\.1:53682/auth\?state=[A-Za-z0-9_.~%-]+")
-_AUTH_EXPIRED = re.compile(
-    r"invalid_grant|token (?:has )?(?:expired|been revoked)|expired.{0,20}token|couldn.t fetch token|oauth2:|"
-    r"unauthori[sz]ed|\b401\b|invalid_client|refresh token|authentication failed|invalid (?:access )?token|"
-    r"AuthenticationFailed|reauth", re.I)
-_NETWORK = re.compile(
-    r"no such host|dial tcp|i/o timeout|connection (?:refused|reset)|network is unreachable|TLS handshake|"
-    r"timed out|context deadline exceeded|temporary failure in name resolution|server misbehaving|"
-    r"unexpected EOF|proxyconnect", re.I)
-_NOT_FOUND = re.compile(r"didn.t find section in config file|directory not found|object not found|"
-                        r"couldn.t find root|unknown (?:remote|backend)", re.I)
-
-
-def classify_failure(returncode: int, stderr: str) -> str:
-    """AUTH_EXPIRED, NETWORK, NOT_FOUND or RCLONE_ERROR for a failed rclone call, from its exit code and stderr."""
-    if _NOT_FOUND.search(stderr):
-        return "NOT_FOUND"
-    if _AUTH_EXPIRED.search(stderr):
-        return "AUTH_EXPIRED"
-    if _NETWORK.search(stderr):
-        return "NETWORK"
-    return "NOT_FOUND" if returncode in _NOT_FOUND_CODES else "RCLONE_ERROR"
-
-
-def _scrub(text: str, secrets: Sequence[str]) -> str:
-    for secret in secrets:
-        if secret:
-            text = text.replace(secret, "***")
-    return text
 
 
 def _tail(stderr: str) -> str:
@@ -332,189 +303,3 @@ class Rclone:
         if not m:
             raise RcloneError(f"rclone version: unrecognised output {out[:200]!r}", 0, out[:500], argv)
         return m.group(1)
-
-    # ------------------------------------------------------------ setup: remotes and `rclone config`
-
-    def version_info(self) -> dict | None:
-        """{'version': 'v1.71.1', 'ok': True when at least 1.69}, or None when rclone cannot be run."""
-        try:
-            tag = self.version()
-        except RcloneError:
-            return None
-        m = re.match(r"v?(\d+)\.(\d+)", tag)
-        return {"version": tag, "ok": bool(m) and (int(m.group(1)), int(m.group(2))) >= MIN_RCLONE}
-
-    def list_remotes(self) -> list[dict]:
-        """[{'name', 'type'}] of every remote in rclone's config (`listremotes --long --json`, or the text form)."""
-        argv = self._argv("listremotes", ["--long", "--json"])
-        rc, out, err = self._run(argv)
-        if rc == 0:
-            try:
-                data = json.loads(out or "[]")
-                return [{"name": str(r["name"]), "type": str(r.get("type", ""))} for r in data]
-            except (ValueError, KeyError, TypeError, AttributeError) as e:
-                raise RcloneError(f"rclone listremotes: unparseable output ({e})", rc, out[:500], argv) from e
-        argv = self._argv("listremotes", ["--long"])           # an older rclone has no --json
-        out = self._run_checked("listremotes", argv)
-        found = []
-        for line in out.splitlines():
-            name, sep, rtype = line.partition(":")
-            if sep and name.strip():
-                found.append({"name": name.strip(), "type": rtype.strip()})
-        return found
-
-    @staticmethod
-    def _check_name(name: str) -> str:
-        if not _REMOTE_NAME.fullmatch(name):
-            raise ValueError(f"invalid rclone remote name {name!r}")
-        return name
-
-    def config_create(self, name: str, rtype: str, options: dict[str, str] | None = None, *,
-                      on_stderr: Callable[[str], None] | None = None, cancel: threading.Event | None = None,
-                      timeout: float | None = None) -> dict:
-        """`rclone config create NAME TYPE k=v... --non-interactive`: rclone's JSON {State, Option, Error, Result}.
-
-        The remote's stanza is already in rclone's config when this returns. Streamed: see `_config_call`.
-        """
-        self._check_name(name)
-        if not re.fullmatch(r"[a-z0-9]+", rtype):
-            raise ValueError(f"invalid rclone remote type {rtype!r}")
-        opts = dict(options or {})
-        argv = self._argv("config", ["create", name, rtype, *[f"{k}={v}" for k, v in opts.items()],
-                                     "--non-interactive"])
-        shown = self._argv("config", ["create", name, rtype, *[f"{k}=***" for k in opts], "--non-interactive"])
-        return self._config_call(argv, secrets=[v for v in opts.values() if len(v) >= 3], shown=shown,
-                                 on_stderr=on_stderr, cancel=cancel, timeout=timeout)
-
-    def config_continue(self, name: str, state: str, result: str, *,
-                        on_stderr: Callable[[str], None] | None = None, cancel: threading.Event | None = None,
-                        timeout: float | None = None) -> dict:
-        """`rclone config update NAME --continue --state S --result R --non-interactive`; `result` may be a
-        password or token, so it is kept out of every error (message, stderr and argv) and out of `on_stderr`."""
-        self._check_name(name)
-        argv = self._argv("config", ["update", name, "--continue", "--state", state, "--result", result,
-                                     "--non-interactive"])
-        shown = self._argv("config", ["update", name, "--continue", "--state", state, "--result", "***",
-                                      "--non-interactive"])
-        return self._config_call(argv, secrets=[result] if len(result) >= 3 else [], shown=shown,
-                                 on_stderr=on_stderr, cancel=cancel, timeout=timeout)
-
-    def config_delete(self, name: str) -> None:
-        """Remove a remote from rclone's config. rclone exits 0 for a name that is not there."""
-        self._check_name(name)
-        argv = self._argv("config", ["delete", name])
-        self._run_checked("config delete", argv)
-
-    def test_remote(self, remote: str) -> RcloneError | None:
-        """List the top of `remote` (`lsjson --max-depth 1`, 30 s): None when it works, else the error (returned)."""
-        argv = self._argv("lsjson", ["--max-depth", "1"], [remote])
-        try:
-            if self._runner is not None:
-                rc, out, err = self._runner(argv)
-            else:
-                p = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                                   encoding="utf-8", errors="replace", timeout=TEST_TIMEOUT_S)
-                rc, err = p.returncode, p.stderr
-        except subprocess.TimeoutExpired:
-            return RcloneTimeout(f"rclone lsjson timed out after {TEST_TIMEOUT_S:g} s", -1, "timed out", argv)
-        except OSError as e:
-            return RcloneError(f"cannot run rclone: {e}", -1, str(e), argv)
-        return None if rc == 0 else _failure("lsjson", argv, rc, err)
-
-    def _config_call(self, argv: list[str], *, secrets: Sequence[str], shown: list[str],
-                     on_stderr: Callable[[str], None] | None, cancel: threading.Event | None,
-                     timeout: float | None) -> dict:
-        """Run a `rclone config` call that may block (rclone waits for the browser) and return its JSON.
-
-        stderr lines go to `on_stderr` as they arrive, so a caller can pick up the sign-in URL while rclone waits.
-        `cancel` being set (or `timeout` seconds passing) kills the process: RcloneCancelled / RcloneTimeout.
-        Errors carry `shown` (the argv with secrets masked) and a stderr from which `secrets` are removed.
-        """
-        if cancel is not None and cancel.is_set():
-            raise RcloneCancelled("rclone config cancelled", -1, "", shown)
-
-        def emit(line: str) -> None:
-            if on_stderr is not None:
-                try:
-                    on_stderr(_scrub(line, secrets))
-                except Exception:  # a broken callback must not wedge the pipe
-                    pass
-
-        if self._runner is not None:
-            rc, out, err = self._runner(argv)
-            for line in err.split("\n"):
-                if line.strip():
-                    emit(line)
-            return self._config_result(rc, out, _scrub(err, secrets), shown)
-
-        try:
-            proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                    text=True, encoding="utf-8", errors="replace")
-        except OSError as e:
-            raise RcloneError(f"cannot run rclone: {e}", -1, str(e), shown) from e
-        tail: deque[str] = deque(maxlen=_STDERR_TAIL_LINES)
-        chunks: list[str] = []
-        why: list[str] = []
-
-        def read_err() -> None:
-            try:
-                for line in proc.stderr:
-                    line = line.rstrip("\n")
-                    tail.append(_scrub(line, secrets))
-                    emit(line)
-            except (OSError, ValueError):
-                pass
-
-        def read_out() -> None:
-            try:
-                chunks.append(proc.stdout.read())
-            except (OSError, ValueError):
-                pass
-
-        def watch() -> None:
-            end = None if timeout is None else time.monotonic() + timeout
-            while proc.poll() is None:
-                if cancel is not None:
-                    if cancel.wait(0.05):
-                        why.append("cancel")
-                else:
-                    time.sleep(0.05)
-                if not why and end is not None and time.monotonic() > end:
-                    why.append("timeout")
-                if why:
-                    proc.kill()
-                    return
-
-        threads = [threading.Thread(target=f, daemon=True) for f in (read_err, read_out, watch)]
-        for t in threads:
-            t.start()
-        try:
-            rc = proc.wait()
-        finally:
-            if proc.poll() is None:
-                proc.kill()
-                proc.wait()
-        for t in threads:
-            t.join(timeout=10)
-        proc.stdout.close()
-        proc.stderr.close()
-        stderr = "\n".join(tail)
-        if why and why[0] == "cancel":
-            raise RcloneCancelled("rclone config cancelled", rc, stderr, shown)
-        if why:
-            raise RcloneTimeout(f"rclone config timed out after {timeout:g} s", rc, stderr, shown)
-        return self._config_result(rc, "".join(chunks), stderr, shown)
-
-    @staticmethod
-    def _config_result(rc: int, out: str, stderr: str, shown: list[str]) -> dict:
-        if rc != 0:
-            raise _failure("config", shown, rc, stderr)
-        if not out.strip():
-            return {"State": "", "Option": None, "Error": "", "Result": ""}
-        try:
-            data = json.loads(out)
-        except json.JSONDecodeError as e:
-            raise RcloneError("rclone config: unparseable output", rc, "", shown) from e
-        if not isinstance(data, dict):
-            raise RcloneError("rclone config: unexpected output", rc, "", shown)
-        return data

@@ -4,9 +4,16 @@ Files, all mode 600, next to the main config (default `~/.config/drive-merge/`):
   rclone.conf         drive-merge's own rclone config (tokens live here and nowhere else)
   connections.toml    `[[remotes]]` entries written here; `config.load_config` merges them into the config
 
-Nothing in this module logs or returns a token. A token exists in memory (an `AuthFlow`) between rclone's
-`authorize` exiting and the `rclone config create` that stores it; it is dropped right after. rclone itself
-gets it on its command line for that one call (rclone has no other way to take it).
+Nothing in this module logs or returns a token, a password or an answer. A token exists in memory (an `AuthFlow`)
+between rclone's `authorize` exiting (or the person pasting one) and the `rclone config create` that stores it; it
+is dropped right after. rclone itself gets it, a password and the answers to its questions on its command line for
+one call each (rclone has no other way to take them; docs/ONBOARDING.md section 8). Every rclone stderr tail is
+scrubbed of them (`_scrub`, `AuthFlow._secrets`) before it becomes an error or a message.
+
+One question loop (`_advance`) serves every path that runs `rclone config create ... --non-interactive`: OAuth
+connections (token from `authorize` or pasted), iCloud Drive (Apple ID and password, then a two-factor code) and
+imports of remotes from the person's own rclone config. rclone's known questions are answered here; any other
+goes to the page as a question (`status == "question"`).
 
 Verified against rclone v1.75.2:
   * `authorize <type> [id secret] --auth-no-open-browser` prints NOTICE lines on stderr, among them
@@ -44,26 +51,39 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from .config import Config, write_private
+from .config import Config, load_config, provider_of, write_private
 from .db import utcnow
-from .rclone import Rclone, RcloneError
+from .rclone import Rclone, classify_failure
 
 MIN_RCLONE = (1, 69)
 NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,30}$")
-_URL_RE = re.compile(r"http://[\w.\-\[\]:]+/auth\?state=[\w\-%.~]+")
+# Where rclone's sign-in helper listens; only a URL there is ever stored in a flow or handed to a browser.
+_URL_RE = re.compile(r"http://127\.0\.0\.1:53682/auth\?state=[A-Za-z0-9_.~%-]+")
 _TOKEN_BLOCK = re.compile(r"--->\s*(\{.*?\})\s*<---End paste", re.S)
 DOWNLOAD_BASE = "https://downloads.rclone.org"
 URL_WAIT_SECONDS = 15
 MANAGED_BIN_DIR = Path("~/.local/share/drive-merge/bin")
+TEST_TIMEOUT_S = 30.0        # `lsjson` of a Test
+CREATE_TIMEOUT_S = 120       # one `rclone config create` call
+QUESTION_TIMEOUT_S = 600.0   # how long a question waits for its answer
+MAX_ANSWER = 65536
+MAX_TOKEN = 16384
+MAX_ROUNDS = 30              # questions rclone may ask in one flow
+# Remotes that wrap other remotes or rotate single-use tokens cannot be copied into drive-merge's rclone.conf.
+UNSUPPORTED_IMPORT = frozenset({"alias", "crypt", "union", "combine", "chunker", "hasher", "compress", "cache", "box"})
+_ENCRYPTED_HEADER = "# Encrypted rclone configuration File"
 
 
 class ConnectError(ValueError):
-    """A connection step failed; `code` is one of NO_RCLONE, RCLONE_TOO_OLD, FLOW_BUSY, FLOW_FAILED,
-    FLOW_TIMEOUT, NAME_TAKEN, BAD_NAME, NEEDS_CLIENT, TEST_FAILED, NOT_FOUND."""
+    """A connection step failed. `code` is one of NO_RCLONE, RCLONE_TOO_OLD, FLOW_BUSY, FLOW_FAILED, FLOW_TIMEOUT,
+    NAME_TAKEN, BAD_NAME, NEEDS_CLIENT, TEST_FAILED, NOT_FOUND, MISSING_FIELD {field}, NOT_WAITING,
+    TOKEN_UNREADABLE, CONFIG_WRITE, IMPORT_UNSUPPORTED {type}, IMPORT_ENCRYPTED, BAD_REQUEST. `params` are the
+    values the page needs to word the code (never a secret)."""
 
-    def __init__(self, code: str, message: str):
+    def __init__(self, code: str, message: str, **params: str):
         super().__init__(message)
         self.code = code
+        self.params = params
 
 
 @dataclass(frozen=True)
@@ -76,6 +96,9 @@ class ProviderSpec:
     write_options: dict[str, str]
     extra_args: tuple[str, ...]
     default_name: str = ""
+    kind: str = "authorize"          # 'authorize': rclone authorize + token; 'config': rclone config asks (iCloud)
+    fields: tuple[str, ...] = ()     # what `start_flow` needs up front for kind 'config'
+    scoped_write: bool = True        # False: the read sign-in can already write; Enable changes reuses `read`
 
 
 PROVIDER_SPECS: dict[str, ProviderSpec] = {
@@ -86,6 +109,8 @@ PROVIDER_SPECS: dict[str, ProviderSpec] = {
         "onedrive", "onedrive", "OneDrive", False,
         {"access_scopes": "Files.Read Files.Read.All Sites.Read.All offline_access"}, {}, (), "onedrive"),
     "dropbox": ProviderSpec("dropbox", "dropbox", "Dropbox", False, {}, {}, (), "dropbox"),
+    "iclouddrive": ProviderSpec("iclouddrive", "iclouddrive", "iCloud Drive", False, {}, {}, (), "icloud",
+                                kind="config", fields=("apple_id", "password"), scoped_write=False),
 }
 
 
@@ -268,6 +293,10 @@ def _entry_text(e: dict) -> str:
             lines.append(f"{k} = {_toml_str(e[k])}")
     lines.append("extra_args = [" + ", ".join(_toml_str(a) for a in e.get("extra_args", ())) + "]")
     lines.append("connection = true")
+    if e.get("scoped") is False:
+        lines.append("scoped = false")
+    if e.get("imported_from"):
+        lines.append(f"imported_from = {_toml_str(e['imported_from'])}")
     if e.get("account"):
         lines.append(f"account = {_toml_str(e['account'])}")
     lines.append(f"created_at = {_toml_str(e.get('created_at') or utcnow())}")
@@ -294,11 +323,13 @@ def _write_entries(config: Config, entries: list[dict]) -> None:
 def _public(e: dict) -> dict:
     return {"name": e["name"], "provider": e.get("provider"), "account": e.get("account"),
             "read": e.get("read"), "write": e.get("write"), "writable": bool(e.get("write")),
-            "created_at": e.get("created_at")}
+            "created_at": e.get("created_at"), "scoped": e.get("scoped") is not False,
+            "imported_from": e.get("imported_from") or None}
 
 
 def list_connections(config: Config) -> list[dict]:
-    """Connections made by drive-merge: name, provider, account, read, write, writable, created_at. No tokens."""
+    """Connections made by drive-merge: name, provider, account, read, write, writable, created_at, scoped,
+    imported_from. No tokens."""
     return [_public(e) for e in _read_entries(config)]
 
 
@@ -316,7 +347,7 @@ def _tail(text: str) -> str:
     return lines[-1][:400] if lines else "no output"
 
 
-def _run(config: Config, args: list[str], *, timeout: int = 120) -> tuple[int, str, str]:
+def _run(config: Config, args: list[str], *, timeout: float = 120) -> tuple[int, str, str]:
     binary = _require_rclone(config)
     conf = _conf_path(config)
     _ensure_private_file(conf)
@@ -338,43 +369,6 @@ def _delete_remote(config: Config, remote: str) -> None:
     # rclone could not be reached or failed: make sure the section is gone anyway
     if remote in _conf_sections(_conf_path(config)):
         raise ConnectError("FLOW_FAILED", f"could not remove rclone remote {remote!r}")
-
-
-def _create_remote(config: Config, remote: str, spec: ProviderSpec, token: str, options: dict[str, str]) -> None:
-    """`rclone config create` and its non-interactive question loop, ending in a stored, complete remote."""
-    kv = [f"token={token}", *[f"{k}={v}" for k, v in options.items()]]
-    try:
-        rc, out, err = _run(config, ["config", "create", remote, spec.rclone_type, *kv, "--non-interactive"])
-        for _ in range(12):
-            if rc != 0:
-                raise ConnectError("FLOW_FAILED", f"rclone could not create the remote: {_scrub(_tail(err), token)}")
-            try:
-                state = json.loads(out) if out.strip() else {}
-            except ValueError:
-                raise ConnectError("FLOW_FAILED", "rclone gave an unreadable answer while creating the remote") from None
-            if state.get("Error") and not state.get("Option"):
-                raise ConnectError("FLOW_FAILED", f"rclone: {_scrub(str(state['Error']), token)[:400]}")
-            if not state.get("State"):
-                return
-            opt = state.get("Option") or {}
-            name = opt.get("Name", "")
-            if name in ("config_refresh_token", "config_change_team_drive"):
-                result = "false"
-            elif name == "config_type":
-                result = "onedrive"
-            elif name == "config_drive_ok":
-                result = "true"
-            else:  # config_driveid and anything unknown: the default, else the first example
-                result = str(opt.get("DefaultStr") or opt.get("Default") or "")
-                if not result and opt.get("Examples"):
-                    result = str(opt["Examples"][0].get("Value", ""))
-            rc, out, err = _run(config, ["config", "create", remote, spec.rclone_type, "--non-interactive",
-                                         "--continue", "--state", state["State"], "--result", result])
-        raise ConnectError("FLOW_FAILED", "rclone kept asking questions while creating the remote")
-    except BaseException:
-        with contextlib.suppress(Exception):
-            _delete_remote(config, remote)
-        raise
 
 
 def _rclone(config: Config) -> Rclone:
@@ -403,20 +397,28 @@ def _account(config: Config, remote: str) -> str | None:
     return None
 
 
-def _test_remote(config: Config, remote: str) -> dict:
-    rc = _rclone(config)
+def _test_remote(config: Config, remote: str, *secrets_: str | None) -> dict:
+    """List the top level (30 s) and ask for the quota. On failure `code` is rclone.classify_failure's."""
     try:
-        it = rc.lsjson(remote, "", recursive=False)
-        next(it, None)
-        it.close()
-    except RcloneError as e:
-        return {"ok": False, "account": None, "quota": None, "error": _scrub(str(e))}
+        rc, _out, err = _run(config, ["lsjson", "--max-depth", "1", remote], timeout=TEST_TIMEOUT_S)
+    except ConnectError as e:
+        if e.code != "FLOW_TIMEOUT":
+            raise
+        rc, err = -1, f"rclone lsjson timed out after {TEST_TIMEOUT_S:g} s"
+    if rc != 0:
+        tail = _scrub(_tail(err), *secrets_)
+        code = classify_failure(rc, err)
+        return {"ok": False, "account": None, "quota": None, "error": tail, "code": code,
+                "params": {"detail": tail[:300]} if code == "RCLONE_ERROR" else {}}
     quota = None
-    with contextlib.suppress(RcloneError):
-        about = rc.about(remote)
-        if about:
-            quota = {"used": about.get("used"), "total": about.get("total"), "free": about.get("free")}
-    return {"ok": True, "account": _account(config, remote), "quota": quota, "error": None}
+    try:
+        about = _rclone(config).about(remote)
+    except Exception:  # noqa: BLE001 - a quota is a nicety; RcloneError, timeouts, odd output
+        about = None
+    if about:
+        quota = {"used": about.get("used"), "total": about.get("total"), "free": about.get("free")}
+    return {"ok": True, "account": _account(config, remote), "quota": quota, "error": None, "code": None,
+            "params": {}}
 
 
 def _entry(config: Config, name: str) -> dict:
@@ -427,36 +429,104 @@ def _entry(config: Config, name: str) -> dict:
 
 
 def test_connection(config: Config, name: str) -> dict:
-    """List the top level and ask for the quota: {'ok', 'account', 'quota': {...} | None, 'error'}."""
-    e = _entry(config, name)
-    return _test_remote(config, e["read"])
+    """List the top level and ask for the quota. A connection, or a remote of config.toml (its `read` path).
+
+    {'ok', 'account', 'quota': {...} | None, 'error', 'code', 'params'}; on failure `code` is AUTH_EXPIRED,
+    NETWORK, NOT_FOUND or RCLONE_ERROR (params.detail), `error` the scrubbed last line of rclone's stderr."""
+    entry = next((e for e in _read_entries(config) if e.get("name") == name), None)
+    if entry is not None:
+        remote = entry["read"]
+    else:
+        manual = next((r for r in config.remotes if r.name == name), None)
+        if manual is None:
+            raise ConnectError("NOT_FOUND", f"no connection or remote named {name!r}")
+        remote = manual.read
+    return _test_remote(config, remote)
 
 
 test_connection.__test__ = False  # not a pytest test
 
 
+# ------------------------------------------------------------------------ questions
+
+def question_view(opt: dict) -> dict:
+    """The page's view of one rclone question. Only what the form needs; nothing the person typed."""
+    examples = opt.get("Examples") or []
+    return {
+        "name": str(opt.get("Name") or ""),
+        "help": str(opt.get("Help") or "")[:4000],
+        "default": opt.get("Default") if isinstance(opt.get("Default"), (str, int, float, bool)) else "",
+        "examples": [{"value": str(e.get("Value", "")), "help": str(e.get("Help", ""))[:500]}
+                     for e in examples[:200] if isinstance(e, dict)],
+        "password": bool(opt.get("IsPassword")),
+        "required": bool(opt.get("Required")),
+        "exclusive": bool(opt.get("Exclusive")),
+        "type": str(opt.get("Type") or "string"),
+    }
+
+
+def _auto_answer(opt: dict) -> str | None:
+    """The answer drive-merge gives itself to a question rclone is known to ask; None for the person's questions."""
+    name = opt.get("Name")
+    if name in ("config_refresh_token", "config_change_team_drive"):
+        return "false"
+    if name == "config_type":
+        return "onedrive"
+    if name == "config_drive_ok":
+        return "true"
+    if name == "config_driveid":
+        examples = [e for e in (opt.get("Examples") or []) if isinstance(e, dict)]
+        if len(examples) > 1:
+            return None
+        result = str(opt.get("DefaultStr") or opt.get("Default") or "")
+        if not result and examples:
+            result = str(examples[0].get("Value", ""))
+        return result
+    return None
+
+
 # --------------------------------------------------------------------------- sign-in flows
 
 class AuthFlow:
-    """One rclone `authorize` subprocess. `public()` is what may leave this module; the token never does."""
+    """One connection in progress: an rclone `authorize` subprocess, a pasted token, an iCloud sign-in or an
+    import. `public()` is what may leave this module; no token, password, answer or secret ever does."""
 
     def __init__(self, provider: str, purpose: str):
         self.id = secrets.token_urlsafe(12)
         self.provider = provider
         self.purpose = purpose
-        self.status = "waiting"           # waiting | succeeded | failed | cancelled | timeout
+        # waiting (rclone authorize runs) | succeeded (token in hand, finish next) | question | working
+        # | done | failed | cancelled | timeout
+        self.status = "waiting"
         self.auth_url: str | None = None
         self.error: str | None = None
+        self.code: str | None = None
+        self.params: dict = {}
+        self.name: str | None = None            # reserved connection name once known
+        self.question: dict | None = None       # question_view(...) while status == 'question'
+        self.retry = False                      # rclone refused the previous answer (its text is never forwarded)
+        self.connection: dict | None = None     # the public entry once status == 'done'
         self._token: str | None = None
         self._client_id: str | None = None
         self._client_secret: str | None = None
+        self._secrets: list[str] = []           # every value to scrub from rclone's output
+        self._state: str | None = None          # rclone's State while a question waits
+        self._remote: str | None = None         # the rclone remote this flow created and must remove on failure
+        self._rtype: str = provider
+        self._config: Config | None = None
+        self._wanted: str | None = None         # the name asked for at start (authorize flows pick it at finish)
+        self._reuse_read = False                # Enable changes without a second sign-in
+        self._extra: dict = {}                  # entry keys of an import (scoped, imported_from)
+        self._timer: threading.Timer | None = None
         self._proc: subprocess.Popen | None = None
         self._url_or_done = threading.Event()
         self._finished = threading.Event()
 
     def public(self) -> dict:
         return {"id": self.id, "provider": self.provider, "purpose": self.purpose, "status": self.status,
-                "auth_url": self.auth_url, "error": self.error}
+                "auth_url": self.auth_url, "error": self.error, "code": self.code, "params": dict(self.params),
+                "name": self.name, "question": dict(self.question) if self.question else None,
+                "retry": self.retry, "connection": dict(self.connection) if self.connection else None}
 
     def __repr__(self) -> str:
         return f"AuthFlow(id={self.id!r}, provider={self.provider!r}, purpose={self.purpose!r}, status={self.status!r})"
@@ -467,13 +537,89 @@ class AuthFlow:
 
 
 _FLOWS: dict[str, AuthFlow] = {}
+_RESERVED: dict[str, str] = {}      # connection name -> id of the live flow that holds it
 _FLOWS_LOCK = threading.Lock()
+_BUSY = ("waiting", "question", "working")
+_ENDED = ("done", "failed", "cancelled", "timeout")
 
 
 def _forget_old_flows() -> None:
-    done = [f for f in _FLOWS.values() if f.status != "waiting"]
-    for f in done[:-20]:
+    old = [f for f in _FLOWS.values() if f.status not in _BUSY]
+    for f in old[:-20]:
         _FLOWS.pop(f.id, None)
+
+
+def _register(flow: AuthFlow, config: Config) -> None:
+    flow._config = config
+    with _FLOWS_LOCK:
+        if any(f.status in _BUSY for f in _FLOWS.values()):
+            raise ConnectError("FLOW_BUSY", "another sign-in is already in progress; finish or cancel it first")
+        _FLOWS[flow.id] = flow
+        _forget_old_flows()
+
+
+def _release(flow: AuthFlow) -> None:
+    with _FLOWS_LOCK:
+        for n in [n for n, fid in _RESERVED.items() if fid == flow.id]:
+            del _RESERVED[n]
+
+
+def _clear_private(flow: AuthFlow) -> None:
+    flow._token = flow._client_secret = flow._state = None
+    flow._secrets.clear()
+    if flow._timer is not None:
+        flow._timer.cancel()
+        flow._timer = None
+
+
+def _end_locked(flow: AuthFlow, status: str, *, code: str | None = None, message: str | None = None,
+                params: dict | None = None) -> None:
+    flow.status, flow.code, flow.error, flow.params = status, code, message, dict(params or {})
+    flow.question, flow.retry = None, False
+    _clear_private(flow)
+    flow._url_or_done.set()
+    flow._finished.set()
+
+
+def _fail(flow: AuthFlow, exc: BaseException) -> None:
+    """The flow ended badly: remove the rclone remote it made, record a coded failure, release the name."""
+    if isinstance(exc, ConnectError):
+        code, message, params = exc.code, str(exc), exc.params
+    else:
+        code, message, params = "FLOW_FAILED", f"unexpected {type(exc).__name__}", {}
+    remote, config = flow._remote, flow._config
+    if remote and config is not None:
+        with contextlib.suppress(Exception), _FILE_LOCK:
+            _delete_remote(config, remote)
+    with _FLOWS_LOCK:
+        if flow.status not in _ENDED:
+            _end_locked(flow, "failed", code=code, message=message, params=params)
+    _release(flow)
+
+
+def _expire(flow: AuthFlow) -> None:
+    """Timer: nobody answered the question in time. Delete what the flow made and free its name; the flow only
+    reads `timeout` once that is done (meanwhile it is `working`, so no answer can slip in)."""
+    with _FLOWS_LOCK:
+        if flow.status != "question":
+            return
+        flow.status, flow._state = "working", None
+    remote, config = flow._remote, flow._config
+    if remote and config is not None:
+        with contextlib.suppress(Exception), _FILE_LOCK:
+            _delete_remote(config, remote)
+    with _FLOWS_LOCK:
+        _end_locked(flow, "timeout", code="FLOW_TIMEOUT", message="the question was not answered in time")
+    _release(flow)
+
+
+def _arm(flow: AuthFlow) -> None:
+    if flow._timer is not None:
+        flow._timer.cancel()
+    timer = threading.Timer(QUESTION_TIMEOUT_S, _expire, args=(flow,))
+    timer.daemon = True
+    flow._timer = timer
+    timer.start()
 
 
 def _watch(flow: AuthFlow, proc: subprocess.Popen, timeout: float) -> None:
@@ -506,28 +652,28 @@ def _watch(flow: AuthFlow, proc: subprocess.Popen, timeout: float) -> None:
         t.join(5)
     out = "".join(out_chunks)
     with _FLOWS_LOCK:
-        if flow.status == "cancelled":
-            pass
+        if flow.status != "waiting":
+            pass                                     # cancelled meanwhile
         elif timed_out:
-            flow.status, flow.error = "timeout", "the sign-in was not completed in time"
+            _end_locked(flow, "timeout", code="FLOW_TIMEOUT", message="the sign-in was not completed in time")
         elif proc.returncode == 0:
             token = _parse_token(out)
             if token:
                 flow._token, flow.status = token, "succeeded"
+                flow._secrets.append(token)
             else:
-                flow.status, flow.error = "failed", "rclone did not return a token"
+                _end_locked(flow, "failed", code="FLOW_FAILED", message="rclone did not return a token")
         else:
             lines = [ln for ln in stderr_tail if ln.strip() and "NOTICE" not in ln]
-            flow.status, flow.error = "failed", _scrub(_tail("\n".join(lines or list(stderr_tail))), flow._client_secret)
-        if flow.status != "succeeded":
-            flow._token = None
+            message = _scrub(_tail("\n".join(lines or list(stderr_tail))), *flow._secrets)
+            _end_locked(flow, "failed", code="FLOW_FAILED", message=message)
     flow._url_or_done.set()
     flow._finished.set()
 
 
 def _parse_token(out: str) -> str | None:
     m = _TOKEN_BLOCK.search(out)
-    candidates = [m.group(1)] if m else [ln for ln in out.splitlines() if ln.strip().startswith("{")][-1:]
+    candidates = [m.group(1)] if m else [out.strip(), *[ln for ln in out.splitlines() if ln.strip().startswith("{")][-1:]]
     for c in candidates:
         try:
             obj = json.loads(c)
@@ -546,45 +692,106 @@ def _spec(provider: str) -> ProviderSpec:
                                         f"{', '.join(PROVIDER_SPECS)}") from None
 
 
-def start_flow(config: Config, provider: str, *, purpose: str = "read", client_id: str | None = None,
-               client_secret: str | None = None, timeout: float = 600, name: str | None = None,
-               url_wait: float = URL_WAIT_SECONDS) -> AuthFlow:
-    """Start `rclone authorize` and return once its sign-in URL is known. One flow at a time.
-
-    For purpose 'write', `name` (an existing connection) supplies the Drive client id/secret when not given."""
+def authorize_command(provider: str, purpose: str, client_id: str | None = None) -> list[str]:
+    """The command to run on another computer that has a browser, as an argv list: `rclone authorize <type>`, the
+    client pair when given (the secret is a placeholder the person types), and the purpose's scope flags."""
     spec = _spec(provider)
     if purpose not in ("read", "write"):
-        raise ConnectError("NOT_FOUND", f"unknown purpose {purpose!r}")
-    binary = _require_rclone(config)
+        raise ConnectError("BAD_REQUEST", f"unknown purpose {purpose!r}")
+    if spec.kind != "authorize":
+        raise ConnectError("BAD_REQUEST", f"{spec.label} is not connected with rclone authorize")
+    argv = ["rclone", "authorize", spec.rclone_type]
+    if client_id:
+        argv += [client_id, "CLIENT_SECRET"]
+    options = spec.read_options if purpose == "read" else spec.write_options
+    argv += [f"--{spec.rclone_type}-{k.replace('_', '-')}={v}" for k, v in options.items()]
+    return argv
+
+
+def _check_fields(spec: ProviderSpec, purpose: str, client_id, client_secret, apple_id, password) -> None:
+    if spec.kind == "config":
+        for f in spec.fields:
+            if not {"apple_id": apple_id, "password": password}.get(f):
+                raise ConnectError("MISSING_FIELD", f"{spec.label} needs {f.replace('_', ' ')}", field=f)
+    elif apple_id or password:
+        raise ConnectError("BAD_REQUEST", "apple_id and password apply to iCloud Drive only")
+    if (client_id or client_secret) and spec.key not in ("drive", "dropbox"):
+        raise ConnectError("BAD_REQUEST", f"client_id and client_secret do not apply to {spec.label}")
+
+
+def _client_for(config: Config, purpose: str, name: str | None, client_id, client_secret):
+    """The Drive/Dropbox OAuth client: given, else (for a write sign-in) the one the connection's `-ro` uses."""
     if purpose == "write" and name and not (client_id and client_secret):
         sec = _conf_sections(_conf_path(config)).get(f"{name}-ro", {})
         client_id, client_secret = client_id or sec.get("client_id"), client_secret or sec.get("client_secret")
+    return client_id or None, client_secret or None
+
+
+def _write_reuses_read(config: Config, provider: str, name: str | None) -> bool:
+    if not name:
+        return False
+    entry = next((e for e in _read_entries(config) if e.get("name") == name), None)
+    if entry is not None and (entry.get("scoped") is False or entry.get("imported_from")):
+        return True
+    spec = PROVIDER_SPECS.get(provider)
+    return bool(spec and not spec.scoped_write)
+
+
+def _secret_list(*values: str | None) -> list[str]:
+    return [v for v in values if v]
+
+
+def start_flow(config: Config, provider: str, *, purpose: str = "read", name: str | None = None,
+               client_id: str | None = None, client_secret: str | None = None, apple_id: str | None = None,
+               password: str | None = None, timeout: float = 600, url_wait: float = URL_WAIT_SECONDS) -> AuthFlow:
+    """Start a connection. One flow at a time (FLOW_BUSY).
+
+    kind 'authorize' (Drive, OneDrive, Dropbox): run `rclone authorize` and return once its sign-in URL is known.
+    kind 'config' (iCloud): create the remote with the Apple ID and password, and return the flow in `question`
+    (the two-factor code) or `done`. `name` is the new connection's name (BAD_NAME / NAME_TAKEN at once) or, for
+    purpose 'write', the connection to enable changes on. A write flow of a connection whose sign-in cannot be
+    scoped (iCloud, an import) returns already `succeeded`, with no process: finishing it reuses `read`."""
+    if purpose not in ("read", "write"):
+        raise ConnectError("BAD_REQUEST", f"unknown purpose {purpose!r}")
+    binary = _require_rclone(config)
+    if purpose == "write" and _write_reuses_read(config, provider, name):
+        flow = AuthFlow(provider, purpose)
+        flow._reuse_read, flow.name, flow.status = True, name, "succeeded"
+        _register(flow, config)
+        return flow
+    spec = _spec(provider)
+    if spec.kind == "config" and purpose != "read":
+        raise ConnectError("BAD_REQUEST", f"{spec.label} has no separate write sign-in; name the connection")
+    _check_fields(spec, purpose, client_id, client_secret, apple_id, password)
+    client_id, client_secret = _client_for(config, purpose, name, client_id, client_secret)
     if bool(client_id) != bool(client_secret):
         raise ConnectError("NEEDS_CLIENT", "give both the client id and the client secret")
     if spec.needs_client and not (client_id and client_secret):
         raise ConnectError("NEEDS_CLIENT", f"{spec.label} needs your own OAuth client id and secret")
-    options = spec.read_options if purpose == "read" else spec.write_options
+    flow = AuthFlow(provider, purpose)
+    flow._rtype = spec.rclone_type
+    flow._client_id, flow._client_secret = client_id, client_secret
+    flow._secrets = _secret_list(client_secret, apple_id, password)
+    if spec.kind == "config":
+        return _start_config_flow(config, flow, spec, name, apple_id or "", password or "")
+    if purpose == "read" and name:
+        _check_free(config, name)                       # fail before the person signs in, not after
+        flow._wanted = name
     argv = [binary, "--config", str(_conf_path(config)), "authorize", spec.rclone_type]
     if client_id and client_secret:
         argv += [client_id, client_secret]
+    options = spec.read_options if purpose == "read" else spec.write_options
     argv += [f"--{spec.rclone_type}-{k.replace('_', '-')}={v}" for k, v in options.items()]
     argv.append("--auth-no-open-browser")
-    flow = AuthFlow(provider, purpose)
-    flow._client_id, flow._client_secret = client_id, client_secret
-    with _FLOWS_LOCK:
-        if any(f.status == "waiting" for f in _FLOWS.values()):
-            raise ConnectError("FLOW_BUSY", "another sign-in is already in progress; finish or cancel it first")
-        _FLOWS[flow.id] = flow
-        _forget_old_flows()
+    _register(flow, config)
     _ensure_private_file(_conf_path(config))
     try:
         proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, encoding="utf-8", errors="replace")
     except OSError as e:
         with _FLOWS_LOCK:
-            flow.status, flow.error = "failed", f"cannot run rclone: {e}"
-            flow._finished.set()
-        raise ConnectError("NO_RCLONE", flow.error) from None
+            _end_locked(flow, "failed", code="NO_RCLONE", message=f"cannot run rclone: {e}")
+        raise ConnectError("NO_RCLONE", flow.error or "cannot run rclone") from None
     flow._proc = proc
     threading.Thread(target=_watch, args=(flow, proc, timeout), daemon=True, name=f"auth-{flow.id}").start()
     flow._url_or_done.wait(url_wait)
@@ -597,6 +804,66 @@ def start_flow(config: Config, provider: str, *, purpose: str = "read", client_i
     return flow
 
 
+def _start_config_flow(config: Config, flow: AuthFlow, spec: ProviderSpec, name: str | None,
+                       apple_id: str, password: str) -> AuthFlow:
+    _register(flow, config)
+    try:
+        with _FILE_LOCK:
+            flow.name = _claim_name(config, flow, spec, name, expect="waiting")
+            flow._remote = f"{flow.name}-ro"
+            out = _cfg(config, flow, ["config", "create", flow._remote, spec.rclone_type,
+                                      f"apple_id={apple_id}", f"password={password}", "--non-interactive"])
+            _forget_credentials(flow)
+            _next(config, flow, out)
+    except BaseException as e:
+        _fail(flow, e)
+        raise
+    return flow
+
+
+def _forget_credentials(flow: AuthFlow) -> None:
+    """The token and client secret were handed to rclone; keep them only as strings to scrub."""
+    flow._token = flow._client_secret = None
+
+
+def paste_token(config: Config, provider: str, token: str, *, purpose: str = "read", name: str | None = None,
+                client_id: str | None = None, client_secret: str | None = None) -> AuthFlow:
+    """A token made with `rclone authorize` on another computer. Returns a flow already `succeeded` (no process);
+    finish it as after a browser sign-in. The token is never quoted back, not even in an error."""
+    if purpose not in ("read", "write"):
+        raise ConnectError("BAD_REQUEST", f"unknown purpose {purpose!r}")
+    spec = _spec(provider)
+    if spec.kind != "authorize":
+        raise ConnectError("BAD_REQUEST", f"{spec.label} is not connected with a pasted token")
+    _check_fields(spec, purpose, client_id, client_secret, None, None)
+    client_id, client_secret = _client_for(config, purpose, name, client_id, client_secret)
+    if bool(client_id) != bool(client_secret):
+        raise ConnectError("NEEDS_CLIENT", "give both the client id and the client secret")
+    if spec.needs_client and not (client_id and client_secret):
+        raise ConnectError("NEEDS_CLIENT", f"{spec.label} needs your own OAuth client id and secret "
+                                           "(the token is tied to the client that made it)")
+    parsed = _parse_token(token) if len(token) <= MAX_TOKEN else None
+    obj = json.loads(parsed) if parsed else {}
+    if not (obj.get("access_token") or obj.get("refresh_token")):
+        raise ConnectError("TOKEN_UNREADABLE", "that does not look like the output of `rclone authorize`; paste the "
+                                               "block between --->  and <---End paste, or the JSON in it")
+    if purpose == "read" and name:
+        _check_free(config, name)
+    flow = AuthFlow(provider, purpose)
+    flow._rtype = spec.rclone_type
+    flow._config = config
+    flow._token, flow.status = parsed, "succeeded"
+    flow._client_id, flow._client_secret = client_id, client_secret
+    flow._secrets = _secret_list(parsed, token.strip(), client_secret)
+    flow._wanted = name if purpose == "read" else None
+    if purpose == "write":
+        flow.name = name
+    with _FLOWS_LOCK:
+        _FLOWS[flow.id] = flow
+        _forget_old_flows()
+    return flow
+
+
 def get_flow(flow_id: str) -> AuthFlow:
     with _FLOWS_LOCK:
         f = _FLOWS.get(flow_id)
@@ -606,47 +873,230 @@ def get_flow(flow_id: str) -> AuthFlow:
 
 
 def cancel_flow(flow_id: str) -> None:
+    """Stop a flow that is waiting for the browser, asking a question or holding a token. Deletes the rclone
+    remote a question flow already made. Idempotent; a flow that is busy with an rclone call is left to end."""
     flow = get_flow(flow_id)
     with _FLOWS_LOCK:
-        if flow.status != "waiting":
+        if flow.status not in ("waiting", "question", "succeeded"):
             return
-        flow.status = "cancelled"
-        flow._token = None
         proc = flow._proc
+        _end_locked(flow, "cancelled")
     if proc is not None and proc.poll() is None:
         proc.kill()
-    flow._url_or_done.set()
+    remote, config = flow._remote, flow._config
+    if remote and config is not None:
+        with contextlib.suppress(Exception), _FILE_LOCK:
+            _delete_remote(config, remote)
+    _release(flow)
 
 
-# ---------------------------------------------------------------------- finishing a flow
+# ---------------------------------------------------------------------- names
 
-def _taken(config: Config, name: str) -> bool:
+def _all_names(config: Config) -> set[str]:
     names = {r.name for r in config.remotes} | {e.get("name") for e in _read_entries(config)}
-    secs = _conf_sections(_conf_path(config))
-    return bool(names & {name} or {name, f"{name}-ro", f"{name}-rw"} & set(secs)
-                or any(n in names for n in (f"{name}-ro", f"{name}-rw")))
+    if config.config_path and Path(config.config_path).exists():
+        try:
+            names |= {r.name for r in load_config(config.config_path).remotes}
+        except (OSError, ValueError):
+            pass
+    return names
 
 
-def _pick_name(config: Config, spec: ProviderSpec, name: str | None) -> str:
+def _taken_locked(config: Config, name: str, ignore: str | None = None) -> bool:
+    names = _all_names(config)
+    secs = set(_conf_sections(_conf_path(config)))
+    reserved = {n for n, fid in _RESERVED.items() if fid != ignore}
+    mine = {name, f"{name}-ro", f"{name}-rw"}
+    return bool(name in names or name in reserved or mine & secs or {f"{name}-ro", f"{name}-rw"} & names)
+
+
+def _pick_locked(config: Config, spec: ProviderSpec, name: str | None, ignore: str | None = None) -> str:
     if name:
         if not NAME_RE.match(name):
             raise ConnectError("BAD_NAME", "a name starts with a lowercase letter and uses lowercase letters, "
                                            "digits and '-' (at most 31 characters)")
-        if _taken(config, name):
+        if _taken_locked(config, name, ignore):
             raise ConnectError("NAME_TAKEN", f"{name!r} is already in use")
         return name
     n = 1
     while True:
         cand = spec.default_name if n == 1 else f"{spec.default_name}-{n}"
-        if not _taken(config, cand):
+        if not _taken_locked(config, cand, ignore):
             return cand
         n += 1
 
 
+def _check_free(config: Config, name: str) -> None:
+    with _FLOWS_LOCK:
+        _pick_locked(config, PROVIDER_SPECS["dropbox"], name)
+
+
 def check_name(config: Config, provider: str, name: str | None) -> str:
     """The name a new connection would get (BAD_NAME / NAME_TAKEN when `name` is unusable); for early checks."""
-    return _pick_name(config, _spec(provider), name)
+    spec = _spec(provider)
+    with _FLOWS_LOCK:
+        return _pick_locked(config, spec, name)
 
+
+def _claim_name(config: Config, flow: AuthFlow, spec: ProviderSpec | None, name: str | None, *,
+                expect: str) -> str:
+    """Pick the flow's connection name and reserve it, atomically with the flow's change to `working`.
+    BAD_NAME / NAME_TAKEN leave the flow as it was (a person can pick another name)."""
+    with _FLOWS_LOCK:
+        if flow.status != expect:
+            raise ConnectError("FLOW_FAILED", f"the sign-in is {flow.status}, not {expect}")
+        for n in [n for n, fid in _RESERVED.items() if fid == flow.id]:
+            del _RESERVED[n]
+        picked = _pick_locked(config, spec or PROVIDER_SPECS["dropbox"], name, flow.id)
+        _RESERVED[picked] = flow.id
+        flow.status = "working"
+        return picked
+
+
+# ------------------------------------------------------------------ the question loop
+
+def _cfg(config: Config, flow: AuthFlow, args: list[str], *, timeout: float = CREATE_TIMEOUT_S) -> dict:
+    """One `rclone config create` call and its JSON answer. Everything rclone says is scrubbed of the flow's
+    secrets before it can reach an error."""
+    rc, out, err = _run(config, args, timeout=timeout)
+    if rc != 0:
+        raise ConnectError("FLOW_FAILED", f"rclone could not create the remote: {_scrub(_tail(err), *flow._secrets)}")
+    try:
+        data = json.loads(out) if out.strip() else {}
+    except ValueError:
+        raise ConnectError("FLOW_FAILED", "rclone gave an unreadable answer while creating the remote") from None
+    if not isinstance(data, dict):
+        raise ConnectError("FLOW_FAILED", "rclone gave an unexpected answer while creating the remote")
+    return data
+
+
+def question_result(flow: AuthFlow) -> dict:
+    """`{"flow_id", "status": "question", "question", "retry"}`: what the page and the terminal get while a
+    flow waits for the person. A connection never has a `flow_id` key, which is how callers tell them apart."""
+    return {"flow_id": flow.id, "status": "question", "question": dict(flow.question or {}), "retry": flow.retry}
+
+
+def flow_result(flow: AuthFlow) -> dict:
+    """What a flow that has just been started (iCloud) or advanced came to: the connection, or the question."""
+    if flow.status == "done" and flow.connection:
+        return dict(flow.connection)
+    if flow.status == "question":
+        return question_result(flow)
+    raise ConnectError("FLOW_FAILED", flow.error or f"the sign-in is {flow.status}")
+
+
+def _advance(config: Config, flow: AuthFlow, out: dict) -> dict | None:
+    """Walk rclone's questions from its last answer `out`. Known questions are answered here; any other sets
+    the flow to `question` and returns the question result. None: rclone is done."""
+    rtype = flow._rtype
+    for _ in range(MAX_ROUNDS):
+        error = str(out.get("Error") or "")
+        opt = out.get("Option") or {}
+        if error and not opt:
+            raise ConnectError("FLOW_FAILED", f"rclone: {_scrub(error, *flow._secrets)[:400]}")
+        if not out.get("State"):
+            return None
+        if not opt:
+            raise ConnectError("FLOW_FAILED", "rclone asked for something it did not describe")
+        answer = _auto_answer(opt)
+        if answer is None:
+            with _FLOWS_LOCK:
+                flow.status, flow.question, flow.retry = "question", question_view(opt), bool(error)
+                flow._state = str(out["State"])
+            _arm(flow)
+            return question_result(flow)
+        if error:
+            raise ConnectError("FLOW_FAILED", f"rclone: {_scrub(error, *flow._secrets)[:400]}")
+        out = _cfg(config, flow, ["config", "create", flow._remote or "", rtype, "--non-interactive",
+                                  "--continue", "--state", str(out["State"]), "--result", answer])
+    raise ConnectError("FLOW_FAILED", "rclone kept asking questions while creating the remote")
+
+
+def _next(config: Config, flow: AuthFlow, out: dict) -> dict:
+    """After an rclone answer: another question, or the connection once rclone is done."""
+    return _advance(config, flow, out) or _complete(config, flow)
+
+
+def _complete(config: Config, flow: AuthFlow) -> dict:
+    """rclone is done: test the remote and record the connection (or its write remote)."""
+    remote = flow._remote or ""
+    res = _test_remote(config, f"{remote}:", *flow._secrets)
+    label = "the new connection" if flow.purpose == "read" else "the write connection"
+    if not res["ok"]:
+        raise ConnectError("TEST_FAILED", f"{label} does not work: {res['error']}")
+    with _FILE_LOCK:
+        entries = _read_entries(config)
+        if flow.purpose == "read":
+            if flow.name in _all_names(config):
+                raise ConnectError("NAME_TAKEN", f"{flow.name!r} was taken meanwhile")
+            spec = PROVIDER_SPECS.get(flow.provider)
+            extra = {"scoped": False} if spec and not spec.scoped_write else {}
+            entry = {"name": flow.name, "provider": flow.provider, "read": f"{remote}:", "write": None,
+                     "extra_args": list(spec.extra_args) if spec else [], "account": res["account"],
+                     "created_at": utcnow(), **extra, **flow._extra}
+            entries.append(entry)
+        else:
+            entry = next((e for e in entries if e.get("name") == flow.name), None)
+            if entry is None:
+                raise ConnectError("NOT_FOUND", f"no connection named {flow.name!r}")
+            entry["write"] = f"{remote}:"
+            entry["account"] = entry.get("account") or res["account"]
+        _store(config, entries)
+    return _done(flow, entry)
+
+
+def _store(config: Config, entries: list[dict]) -> None:
+    try:
+        _write_entries(config, entries)
+    except ConnectError:
+        raise
+    except Exception:  # noqa: BLE001 - disk full, permissions, a read-only home ...
+        raise ConnectError("CONFIG_WRITE", f"{config.connections_path.name} could not be written") from None
+
+
+def _done(flow: AuthFlow, entry: dict) -> dict:
+    public = _public(entry)
+    with _FLOWS_LOCK:
+        _end_locked(flow, "done")
+        flow.connection = public
+    _release(flow)
+    return dict(public)
+
+
+def answer_flow(config: Config, flow_id: str, result: str) -> dict:
+    """The person's answer to the question a flow is waiting on. Returns the connection once rclone is done, or
+    the next question (a wrong answer asks again with `retry`). The answer is passed to rclone for this one call
+    and then dropped; it is scrubbed from everything rclone says back."""
+    flow = get_flow(flow_id)
+    if not isinstance(result, str) or len(result) > MAX_ANSWER:
+        raise ConnectError("BAD_REQUEST", f"an answer is at most {MAX_ANSWER} characters")
+    with _FLOWS_LOCK:
+        if flow.status != "question" or flow._state is None:
+            raise ConnectError("NOT_WAITING", "this connection is not waiting for an answer")
+        state, password = flow._state, bool((flow.question or {}).get("password"))
+        flow.status, flow.question, flow.retry, flow._state = "working", None, False, None
+        if flow._timer is not None:
+            flow._timer.cancel()
+            flow._timer = None
+        added = bool(result) and (password or len(result) >= 3)
+        if added:
+            flow._secrets.append(result)
+    try:
+        with _FILE_LOCK:
+            out = _cfg(config, flow, ["config", "create", flow._remote or "", flow._rtype, "--non-interactive",
+                                      "--continue", "--state", state, "--result", result])
+            res = _next(config, flow, out)
+    except BaseException as e:
+        _fail(flow, e)
+        raise
+    finally:
+        with _FLOWS_LOCK:
+            if added and result in flow._secrets:
+                flow._secrets.remove(result)
+    return res
+
+
+# ---------------------------------------------------------------------- finishing a flow
 
 def _flow_ready(flow_id: str, purpose: str) -> AuthFlow:
     flow = get_flow(flow_id)
@@ -654,47 +1104,70 @@ def _flow_ready(flow_id: str, purpose: str) -> AuthFlow:
         raise ConnectError("FLOW_FAILED", f"this sign-in is for purpose {flow.purpose!r}, not {purpose!r}")
     if flow.status == "waiting":
         raise ConnectError("FLOW_FAILED", "the sign-in is not finished yet")
-    if flow.status != "succeeded" or not flow._token:
+    if flow.status in ("question", "working"):
+        raise ConnectError("FLOW_FAILED", f"the sign-in is {flow.status}")
+    if flow.status in ("failed", "timeout") and flow.code in ("FLOW_TIMEOUT", "FLOW_FAILED", "NO_RCLONE"):
+        raise ConnectError(flow.code, flow.error or f"the sign-in {flow.status}")
+    if flow.status not in ("succeeded", "done"):
         raise ConnectError("FLOW_TIMEOUT" if flow.status == "timeout" else "FLOW_FAILED",
                            flow.error or f"the sign-in {flow.status}")
+    if flow.status == "succeeded" and not (flow._token or flow._reuse_read):
+        raise ConnectError("FLOW_FAILED", "the sign-in has no token any more; sign in again")
     return flow
 
 
-def _drop_secrets(flow: AuthFlow) -> None:
-    flow._token = flow._client_secret = None
-
-
 def finish_connect(config: Config, flow_id: str, *, name: str | None = None) -> dict:
-    """Create `<name>-ro` from a finished read flow, test it and record the connection. Returns the connection."""
+    """Create `<name>-ro` from a finished read flow, walk rclone's questions, test it and record the connection.
+    Returns the connection, or a question result (`flow_id` in it) when rclone asks the person something."""
     flow = _flow_ready(flow_id, "read")
+    if flow.status == "done" and flow.connection:
+        return dict(flow.connection)
     spec = _spec(flow.provider)
+    if spec.kind != "authorize":
+        raise ConnectError("FLOW_FAILED", f"{spec.label} is connected with its own questions, not finish")
     with _FILE_LOCK:
-        name = _pick_name(config, spec, name)
-        remote = f"{name}-ro"
+        flow.name = _claim_name(config, flow, spec, name or flow._wanted, expect="succeeded")
+        remote = flow._remote = f"{flow.name}-ro"
         options = dict(spec.read_options)
         if flow._client_id and flow._client_secret:
             options.update(client_id=flow._client_id, client_secret=flow._client_secret)
-        _create_remote(config, remote, spec, flow._token or "", options)
-        _drop_secrets(flow)
         try:
-            res = _test_remote(config, f"{remote}:")
-        except BaseException:
-            _delete_remote(config, remote)
+            kv = [f"token={flow._token}", *[f"{k}={v}" for k, v in options.items()]]
+            out = _cfg(config, flow, ["config", "create", remote, spec.rclone_type, *kv, "--non-interactive"])
+            _forget_credentials(flow)
+            return _next(config, flow, out)
+        except BaseException as e:
+            _fail(flow, e)
             raise
-        if not res["ok"]:
-            _delete_remote(config, remote)
-            raise ConnectError("TEST_FAILED", f"the new connection does not work: {res['error']}")
-        entry = {"name": name, "provider": spec.key, "read": f"{remote}:", "write": None,
-                 "extra_args": list(spec.extra_args), "account": res["account"], "created_at": utcnow()}
-        _write_entries(config, [*_read_entries(config), entry])
-    return _public(entry)
 
 
 def finish_enable_writes(config: Config, flow_id: str, name: str) -> dict:
-    """Create `<name>-rw` from a finished write flow and set it as the connection's write remote."""
+    """Create `<name>-rw` from a finished write flow and set it as the connection's write remote. For a
+    connection that cannot be scoped (iCloud, an import) `read` itself becomes the write remote.
+    Returns the connection, or a question result."""
     flow = _flow_ready(flow_id, "write")
+    if flow.status == "done" and flow.connection and flow.connection.get("name") == name:
+        return dict(flow.connection)
+    if flow.status == "done":
+        raise ConnectError("FLOW_FAILED", f"this sign-in already enabled changes on {flow.name!r}, not {name!r}")
     with _FILE_LOCK:
-        entry = _entry(config, name)
+        entries = _read_entries(config)
+        entry = next((e for e in entries if e.get("name") == name), None)
+        if entry is None:
+            raise ConnectError("NOT_FOUND", f"no connection named {name!r}")
+        if flow._reuse_read:
+            with _FLOWS_LOCK:
+                if flow.status != "succeeded":
+                    raise ConnectError("FLOW_FAILED", f"the sign-in is {flow.status}")
+                flow.status = "working"
+            try:
+                entry["write"] = entry["read"]
+                _store(config, entries)
+            except BaseException as e:
+                _fail(flow, e)
+                raise
+            flow.name = name
+            return _done(flow, entry)
         if entry.get("provider") != flow.provider:
             raise ConnectError("FLOW_FAILED", f"this sign-in is for {flow.provider}, but {name!r} is {entry.get('provider')}")
         spec = _spec(flow.provider)
@@ -704,27 +1177,139 @@ def finish_enable_writes(config: Config, flow_id: str, name: str) -> dict:
         cid, csec = flow._client_id or sec.get("client_id"), flow._client_secret or sec.get("client_secret")
         if cid and csec:
             options.update(client_id=cid, client_secret=csec)
-        _delete_remote(config, remote)
-        _create_remote(config, remote, spec, flow._token or "", options)
-        _drop_secrets(flow)
-        res = _test_remote(config, f"{remote}:")
-        if not res["ok"]:
+            flow._secrets.append(csec)
+        with _FLOWS_LOCK:
+            if flow.status != "succeeded":
+                raise ConnectError("FLOW_FAILED", f"the sign-in is {flow.status}")
+            flow.status = "working"
+        flow.name = name
+        try:
             _delete_remote(config, remote)
-            raise ConnectError("TEST_FAILED", f"the write connection does not work: {res['error']}")
-        entries = _read_entries(config)
-        for e in entries:
-            if e.get("name") == name:
-                e["write"] = f"{remote}:"
-                e["account"] = e.get("account") or res["account"]
-                entry = e
-        _write_entries(config, entries)
-    return _public(entry)
+            flow._remote = remote
+            kv = [f"token={flow._token}", *[f"{k}={v}" for k, v in options.items()]]
+            out = _cfg(config, flow, ["config", "create", remote, spec.rclone_type, *kv, "--non-interactive"])
+            _forget_credentials(flow)
+            return _next(config, flow, out)
+        except BaseException as e:
+            _fail(flow, e)
+            raise
 
 
 def disconnect(config: Config, name: str) -> None:
-    """Remove `<name>-ro`/`<name>-rw` from drive-merge's rclone.conf and the entry from connections.toml."""
+    """Remove the rclone remotes the entry's `read` and `write` name (when they are sections of drive-merge's own
+    rclone.conf) and the entry from connections.toml. The person's own rclone config is never opened."""
     with _FILE_LOCK:
-        _entry(config, name)
-        for suffix in ("-ro", "-rw"):
-            _delete_remote(config, name + suffix)
+        entry = _entry(config, name)
+        wanted = []
+        for path in (entry.get("read"), entry.get("write")):
+            section = str(path).split(":", 1)[0] if path and ":" in str(path) else None
+            if section and section not in wanted:
+                wanted.append(section)
+        for section in wanted:
+            if section in _conf_sections(_conf_path(config)):
+                _delete_remote(config, section)
         _write_entries(config, [e for e in _read_entries(config) if e.get("name") != name])
+
+
+# ----------------------------------------------------------------------------- import
+
+def _personal_conf(config: Config) -> Path | None:
+    """The person's own rclone config file: RCLONE_CONFIG, else what `rclone config file` says without --config.
+    None when there is none, or when it is drive-merge's own."""
+    env = os.environ.get("RCLONE_CONFIG")
+    path: Path | None = None
+    if env:
+        path = Path(env).expanduser()
+    else:
+        binary = resolve_binary(config)
+        if binary:
+            try:
+                p = subprocess.run([binary, "config", "file"], capture_output=True, text=True, encoding="utf-8",
+                                   errors="replace", stdin=subprocess.DEVNULL, timeout=20)
+            except (OSError, subprocess.SubprocessError):
+                p = None
+            lines = [ln.strip() for ln in (p.stdout if p and p.returncode == 0 else "").splitlines() if ln.strip()]
+            if lines:
+                path = Path(lines[-1]).expanduser()
+    if path is None or not path.is_file():
+        return None
+    ours = {os.path.realpath(_conf_path(config)), os.path.realpath(config.own_rclone_conf)}
+    return None if os.path.realpath(path) in ours else path
+
+
+def _is_encrypted(path: Path) -> bool:
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.strip():
+                    return line.strip().startswith(_ENCRYPTED_HEADER)
+    except OSError:
+        pass
+    return False
+
+
+def importable(config: Config) -> dict:
+    """The remotes of the person's own rclone config that could be copied into drive-merge. Section names and
+    types are read straight from the file: no subprocess that prints tokens."""
+    path = _personal_conf(config)
+    if path is None:
+        return {"config_path": None, "encrypted": False, "remotes": []}
+    if _is_encrypted(path):
+        return {"config_path": str(path), "encrypted": True, "remotes": []}
+    done = {e.get("imported_from") for e in _read_entries(config) if e.get("imported_from")}
+    remotes = []
+    for section, opts in _conf_sections(path).items():
+        rtype = opts.get("type")
+        if not rtype:
+            continue
+        remotes.append({"name": section, "type": rtype, "provider": provider_of(rtype),
+                        "supported": rtype not in UNSUPPORTED_IMPORT, "imported": section in done})
+    return {"config_path": str(path), "encrypted": False, "remotes": remotes}
+
+
+def _import_name(source: str) -> str:
+    name = re.sub(r"[^a-z0-9-]+", "-", source.lower()).strip("-")
+    if not NAME_RE.match(name):
+        raise ConnectError("BAD_NAME", f"{source!r} cannot be turned into a cloud name; pass a name "
+                                       "(lowercase letters, digits and '-', starting with a letter)")
+    return name
+
+
+def import_remote(config: Config, source: str, *, name: str | None = None) -> dict:
+    """Copy remote `source` of the person's own rclone config into drive-merge's rclone.conf as `<name>-ro`.
+
+    The copy keeps every value as stored (obscured passwords stay obscured once), is tested, and is recorded
+    read-only with `scoped = false` and `imported_from`. The person's file is never written. Returns the
+    connection, or a question result when rclone asks something."""
+    _require_rclone(config)
+    path = _personal_conf(config)
+    if path is None:
+        raise ConnectError("NOT_FOUND", "no rclone config of your own was found to import from")
+    if _is_encrypted(path):
+        raise ConnectError("IMPORT_ENCRYPTED", "your rclone config is encrypted; drive-merge cannot read it")
+    section = _conf_sections(path).get(source)
+    if section is None or not section.get("type"):
+        raise ConnectError("NOT_FOUND", f"no remote named {source!r} in your rclone config")
+    rtype = section["type"]
+    if rtype in UNSUPPORTED_IMPORT:
+        raise ConnectError("IMPORT_UNSUPPORTED", f"a {rtype} remote cannot be imported", type=rtype)
+    if any(e.get("imported_from") == source for e in _read_entries(config)):
+        raise ConnectError("NAME_TAKEN", f"{source!r} is already imported")
+    wanted = name if name else _import_name(source)
+    flow = AuthFlow(provider_of(rtype), "read")
+    flow._rtype = rtype
+    flow._extra = {"scoped": False, "imported_from": source}
+    flow._secrets = [v for k, v in section.items() if k != "type" and len(v) >= 3]
+    flow.status = "succeeded"
+    spec = PROVIDER_SPECS.get(flow.provider)
+    _register(flow, config)
+    try:
+        with _FILE_LOCK:
+            flow.name = _claim_name(config, flow, spec, wanted, expect="succeeded")
+            remote = flow._remote = f"{flow.name}-ro"
+            kv = [f"{k}={v}" for k, v in section.items() if k != "type"]
+            out = _cfg(config, flow, ["config", "create", remote, rtype, *kv, "--no-obscure", "--non-interactive"])
+            return _next(config, flow, out)
+    except BaseException as e:
+        _fail(flow, e)
+        raise

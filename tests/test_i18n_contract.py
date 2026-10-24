@@ -303,24 +303,24 @@ def test_the_plan_codes_the_server_sends_have_sentences():
     assert len(sites) == 2 and all({"plan", "plan_status"} <= s for s in sites)
 
 
-# --------------------------------------------------------------------------- the Setup screen (docs/SETUP.md)
+# --------------------------------------------------------------------------- connecting a cloud (docs/ONBOARDING.md G)
 
-SETUP_CODES = {"BAD_NAME", "REMOTE_EXISTS", "REMOTE_NOT_FOUND", "CONFIG_LAYOUT", "CONFIG_WRITE", "RCLONE_MISSING",
-               "NOT_WAITING", "NO_CONFIG_PATH", "MISSING_FIELD", "SIGNIN_TIMEOUT", "CANCELLED", "RCLONE_ERROR",
-               "AUTH_EXPIRED", "NOT_FOUND", "NETWORK"}
+CONNECT_CODES = {"NO_RCLONE", "RCLONE_TOO_OLD", "FLOW_BUSY", "FLOW_FAILED", "FLOW_TIMEOUT", "NAME_TAKEN", "BAD_NAME",
+                 "NEEDS_CLIENT", "TEST_FAILED", "NOT_FOUND", "MISSING_FIELD", "NOT_WAITING", "TOKEN_UNREADABLE",
+                 "CONFIG_WRITE", "IMPORT_UNSUPPORTED", "IMPORT_ENCRYPTED", "BAD_REQUEST",
+                 "AUTH_EXPIRED", "NETWORK", "RCLONE_ERROR"}      # the last three come from classify_failure
 
 
-def setup_code_sites() -> dict[str, list[set[str]]]:
-    """{code: [parameter names of each site]} for everything the Setup routes and the connect job can answer with:
-    a UiError(status, code, ...), a ConfigError(code, ...) raised while editing the config file, a CodedError(code,
-    ...) that fails a job, and the codes `classify_failure` gives a failed test."""
+def connect_code_sites() -> dict[str, list[set[str]]]:
+    """{code: [parameter names of each site]} for every `ConnectError(code, message, **params)` in connections.py,
+    ui_api.py and cli.py (a dynamic code, such as a flow's own, is one of the others), plus the codes
+    `rclone.classify_failure` gives a failed Test (RCLONE_ERROR sends `detail`)."""
     sites: dict[str, list[set[str]]] = {}
-    for path, name, at in (("ui_api.py", "UiError", 1), ("config.py", "ConfigError", 0), ("ui_api.py", "ConfigError", 0),
-                           ("ui_api.py", "CodedError", 0)):
-        for call in calls(path, name):
-            code = const(call.args[at]) if len(call.args) > at else None
-            if isinstance(code, str):                          # a dynamic code (exc.code) is one of the others
-                sites.setdefault(code, []).append(keyword_names(call) - {"headers"})
+    for path in ("connections.py", "ui_api.py", "cli.py"):
+        for call in calls(path, "ConnectError"):
+            code = const(call.args[0]) if call.args else None
+            if isinstance(code, str):
+                sites.setdefault(code, []).append(keyword_names(call))
     fn = next(n for n in ast.walk(ast.parse((SRC / "rclone.py").read_text(encoding="utf-8")))
               if isinstance(n, ast.FunctionDef) and n.name == "classify_failure")
     for node in ast.walk(fn):
@@ -329,10 +329,10 @@ def setup_code_sites() -> dict[str, list[set[str]]]:
     return sites
 
 
-def test_every_setup_code_has_a_sentence_in_both_languages_that_uses_only_what_every_site_sends():
-    sites = setup_code_sites()
-    assert SETUP_CODES <= set(sites), sorted(SETUP_CODES - set(sites))
-    for code in sorted(SETUP_CODES):
+def test_every_connect_code_has_a_sentence_in_both_languages_that_uses_only_what_every_site_sends():
+    sites = connect_code_sites()
+    assert CONNECT_CODES <= set(sites), sorted(CONNECT_CODES - set(sites))
+    for code in sorted(CONNECT_CODES):
         need(f"err.{code}")
         usable = set.intersection(*sites[code])
         for lang, d in DICTS.items():
@@ -340,13 +340,17 @@ def test_every_setup_code_has_a_sentence_in_both_languages_that_uses_only_what_e
                 f"{lang} err.{code}: {placeholders(d[f'err.{code}']) - usable} is not sent by every site")
 
 
-def test_the_setup_job_failures_send_the_name_so_the_page_can_say_which_cloud():
-    sites = setup_code_sites()
-    for code in ("SIGNIN_TIMEOUT", "CANCELLED", "CONFIG_WRITE", "CONFIG_LAYOUT", "REMOTE_EXISTS"):
-        assert all("name" in s for s in sites[code]), code
-    assert sites["RCLONE_ERROR"] and all("detail" in s for s in sites["RCLONE_ERROR"])      # a failed test sends only this
-    assert {"binary"} <= set.intersection(*sites["RCLONE_MISSING"])
-    assert {"field"} <= set.intersection(*sites["MISSING_FIELD"])
+def test_the_codes_that_need_a_parameter_send_it_at_every_site():
+    sites = connect_code_sites()
+    assert sites["MISSING_FIELD"] and all("field" in s for s in sites["MISSING_FIELD"])
+    assert sites["IMPORT_UNSUPPORTED"] and all("type" in s for s in sites["IMPORT_UNSUPPORTED"])
+    assert sites["RCLONE_ERROR"] and all("detail" in s for s in sites["RCLONE_ERROR"])
+
+
+def test_the_codes_of_the_removed_setup_screen_are_gone_from_the_page():
+    for gone in ("REMOTE_EXISTS", "REMOTE_NOT_FOUND", "CONFIG_LAYOUT", "RCLONE_MISSING", "NO_CONFIG_PATH",
+                 "SIGNIN_TIMEOUT", "CANCELLED"):
+        assert f"err.{gone}" not in DICTS["en"] and f"err.{gone}" not in DICTS["zh-TW"], gone
 
 
 # --------------------------------------------------------------------------- suggestions
