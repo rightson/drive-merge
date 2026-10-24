@@ -991,6 +991,10 @@ a.btn-primary { color: var(--accent-ink); }
 .import-list { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
 .import-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 8px 12px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); }
 .import-row .muted { font-size: 12.5px; }
+.import-rename { flex: 1 1 100%; display: flex; flex-wrap: wrap; align-items: flex-end; gap: 8px 10px; }
+.import-rename .field { flex: 1 1 220px; margin: 0; }
+.import-rename .field-error { flex: 1 1 100%; margin: 0; order: 3; }
+.import-rename-actions { display: flex; gap: 6px; }
 .view-clouds .su-ro { margin-bottom: 14px; }
 
 /* ================================================================== clouds, connect, sync, free space (docs/ONBOARDING.md) */

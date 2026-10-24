@@ -83,6 +83,7 @@ class OnbMock(MockApi):
         self.needed: bool | None = None   # None: derived (nothing connected); a bool forces GET /v1/setup `needed`
         self.omit_needed = False          # an older server: the answer has no `needed` key
         self.importable_info: dict = {"config_path": "/home/u/.config/rclone/rclone.conf", "encrypted": False, "remotes": []}
+        self.suggest_names = True          # NAME_TAKEN of an import carries `suggested_name` (an older backend does not)
         self.questions: list[dict] = []   # question results the next finish / answer / import returns, one each
         self.auth_override: str | None = None        # what connect/start puts in `auth_url` instead of rclone's helper
         self.error_params: dict = {}                 # `params` of start_error / finish_error / answer_error / paste_error
@@ -165,6 +166,16 @@ class OnbMock(MockApi):
                 status, code, message = self.start_error
                 return status, {"error": message, "code": code, "params": self.error_params}
             source = body.get("source")
+            chosen = body.get("name") or re.sub(r"[^a-z0-9-]+", "-", source.lower()).strip("-")
+            if not re.match(r"^[a-z][a-z0-9-]{0,30}$", chosen):
+                return 400, {"error": "bad name", "code": "BAD_NAME"}
+            used = {c["name"] for c in self.conns}
+            if chosen in used:                                   # like the backend: NAME_TAKEN carries the first free `-N` name
+                n = 2
+                while f"{chosen}-{n}" in used:
+                    n += 1
+                params = {"suggested_name": f"{chosen}-{n}"} if self.suggest_names else {}
+                return 409, {"error": f"{chosen!r} is already in use", "code": "NAME_TAKEN", "params": params}
             if self.questions:
                 fid = f"flow-{self.next_flow}"
                 self.next_flow += 1
@@ -1603,6 +1614,158 @@ def test_an_import_that_needs_an_answer_asks_in_the_dialog(make_onb):
     ui.tid("connect-q-continue").click()
     expect(ui.tid("conn-card-work-od")).to_be_visible()
     assert last_body(ui, "POST", r"/v1/ui/connect/flows/flow-1/answer") == {"result": "b!library"}
+
+
+def _colliding(make_onb, **kw):
+    """The import row of "work-od" whose derived name is a connection already; "work-od-2" is taken as well."""
+    ui = make_onb(**kw)
+    ui.mock.connect_clouds("work-od", "work-od-2")
+    ui.mock.importable_info["remotes"] = copy.deepcopy(IMPORT_ROWS)
+    ui.mock.needed = False
+    return start(ui, "#/clouds")
+
+
+def _import_posts(ui: Ui) -> list:
+    return [c.body for c in ui.mock.calls if c.method == "POST" and c.path == "/v1/ui/connect/import"]
+
+
+def test_a_taken_import_name_opens_a_rename_form_with_a_free_suggestion(make_onb):
+    ui = _colliding(make_onb)
+    ui.tid("import-add-work-od").click()
+    form = ui.tid("import-rename-work-od")
+    expect(form).to_be_visible()
+    expect(ui.tid("toast")).to_have_count(0)                                        # inline, not a toast
+    expect(ui.tid("import-add-work-od")).to_have_count(0)
+    expect(ui.tid("import-rename-input-work-od")).to_have_value("work-od-3")        # -2 is a connection too
+    expect(ui.tid("import-rename-input-work-od")).to_be_focused()
+    expect(ui.tid("import-rename-ok-work-od")).to_contain_text("Import as")
+    expect(ui.tid("import-rename-cancel-work-od")).to_contain_text("Cancel")
+    assert _import_posts(ui) == [{"source": "work-od"}]
+    shot(ui, "import-rename-en")
+    ui.tid("import-rename-ok-work-od").click()
+    expect(ui.tid("conn-card-work-od-3")).to_be_visible()
+    expect(ui.tid("conn-unscoped-work-od-3")).to_be_visible()
+    expect(ui.tid("import-rename-work-od")).to_have_count(0)
+    expect(ui.tid("import-done-work-od")).to_be_visible()
+    assert _import_posts(ui)[-1] == {"source": "work-od", "name": "work-od-3"}
+    expect(ui.tid("toast")).to_contain_text("Connected work-od-3")
+
+
+def test_the_rename_form_words_the_reason_inline_in_both_languages(make_onb):
+    ui = _colliding(make_onb)
+    ui.tid("import-add-work-od").click()
+    input_ = ui.tid("import-rename-input-work-od")
+    input_.fill("work-od")                                                           # taken: known to the page already
+    expect(ui.tid("import-rename-error-work-od")).to_have_attribute("data-code", "NAME_TAKEN")
+    expect(ui.tid("import-rename-error-work-od")).to_contain_text("already used by another cloud")
+    expect(ui.tid("import-rename-ok-work-od")).to_be_disabled()
+    input_.fill("Bad Name!")                                                         # the backend's rule, checked before sending
+    expect(ui.tid("import-rename-error-work-od")).to_have_attribute("data-code", "BAD_NAME")
+    expect(ui.tid("import-rename-error-work-od")).to_contain_text("lowercase letters, digits and -")
+    expect(ui.tid("import-rename-ok-work-od")).to_be_disabled()
+    for bad in ("", "1abc", "-abc", "a" * 32, "a_b"):
+        input_.fill(bad)
+        expect(ui.tid("import-rename-error-work-od")).to_have_attribute("data-code", "BAD_NAME")
+    input_.press("Enter")                                                            # Enter on an invalid name sends nothing
+    ui.page.wait_for_timeout(150)
+    assert len(_import_posts(ui)) == 1
+    input_.fill("a" * 31)
+    expect(ui.tid("import-rename-error-work-od")).to_have_count(0)
+    expect(ui.tid("import-rename-ok-work-od")).to_be_enabled()
+
+
+def test_the_server_stays_authoritative_about_the_chosen_name(make_onb):
+    ui = _colliding(make_onb)
+    ui.tid("import-add-work-od").click()
+    input_ = ui.tid("import-rename-input-work-od")
+    # the page knows two names; a third is taken behind its back
+    ui.mock.conns.append({**ui.mock.conns[0], "name": "sneaky"})
+    input_.fill("sneaky")
+    ui.tid("import-rename-ok-work-od").click()
+    err = ui.tid("import-rename-error-work-od")
+    expect(err).to_have_attribute("data-code", "NAME_TAKEN")
+    assert _import_posts(ui)[-1] == {"source": "work-od", "name": "sneaky"}
+    expect(ui.tid("import-rename-input-work-od")).to_have_value("sneaky")            # what was typed is kept
+    input_.fill("fine-name")                                                         # typing clears the server's reason
+    expect(ui.tid("import-rename-error-work-od")).to_have_count(0)
+    ui.tid("import-rename-ok-work-od").click()
+    expect(ui.tid("conn-card-fine-name")).to_be_visible()
+
+
+def test_enter_submits_but_not_while_an_ime_composes_and_escape_cancels(make_onb):
+    ui = _colliding(make_onb)
+    ui.tid("import-add-work-od").click()
+    input_ = ui.tid("import-rename-input-work-od")
+    input_.fill("kept-name")
+    before = len(_import_posts(ui))
+    input_.dispatch_event("keydown", {"key": "Enter", "isComposing": True, "bubbles": True, "cancelable": True})
+    input_.dispatch_event("keydown", {"key": "Enter", "keyCode": 229, "bubbles": True, "cancelable": True})
+    ui.page.wait_for_timeout(150)
+    assert len(_import_posts(ui)) == before and input_.is_visible()                  # the IME's Enter belongs to the IME
+    input_.press("Enter")
+    expect(ui.tid("conn-card-kept-name")).to_be_visible()
+    assert _import_posts(ui)[-1] == {"source": "work-od", "name": "kept-name"}
+
+
+def test_escape_and_cancel_close_the_form_and_return_focus_to_the_import_button(make_onb):
+    ui = _colliding(make_onb)
+    ui.tid("import-add-work-od").click()
+    expect(ui.tid("import-rename-input-work-od")).to_be_focused()
+    ui.page.keyboard.press("Escape")
+    expect(ui.tid("import-rename-work-od")).to_have_count(0)
+    expect(ui.tid("import-add-work-od")).to_be_focused()
+    expect(ui.tid("import-add-work-od")).to_be_enabled()
+    assert len(_import_posts(ui)) == 1
+    ui.tid("import-add-work-od").click()                                             # opens again, with the suggestion
+    expect(ui.tid("import-rename-input-work-od")).to_have_value("work-od-3")
+    ui.tid("import-rename-cancel-work-od").click()
+    expect(ui.tid("import-rename-work-od")).to_have_count(0)
+    expect(ui.tid("import-add-work-od")).to_be_focused()
+
+
+def test_a_renamed_import_that_needs_an_answer_continues_in_the_question_form(make_onb):
+    ui = _colliding(make_onb)
+    ui.mock.questions = [{**DRIVE_CHOICE}]
+    ui.tid("import-add-work-od").click()
+    expect(ui.tid("import-rename-work-od")).to_be_visible()                          # the collision comes before any question
+    ui.tid("import-rename-ok-work-od").click()
+    expect(ui.tid("connect-question")).to_be_visible()
+    expect(ui.tid("import-rename-work-od")).to_have_count(0)
+    assert _import_posts(ui)[-1] == {"source": "work-od", "name": "work-od-3"}
+    ui.tid("connect-q-option-1").check()
+    ui.tid("connect-q-continue").click()
+    expect(ui.tid("conn-card-work-od")).to_be_visible()
+
+
+def test_without_a_suggestion_from_the_server_the_page_numbers_the_name_itself(make_onb):
+    ui = _colliding(make_onb)
+    ui.mock.suggest_names = False
+    ui.tid("import-add-work-od").click()
+    expect(ui.tid("import-rename-input-work-od")).to_have_value("work-od-3")
+
+
+def test_a_name_the_server_calls_bad_opens_the_form_with_that_reason(make_onb):
+    ui = make_onb()
+    ui.mock.importable_info["remotes"] = [{"name": "123 Photos", "type": "dropbox", "provider": "dropbox", "supported": True, "imported": False}]
+    ui = start(ui)
+    ui.tid("import-add-123 Photos").click()
+    expect(ui.tid("import-rename-error-123 Photos")).to_have_attribute("data-code", "BAD_NAME")
+    ui.tid("import-rename-input-123 Photos").fill("photos")
+    ui.tid("import-rename-ok-123 Photos").click()
+    expect(ui.tid("conn-card-photos")).to_be_visible()
+
+
+def test_the_rename_form_is_in_traditional_chinese(make_onb):
+    ui = _colliding(make_onb, locale="zh-TW")
+    ui.tid("import-add-work-od").click()
+    expect(ui.tid("import-rename-work-od")).to_contain_text("要用哪個名稱匯入")
+    expect(ui.tid("import-rename-ok-work-od")).to_have_text("以此名稱匯入")
+    expect(ui.tid("import-rename-cancel-work-od")).to_have_text("取消")
+    ui.tid("import-rename-input-work-od").fill("work-od")
+    expect(ui.tid("import-rename-error-work-od")).to_have_text("這個名稱已被另一個雲端使用。")
+    ui.tid("import-rename-input-work-od").fill("Bad!")
+    expect(ui.tid("import-rename-error-work-od")).to_contain_text("小寫英文字母")
+    shot(ui, "import-rename-zh")
 
 
 def test_an_import_refusal_is_worded(make_onb):
