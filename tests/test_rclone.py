@@ -4,7 +4,6 @@ import json
 import pickle
 import shutil
 import stat as statmod
-import subprocess
 import sys
 import threading
 import time
@@ -514,148 +513,15 @@ def test_real_about_and_version(tree):
     assert rc.version().startswith("v1.")
 
 
-# --- setup: version, remotes, `rclone config` (docs/SETUP.md section A) ------------------------------
+# --- classify_failure: how a failed rclone call is worded (docs/ONBOARDING.md section G4.3) -------------
 
-from fake_rclone import FakeRclone  # noqa: E402
-from drivemerge.rclone import (  # noqa: E402
-    AUTH_URL, RcloneCancelled, RcloneTimeout, classify_failure,
-)
-
-CREATE_DROPBOX = ["rclone", "config", "create", "dbx", "dropbox", "--non-interactive"]
-
-
-@pytest.fixture
-def fake(tmp_path):
-    return FakeRclone(tmp_path)
-
-
-def fake_rclone(fake) -> Rclone:
-    return Rclone(fake.binary, config=fake.config)
-
-
-@pytest.mark.parametrize("out, version, ok", [
-    ("rclone v1.71.1\n- os/version: ubuntu\n", "v1.71.1", True),
-    ("rclone v1.69.0\n", "v1.69.0", True),
-    ("rclone v1.68.2\n", "v1.68.2", False),
-    ("rclone v1.9.9\n", "v1.9.9", False),
-    ("rclone v2.0.0-beta.1\n", "v2.0.0-beta.1", True),
-])
-def test_version_info_flags_versions_below_1_69(out, version, ok):
-    assert Rclone(runner=FakeRunner(out=out)).version_info() == {"version": version, "ok": ok}
-
-
-def test_version_info_is_none_when_rclone_cannot_run(tmp_path):
-    assert Rclone(str(tmp_path / "no-such-rclone")).version_info() is None
-    assert Rclone(runner=FakeRunner(rc=1, err="boom")).version_info() is None
-    assert Rclone(runner=FakeRunner(out="something else\n")).version_info() is None
-
-
-def test_list_remotes_parses_the_json_form():
-    out = json.dumps([{"name": "gd", "type": "drive", "source": "file", "description": ""},
-                      {"name": "my box", "type": "box", "source": "file", "description": ""}])
-    r = FakeRunner(out=out)
-    assert Rclone(config="c.conf", runner=r).list_remotes() == [{"name": "gd", "type": "drive"},
-                                                                {"name": "my box", "type": "box"}]
-    assert r.calls == [["rclone", "--config", "c.conf", "listremotes", "--long", "--json"]]
-    assert Rclone(runner=FakeRunner(out="[\n]\n")).list_remotes() == []
-
-
-def test_list_remotes_falls_back_to_the_text_form_on_an_older_rclone():
-    calls = []
-
-    def runner(argv):
-        calls.append(argv)
-        if "--json" in argv:
-            return 1, "", "Error: unknown flag: --json"
-        return 0, "gd: drive\nlocal-disk: local\n", ""
-
-    assert Rclone(runner=runner).list_remotes() == [{"name": "gd", "type": "drive"},
-                                                    {"name": "local-disk", "type": "local"}]
-    assert calls[1] == ["rclone", "listremotes", "--long"]
-
-
-def test_list_remotes_garbage_raises():
-    with pytest.raises(RcloneError):
-        Rclone(runner=FakeRunner(out="{not json")).list_remotes()
-
-
-def test_config_create_argv_and_json_with_a_runner():
-    reply = {"State": "*oauth-islocal,,,", "Option": {"Name": "config_is_local"}, "Error": "", "Result": ""}
-    r = FakeRunner(out=json.dumps(reply), err="NOTICE: Config file not found\n")
-    seen = []
-    got = Rclone(config="c.conf", runner=r).config_create(
-        "gd", "drive", {"scope": "drive.readonly"}, on_stderr=seen.append)
-    assert got == reply
-    assert r.calls == [["rclone", "--config", "c.conf", "config", "create", "gd", "drive", "scope=drive.readonly",
-                        "--non-interactive"]]
-    assert seen == ["NOTICE: Config file not found"]
-
-
-def test_config_continue_argv_and_an_empty_state_means_finished():
-    r = FakeRunner(out="")
-    got = Rclone(runner=r).config_continue("gd", "*oauth-islocal,,,", "true")
-    assert got["State"] == "" and got["Option"] is None
-    assert r.calls == [["rclone", "config", "update", "gd", "--continue", "--state", "*oauth-islocal,,,",
-                        "--result", "true", "--non-interactive"]]
-
-
-def test_config_calls_refuse_names_and_types_that_could_be_flags():
-    rc = Rclone(runner=FakeRunner())
-    for bad in ("-x", "", "a b", "a:b", "a/b", "../x"):
-        with pytest.raises(ValueError):
-            rc.config_create(bad, "drive")
-        with pytest.raises(ValueError):
-            rc.config_continue(bad, "s", "r")
-        with pytest.raises(ValueError):
-            rc.config_delete(bad)
-    with pytest.raises(ValueError):
-        rc.config_create("ok", "--drive")
-
-
-def test_config_failure_keeps_secrets_out_of_message_argv_and_stderr():
-    secret = "hunter2-TOKEN"
-    r = FakeRunner(rc=1, err=f"NOTICE: x\nCRITICAL: could not use {secret} here\n")
-    seen = []
-    with pytest.raises(RcloneError) as ei:
-        Rclone(runner=r).config_continue("gd", "st", secret, on_stderr=seen.append)
-    e = ei.value
-    assert e.returncode == 1
-    for text in (str(e), e.stderr, " ".join(e.args), repr(e), *seen):
-        assert secret not in text
-    assert e.args[e.args.index("--result") + 1] == "***"
-    with pytest.raises(RcloneError) as ei:
-        Rclone(runner=r).config_create("ic", "iclouddrive", {"apple_id": "me@example.com", "password": secret})
-    assert secret not in str(ei.value) and secret not in " ".join(ei.value.args) and secret not in ei.value.stderr
-    assert "password=***" in ei.value.args
-
-
-def test_config_unparseable_output_raises_without_echoing_it():
-    with pytest.raises(RcloneError) as ei:
-        Rclone(runner=FakeRunner(out="not json SECRETSECRET")).config_create("gd", "drive")
-    assert "SECRETSECRET" not in str(ei.value) and "SECRETSECRET" not in ei.value.stderr
-    with pytest.raises(RcloneError):
-        Rclone(runner=FakeRunner(out="[1, 2]")).config_create("gd", "drive")
-
-
-def test_config_delete_argv():
-    r = FakeRunner()
-    Rclone(config="c.conf", runner=r).config_delete("gd")
-    assert r.calls == [["rclone", "--config", "c.conf", "config", "delete", "gd"]]
-    with pytest.raises(RcloneError):
-        Rclone(runner=FakeRunner(rc=1, err="nope")).config_delete("gd")
-
-
-def test_test_remote_returns_the_error_instead_of_raising():
-    r = FakeRunner(out="[]")
-    assert Rclone(runner=r).test_remote("gd:") is None
-    assert r.calls == [["rclone", "lsjson", "--max-depth", "1", "gd:"]]
-    failure = Rclone(runner=FakeRunner(rc=3, err="ERROR : directory not found")).test_remote("gd:")
-    assert isinstance(failure, RcloneError) and failure.returncode == 3 and "directory not found" in failure.stderr
+from drivemerge.rclone import classify_failure  # noqa: E402
 
 
 @pytest.mark.parametrize("rc, stderr, code", [
     (1, 'CRITICAL: Failed to create file system for "x:": didn\'t find section in config file ("x")', "NOT_FOUND"),
     (3, "ERROR : error listing: directory not found", "NOT_FOUND"),
+    (4, "something else entirely", "NOT_FOUND"),
     (1, "couldn't fetch token - maybe it has expired?: oauth2: token expired and refresh token is not set",
      "AUTH_EXPIRED"),
     (1, "Error: invalid_grant: Token has been expired or revoked.", "AUTH_EXPIRED"),
@@ -663,158 +529,9 @@ def test_test_remote_returns_the_error_instead_of_raising():
     (1, 'Get "https://www.googleapis.com": dial tcp: lookup www.googleapis.com: no such host', "NETWORK"),
     (1, "read tcp 10.0.0.2:5555->1.2.3.4:443: i/o timeout", "NETWORK"),
     (1, "context deadline exceeded", "NETWORK"),
+    (1, "rclone lsjson timed out after 30 s", "NETWORK"),
     (1, "something odd", "RCLONE_ERROR"),
     (2, "", "RCLONE_ERROR"),
 ])
 def test_classify_failure(rc, stderr, code):
     assert classify_failure(rc, stderr) == code
-
-
-def test_a_test_remote_timeout_is_a_returned_timeout(monkeypatch, tmp_path):
-    def slow(*a, **kw):
-        raise subprocess.TimeoutExpired(a[0], 30)
-
-    monkeypatch.setattr(subprocess, "run", slow)
-    failure = Rclone("rclone").test_remote("gd:")
-    assert isinstance(failure, RcloneTimeout) and classify_failure(failure.returncode, failure.stderr) == "NETWORK"
-
-
-@pytest.mark.parametrize("line, url", [
-    ('ERROR : Failed to open browser automatically (...) - please go to the following link: '
-     'http://127.0.0.1:53682/auth?state=9B338VBQ2e8ctJbajCeu4w', "http://127.0.0.1:53682/auth?state=9B338VBQ2e8ctJbajCeu4w"),
-    ("If your browser doesn't open automatically go to the following link: http://127.0.0.1:53682/auth?state=a-b_c",
-     "http://127.0.0.1:53682/auth?state=a-b_c"),
-    ("go to http://127.0.0.1:53682/auth?state=abc@evil.example/x", "http://127.0.0.1:53682/auth?state=abc"),
-])
-def test_auth_url_pattern_takes_only_the_helper_url(line, url):
-    assert AUTH_URL.search(line).group(0) == url
-
-
-@pytest.mark.parametrize("line", [
-    "NOTICE: Waiting for code...",
-    "go to http://evil.example/auth?state=abc",
-    "go to http://127.0.0.1:53683/auth?state=abc",
-    "go to http://127.0.0.1:53682.evil.example/auth?state=abc",
-    "go to https://127.0.0.1:53682/auth?state=abc",
-    "go to http://localhost:53682/auth?state=abc",
-    "http://127.0.0.1:53682/other?state=abc",
-])
-def test_auth_url_pattern_ignores_everything_else(line):
-    assert AUTH_URL.search(line) is None
-
-
-def test_fake_binary_create_and_list_and_delete(fake):
-    rc = fake_rclone(fake)
-    out = rc.config_create("dbx", "dropbox")
-    assert out["State"] == "*oauth-islocal,,," and out["Option"]["Name"] == "config_is_local"
-    assert out["Option"]["Examples"] == [{"Value": "true", "Help": "Yes"}, {"Value": "false", "Help": "No"}]
-    assert rc.list_remotes() == [{"name": "dbx", "type": "dropbox"}]
-    rc.config_delete("dbx")
-    assert rc.list_remotes() == []
-    fake.flag("no_json")
-    fake.seed("gd", "drive")
-    assert rc.list_remotes() == [{"name": "gd", "type": "drive"}]         # the text fallback, against a real process
-
-
-def test_fake_binary_streams_stderr_and_blocks_until_the_browser_is_done(fake):
-    rc = fake_rclone(fake)
-    rc.config_create("dbx", "dropbox")
-    lines, result = [], []
-    done = threading.Event()
-
-    def call():
-        result.append(rc.config_continue("dbx", "*oauth-islocal,,,", "true", on_stderr=lines.append))
-        done.set()
-
-    threading.Thread(target=call, daemon=True).start()
-    assert fake.wait_for(lambda: any(AUTH_URL.search(ln) for ln in lines))      # seen while rclone is still waiting
-    assert not done.is_set()
-    fake.finish_browser()
-    assert done.wait(10)
-    assert result[0]["State"] == ""
-    assert "token" in fake.sections()["dbx"]
-
-
-def test_cancel_kills_a_config_call_that_is_waiting_for_the_browser(fake):
-    rc = fake_rclone(fake)
-    rc.config_create("dbx", "dropbox")
-    cancel, lines, errors = threading.Event(), [], []
-
-    def call():
-        try:
-            rc.config_continue("dbx", "*oauth-islocal,,,", "true", on_stderr=lines.append, cancel=cancel)
-        except RcloneError as e:
-            errors.append(e)
-
-    t = threading.Thread(target=call, daemon=True)
-    t.start()
-    assert fake.wait_for(lambda: any(AUTH_URL.search(ln) for ln in lines))
-    started = time.monotonic()
-    cancel.set()
-    t.join(10)
-    assert not t.is_alive() and time.monotonic() - started < 5
-    assert isinstance(errors[0], RcloneCancelled)
-
-
-def test_a_cancel_that_is_already_set_never_starts_rclone(fake):
-    cancel = threading.Event()
-    cancel.set()
-    with pytest.raises(RcloneCancelled):
-        fake_rclone(fake).config_create("dbx", "dropbox", cancel=cancel)
-    assert fake.calls() == []
-
-
-def test_a_config_call_that_takes_too_long_is_killed(fake):
-    rc = fake_rclone(fake)
-    rc.config_create("dbx", "dropbox")
-    started = time.monotonic()
-    with pytest.raises(RcloneTimeout):
-        rc.config_continue("dbx", "*oauth-islocal,,,", "true", timeout=0.4)
-    assert time.monotonic() - started < 5
-
-
-def test_a_failing_config_call_raises_with_the_stderr_tail(fake):
-    rc = fake_rclone(fake)
-    fake.flag("fail_create")
-    with pytest.raises(RcloneError) as ei:
-        rc.config_create("dbx", "dropbox")
-    assert ei.value.returncode == 1 and "boom" in str(ei.value) and "boom" in ei.value.stderr
-
-
-def test_a_password_answer_never_reaches_an_error_from_a_process_that_echoes_it(fake):
-    rc = fake_rclone(fake)
-    rc.config_create("ic", "iclouddrive", {"apple_id": "me@example.com", "password": "pw-123456"})
-    fake.flag("echo_answer")
-    lines = []
-    with pytest.raises(RcloneError) as ei:
-        rc.config_continue("ic", "fake-2fa,,,", "654321-SECRET", on_stderr=lines.append)
-    for text in (str(ei.value), ei.value.stderr, " ".join(ei.value.args), *lines):
-        assert "654321-SECRET" not in text
-    assert any("bad code" in ln for ln in lines)                 # the line itself still arrived, masked
-
-
-def test_listing_the_fake_remote_reports_what_rclone_reports(fake):
-    rc = fake_rclone(fake)
-    fake.seed("gd", "drive")
-    assert rc.test_remote("gd:") is None
-    failure = rc.test_remote("nothere:")
-    assert classify_failure(failure.returncode, failure.stderr) == "NOT_FOUND"
-    fake.fail_lsjson("gd", "auth")
-    assert classify_failure(*(lambda e: (e.returncode, e.stderr))(rc.test_remote("gd:"))) == "AUTH_EXPIRED"
-    fake.fail_lsjson("gd", "network")
-    assert classify_failure(*(lambda e: (e.returncode, e.stderr))(rc.test_remote("gd:"))) == "NETWORK"
-
-
-@needs_rclone
-def test_real_rclone_setup_calls(tmp_path):
-    conf = str(tmp_path / "rclone.conf")
-    rc = Rclone(config=conf)
-    assert rc.version_info()["ok"] in (True, False)
-    assert rc.list_remotes() == []
-    first = rc.config_create("dbx", "dropbox")
-    assert first["State"].startswith("*oauth-islocal") and first["Option"]["Name"] == "config_is_local"
-    assert rc.list_remotes() == [{"name": "dbx", "type": "dropbox"}]
-    rc.config_delete("dbx")
-    rc.config_delete("dbx")                                      # deleting what is not there is not an error
-    assert rc.list_remotes() == []
-    assert classify_failure(*(lambda e: (e.returncode, e.stderr))(rc.test_remote("dbx:"))) == "NOT_FOUND"

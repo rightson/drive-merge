@@ -434,7 +434,8 @@ def cmd_init(ctx: Ctx) -> int:
     print()
     print("Next steps:")
     print("  1. Connect your clouds in the browser:      drivemerge ui")
-    print("     or in this terminal:                     drivemerge connect dropbox   (also: onedrive, drive)")
+    print("     or in this terminal:                     drivemerge connect dropbox   (also: onedrive, drive, iclouddrive)")
+    print("     clouds you already use with rclone:      drivemerge import NAME")
     print("  2. Check them, then scan:                   drivemerge connections && drivemerge scan --all")
     print(f"  (clouds you connect are kept next to {path.name}: connections.toml and rclone.conf, mode 600;"
           " you can still add [[remotes]] of your own)")
@@ -950,6 +951,41 @@ def _show_connection(ctx: Ctx, conn: dict, verb: str) -> int:
     return EXIT_OK
 
 
+def _ask_question(result: dict) -> str:
+    """Show rclone's question on the terminal and read the answer (hidden when it is a password)."""
+    q = result["question"]
+    if result.get("retry"):
+        print("That answer was not accepted; try again.", file=sys.stderr)
+    if q.get("help"):
+        print(q["help"], file=sys.stderr)
+    examples = q.get("examples") or []
+    for ex in examples:
+        print(f"  {ex['value']}" + (f"  ({ex['help']})" if ex.get("help") else ""), file=sys.stderr)
+    default = q.get("default")
+    prompt = f"{q.get('name') or 'answer'}" + (f" [{default}]" if default not in ("", None) else "") + ": "
+    try:
+        answer = getpass.getpass(prompt) if q.get("password") else input(prompt)
+    except EOFError:
+        raise ValueError("no answer given") from None
+    if answer == "" and default not in ("", None):
+        return str(default).lower() if isinstance(default, bool) else str(default)
+    return answer
+
+
+def _answer_questions(cfg: config_mod.Config, result: dict) -> dict:
+    """Ask the terminal every question rclone has (iCloud's two-factor code, a OneDrive drive choice) until the
+    connection is made."""
+    while "flow_id" in result:
+        flow_id = result["flow_id"]
+        try:
+            answer = _ask_question(result)
+        except BaseException:
+            connections.cancel_flow(flow_id)
+            raise
+        result = connections.answer_flow(cfg, flow_id, answer)
+    return result
+
+
 def cmd_connect(ctx: Ctx) -> int:
     a = ctx.args
     _connect_gate("connect a cloud")
@@ -960,14 +996,40 @@ def cmd_connect(ctx: Ctx) -> int:
             raise connections.ConnectError("NOT_FOUND", f"no connection named {a.enable_writes!r}")
         flow = connections.start_flow(cfg, match["provider"], purpose="write", name=a.enable_writes,
                                       client_id=a.client_id, client_secret=a.client_secret)
-        _wait_for_sign_in(flow)
-        return _show_connection(ctx, connections.finish_enable_writes(cfg, flow.id, a.enable_writes), "Enabled changes on")
+        if flow.status == "waiting":
+            _wait_for_sign_in(flow)
+        conn = _answer_questions(cfg, connections.finish_enable_writes(cfg, flow.id, a.enable_writes))
+        return _show_connection(ctx, conn, "Enabled changes on")
+    if a.paste_token:
+        if _is_tty(sys.stdin):
+            print("Paste the output of `rclone authorize` from the other computer, then end with Ctrl-D:",
+                  file=sys.stderr)
+        flow = connections.paste_token(cfg, a.paste_token, sys.stdin.read(), name=a.name,
+                                       client_id=a.client_id, client_secret=a.client_secret)
+        conn = _answer_questions(cfg, connections.finish_connect(cfg, flow.id, name=a.name))
+        return _show_connection(ctx, conn, "Connected")
     if not a.provider:
-        raise ValueError("say which cloud: drivemerge connect drive|onedrive|dropbox (or --enable-writes NAME)")
+        raise ValueError("say which cloud: drivemerge connect drive|onedrive|dropbox|iclouddrive "
+                         "(or --enable-writes NAME, or --paste-token PROVIDER)")
+    spec = connections.PROVIDER_SPECS[a.provider]
     connections.check_name(cfg, a.provider, a.name)     # before the person signs in, not after
+    if spec.kind == "config":
+        if not a.apple_id:
+            raise ValueError(f"{spec.label} needs --apple-id ID (the password is asked here, not on the command line)")
+        flow = connections.start_flow(cfg, a.provider, name=a.name, apple_id=a.apple_id,
+                                      password=getpass.getpass(f"Apple ID password for {a.apple_id}: "))
+        return _show_connection(ctx, _answer_questions(cfg, connections.flow_result(flow)), "Connected")
     flow = connections.start_flow(cfg, a.provider, client_id=a.client_id, client_secret=a.client_secret)
     _wait_for_sign_in(flow)
-    return _show_connection(ctx, connections.finish_connect(cfg, flow.id, name=a.name), "Connected")
+    conn = _answer_questions(cfg, connections.finish_connect(cfg, flow.id, name=a.name))
+    return _show_connection(ctx, conn, "Connected")
+
+
+def cmd_import(ctx: Ctx) -> int:
+    _connect_gate("import a cloud")
+    cfg = ctx.config
+    conn = _answer_questions(cfg, connections.import_remote(cfg, ctx.args.source, name=ctx.args.name))
+    return _show_connection(ctx, conn, "Imported")
 
 
 def cmd_disconnect(ctx: Ctx) -> int:
@@ -1014,10 +1076,8 @@ def cmd_serve(ctx: Ctx) -> int:
 
 def cmd_ui(ctx: Ctx) -> int:
     if config_mod.ensure_config(ctx.config_path):
-        print(f"Created {ctx.config_path} (mode 600, new API token): no clouds yet, so the page opens on Setup",
-              flush=True)
-        print(f"No config found: wrote {ctx.config_path} and created the catalog. "
-              "Connect your clouds on the page that opens.", file=sys.stderr)
+        print(f"Created {ctx.config_path} (mode 600, new API token) and the catalog: "
+              "connect your clouds on the page that opens.", file=sys.stderr)
     cfg = ctx.config
     try:
         from . import ui_api
@@ -1097,10 +1157,18 @@ def build_parser() -> argparse.ArgumentParser:
             "sign in to a cloud and add it as a read-only connection (human, interactive terminal only)")
     p.add_argument("provider", nargs="?", choices=sorted(connections.PROVIDER_SPECS), help="the cloud to connect")
     p.add_argument("--name", metavar="N", help="connection name (default: gdrive, onedrive, dropbox; then -2, -3)")
+    p.add_argument("--apple-id", metavar="ID", help="your Apple ID (iclouddrive; the password and the two-factor "
+                   "code are asked in the terminal)")
+    p.add_argument("--paste-token", metavar="PROVIDER", choices=sorted(connections.PROVIDER_SPECS),
+                   help="connect PROVIDER with a token made by `rclone authorize` on another computer, read from stdin")
     p.add_argument("--client-id", metavar="ID", help="your own OAuth client id (required for drive)")
     p.add_argument("--client-secret", metavar="SECRET", help="your own OAuth client secret (required for drive)")
     p.add_argument("--enable-writes", metavar="NAME",
                    help="sign in again with write access for an existing connection (needed before a plan can change it)")
+    p = add(sub, "import", cmd_import,
+            "copy a remote of your own rclone config into drive-merge, read-only (human, interactive terminal only)")
+    p.add_argument("source", metavar="SOURCE", help="the remote's name in your rclone config")
+    p.add_argument("--name", metavar="N", help="connection name (default: SOURCE in lowercase)")
     p = add(sub, "disconnect", cmd_disconnect, "remove a connection and its rclone remotes (human, interactive terminal only)")
     p.add_argument("name", metavar="NAME")
     p = add(sub, "connections", cmd_connections, "list the clouds connected with `drivemerge connect`")

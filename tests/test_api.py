@@ -507,8 +507,11 @@ def test_serve_refuses_empty_token_before_opening_the_catalog(monkeypatch):
 
 def test_setup_is_readable_with_the_token_and_has_no_connection_routes(client, service):
     body = client.get("/v1/setup", headers=AUTH).json()
-    assert set(body) == {"first_run", "config_path", "rclone", "connections", "providers"}
-    assert body["connections"] == [] and {p["key"] for p in body["providers"]} == {"drive", "onedrive", "dropbox"}
+    assert set(body) == {"first_run", "config_path", "rclone", "connections", "providers", "needed", "manual_remotes"}
+    assert body["connections"] == [] and {p["key"] for p in body["providers"]} == {
+        "drive", "onedrive", "dropbox", "iclouddrive"}
+    assert body["needed"] is True and body["manual_remotes"] == []
+    assert all({"key", "label", "needs_client", "kind", "fields", "authorize"} == set(p) for p in body["providers"])
     paths = {r.path for r in _route_paths(client.app.routes)}
     assert not [p for p in paths if "connect" in p or "sync" in p or "rclone" in p]     # human channel only
 
@@ -535,6 +538,18 @@ def test_connect_errors_are_always_coded(client, service, monkeypatch):
     _record(monkeypatch, service, "setup_status", raises=connections.ConnectError("NO_RCLONE", "rclone is missing"))
     r = client.get("/v1/setup", headers=AUTH)
     assert r.status_code == 409 and r.json() == {"error": "rclone is missing", "code": "NO_RCLONE"}
+
+
+@pytest.mark.parametrize("code, status, params", [
+    ("MISSING_FIELD", 400, {"field": "password"}), ("BAD_REQUEST", 400, {}), ("TOKEN_UNREADABLE", 400, {}),
+    ("NOT_WAITING", 409, {}), ("IMPORT_UNSUPPORTED", 400, {"type": "crypt"}), ("IMPORT_ENCRYPTED", 409, {}),
+    ("CONFIG_WRITE", 409, {}), ("NOT_FOUND", 404, {}), ("NEEDS_CLIENT", 400, {})])
+def test_connect_error_codes_have_their_status_and_params(client, service, monkeypatch, code, status, params):
+    from drivemerge import connections
+    _record(monkeypatch, service, "setup_status", raises=connections.ConnectError(code, "nope", **params))
+    r = client.get("/v1/setup", headers=AUTH)
+    assert r.status_code == status and r.json()["code"] == code
+    assert r.json().get("params", {}) == params
 
 
 def test_a_release_plan_can_be_proposed_over_the_api(client, service, monkeypatch):

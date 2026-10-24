@@ -28,7 +28,8 @@ LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 _NO_PLAN = re.compile(r"no plan \d+")
 QUOTA_TTL = 600.0          # seconds a quota from test_connection is reused
 QUOTA_FAIL_TTL = 60.0      # a failed lookup is not retried for this long
-_CONNECT_STATUS = {"NOT_FOUND": 404, "BAD_NAME": 400, "NEEDS_CLIENT": 400}
+_CONNECT_STATUS = {"NOT_FOUND": 404, "BAD_NAME": 400, "NEEDS_CLIENT": 400, "MISSING_FIELD": 400, "BAD_REQUEST": 400,
+                   "TOKEN_UNREADABLE": 400, "NOT_WAITING": 409, "IMPORT_UNSUPPORTED": 400}
 
 
 class QuotaCache:

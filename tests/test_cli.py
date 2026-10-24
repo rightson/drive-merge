@@ -237,11 +237,50 @@ def test_ui_without_a_config_runs_init_first(tmp_path, monkeypatch, capsys):
     assert cli.main(["--config", str(path), "ui", "--no-browser"]) == 0
     assert path.exists() and stat.S_IMODE(path.stat().st_mode) == 0o600
     assert started["cfg"].remotes == [] and started["open_browser"] is False
+    assert started["config_path"] == path                      # handed on, so the server can reload what is connected
     assert len(tomllib.loads(path.read_text())["api"]["token"]) >= 32
-    assert "wrote" in capsys.readouterr().err.lower()
+    err = capsys.readouterr().err
+    assert err.count("Created") == 1 and "connect your clouds on the page" in err      # one line, not two
+    assert tomllib.loads(path.read_text())["api"]["token"] not in err
     first = path.read_text()                       # a second start keeps the config (and its token)
+    started.clear()
     assert cli.main(["--config", str(path), "ui", "--no-browser"]) == 0
-    assert path.read_text() == first
+    assert path.read_text() == first and started["config_path"] == path
+    assert "Created" not in capsys.readouterr().err
+
+
+def test_other_commands_still_hint_at_init_when_the_config_is_missing(tmp_path, capsys):
+    path = tmp_path / "none.toml"
+    for argv in (["remotes"], ["connections"], ["scan", "--all"]):
+        assert cli.main(["--config", str(path), *argv]) == 1
+        assert "drivemerge init" in capsys.readouterr().err
+    assert not path.exists()
+
+
+def test_run_ui_hands_the_config_path_to_the_service(env, monkeypatch, capsys):
+    from drivemerge import ui_api
+    captured = {}
+    real_service = ui_api.Service
+
+    def spy(config, **kw):
+        captured["config_path"] = kw.get("config_path")
+        return real_service(config, **kw)
+
+    monkeypatch.setattr(ui_api, "Service", spy)
+    monkeypatch.setattr(ui_api.uvicorn, "run", lambda app, **kw: captured.update(app=app))
+    monkeypatch.setattr(ui_api, "approvals_allowed", lambda: (True, None))
+    cfg = cli._load_config(env.config)
+    other = env.tmp / "elsewhere.toml"
+    ui_api.run_ui(cfg, host="127.0.0.1", port=0, open_browser=False, config_path=other)
+    assert captured["config_path"] == other
+    ui_api.run_ui(cfg, host="127.0.0.1", port=0, open_browser=False)
+    assert captured["config_path"] == cfg.config_path
+    token = capsys.readouterr().out.split("#token=")[-1].split()[0]        # the second run's
+    from fastapi.testclient import TestClient
+    client = TestClient(captured["app"])
+    assert client.get("/v1/setup").status_code == 401                 # locked until a session is opened
+    client.post("/v1/ui/session", json={"token": token})
+    assert client.get("/v1/setup").json()["config_path"] == str(cfg.config_path)
 
 
 def test_packaged_template_and_example_config_are_identical():
@@ -1130,7 +1169,78 @@ def test_connect_enable_writes_and_drive_needs_a_client(cenv, trun, jrun):
     assert rc == 1 and "say which cloud" in err
 
 
-@pytest.mark.parametrize("argv", [["connect", "dropbox"], ["connect", "--enable-writes", "x"], ["disconnect", "x"]])
+@pytest.mark.skipif(sys.platform == "win32", reason="posix fake rclone")
+def test_connect_iclouddrive_asks_the_password_and_the_code_on_the_terminal(cenv, trun, run, jrun, monkeypatch):
+    import getpass as getpass_mod
+    (cenv.parent.parent / "clouds" / "icloud").mkdir()
+    asked, codes = [], iter(["000000", "123456"])
+    monkeypatch.setattr(getpass_mod, "getpass", lambda prompt="": (asked.append(("hidden", prompt)), "pw-SECRET-4711")[1])
+    monkeypatch.setattr("builtins.input", lambda prompt="": (asked.append(("shown", prompt)), next(codes))[1])
+    rc, out, err = trun("connect", "iclouddrive", config=cenv)
+    assert rc == 1 and "--apple-id" in err and not asked                         # the password is never an option
+    rc, out, err = trun("connect", "iclouddrive", "--apple-id", "me@example.com", config=cenv)
+    assert rc == 0, err
+    assert "Connected icloud: read-only" in out
+    assert [k for k, _ in asked] == ["hidden", "shown", "shown"]                  # password hidden, the code echoed
+    assert "not accepted" in err                                                  # the wrong code asked again
+    rc, rows = jrun("connections", "--test", config=cenv)
+    assert rows[0]["provider"] == "iclouddrive" and rows[0]["scoped"] is False and rows[0]["test"]["ok"] is True
+    for text in (out, err, (cenv.parent / "connections.toml").read_text(), cenv.read_text(), json.dumps(rows)):
+        assert "pw-SECRET-4711" not in text and "123456" not in text
+    assert "pw-SECRET-4711" not in (cenv.parent / "rclone.conf").read_text()      # rclone obscured it
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="posix fake rclone")
+def test_connect_paste_token_reads_the_token_from_stdin(cenv, trun, run, jrun, monkeypatch):
+    import io
+
+    class Tty(io.StringIO):
+        def isatty(self):
+            return True
+
+    root = cenv.parent.parent / "clouds" / "dropbox"
+    token = {"access_token": "pasted-at-a1b2c3d4", "refresh_token": "pasted-rt-e5f6a7b8", "fake_root": str(root)}
+    monkeypatch.setattr(sys, "stdin", Tty("Paste the following into your remote machine --->\n" + json.dumps(token)
+                                           + "\n<---End paste\n"))
+    rc, out, err = trun("connect", "--paste-token", "dropbox", config=cenv)
+    assert rc == 0, err
+    assert "Connected dropbox" in out and "state=" not in err                      # no browser sign-in
+    assert "pasted-rt" not in out + err + (cenv.parent / "connections.toml").read_text()
+    monkeypatch.setattr(sys, "stdin", Tty("garbage SECRET-GARBAGE"))
+    rc, out, err = trun("connect", "--paste-token", "dropbox", "--name", "other", config=cenv)
+    assert rc == 1 and "rclone authorize" in err and "SECRET-GARBAGE" not in out + err
+    monkeypatch.setattr(sys, "stdin", Tty(json.dumps(token)))
+    rc, out, err = trun("connect", "--paste-token", "drive", config=cenv)
+    assert rc == 1 and "client id" in err                                          # the token belongs to its client
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="posix fake rclone")
+def test_import_copies_a_remote_of_your_own_rclone_config(cenv, trun, run, jrun, monkeypatch):
+    work = cenv.parent.parent / "clouds" / "work"
+    work.mkdir()
+    personal = cenv.parent.parent / "personal.conf"
+    personal.write_text('[Work]\ntype = dropbox\ntoken = {"access_token":"imp-at-1","refresh_token":"imp-rt-2"}\n'
+                        f"fake_root = {work}\n[enc]\ntype = crypt\nremote = Work:\n")
+    monkeypatch.setenv("RCLONE_CONFIG", str(personal))
+    before = personal.read_bytes()
+    rc, out, err = trun("import", "enc", config=cenv)
+    assert rc == 1 and "crypt" in err
+    rc, out, err = trun("import", "Work", config=cenv)
+    assert rc == 0, err
+    assert "Imported work" in out and personal.read_bytes() == before
+    rc, rows = jrun("connections", "--test", config=cenv)
+    assert rows[0]["name"] == "work" and rows[0]["imported_from"] == "Work" and rows[0]["scoped"] is False
+    assert rows[0]["writable"] is False and rows[0]["test"]["ok"] is True
+    assert "imp-rt-2" not in out + err + json.dumps(rows) + (cenv.parent / "connections.toml").read_text()
+    rc, out, err = trun("import", "Work", config=cenv)
+    assert rc == 1 and "already" in err
+    rc, out, err = trun("connect", "--enable-writes", "work", config=cenv)           # imported: reuses read
+    assert rc == 0 and "changes allowed" in out, err
+
+
+@pytest.mark.parametrize("argv", [["connect", "dropbox"], ["connect", "--enable-writes", "x"], ["disconnect", "x"],
+                                  ["connect", "iclouddrive", "--apple-id", "a@b.c"], ["connect", "--paste-token", "dropbox"],
+                                  ["import", "work"]])
 def test_connecting_is_a_human_only_command(argv, run, trun, monkeypatch, no_input):
     rc, _, err = run(*argv)                                       # no terminal
     assert rc == 2 and "interactive terminal" in err
