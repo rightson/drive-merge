@@ -66,7 +66,7 @@ A fifth rail item, **Plans** (`#/plans`), between Compare and Workspace.
 - Parameters map onto `builders.build_consolidate`: `target` (only writable clouds are offered), `target_root`, `sources` (checkboxes, all others by default), `reorganize_target`, `include_probable` (off; when on the page explains that a probable match is assumed identical without proof and offers bridging instead), `path_prefix`, `prefer_remotes`, and `delete_sources`.
 - `delete_sources` is not on the main form. It sits behind "Clean up sources (after the soak period)", which explains §8 of DESIGN.md and shows, from the coverage numbers, how much content is still *not* on the target. While that number is not zero the option stays available but carries a warning, because those contents would be copied and their sources removed in one plan.
 - The estimate shows: contents already on the target, contents to copy and their bytes (and the part that crosses clouds through this machine), moves on the target when reorganising, deletes when cleaning up, skipped by reason (probable match not proven, native document, read-only, ambiguous), and a sample of placements (first 50 `from → to`, grouped by destination folder), so the layout is visible before the plan exists.
-- Rules: the layout uses the configured rules, as the CLI does. Editing rules stays in the CLI and MCP for now.
+- Rules: the layout uses the active rules, as the CLI does, and the plan records the exact rules text it was built with (`params.rules`) and where it came from (`params.rules_ref`). Choosing and editing the rules from the form is specified in [RULES.md](RULES.md).
 
 ## 6. Bridging from the page
 
@@ -82,7 +82,7 @@ The Overview card that reports "no comparable hash" gets a **Bridge** button (on
 
 ## 8. Known limitations (v1)
 
-- Rules for the consolidation layout are edited in the CLI or by Claude, not on the page.
+- Rules for the consolidation layout are edited in the Rules view ([RULES.md](RULES.md)), not in the consolidate form itself.
 - Estimates rebuild the plan on each change of the form (debounced); on a catalog of a million files a build can take seconds, and the estimate says it is working.
 - A plan's ops cannot be edited; a different plan is a new plan (as everywhere in drive-merge).
 

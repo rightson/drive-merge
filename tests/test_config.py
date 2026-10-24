@@ -230,3 +230,75 @@ def test_write_private_is_atomic_and_mode_600(tmp_path):
     write_private(p, "b")
     assert p.read_text() == "b" and stat.S_IMODE(p.stat().st_mode) == 0o600
     assert [x.name for x in p.parent.iterdir()] == ["f"]
+
+
+# --------------------------------------------------------------------------- the rules file (docs/RULES.md A)
+
+from pathlib import Path  # noqa: E402
+
+
+def _config_file(tmp_path, extra=""):
+    d = tmp_path / "cfg"
+    d.mkdir(exist_ok=True)
+    (d / "config.toml").write_text(f'[database]\npath = "{tmp_path / "c.db"}"\n{extra}')
+    return d / "config.toml"
+
+
+def test_rules_file_is_the_configured_path_else_rules_toml_next_to_the_config(tmp_path):
+    plain = load_config(_config_file(tmp_path))
+    assert plain.rules_path is None and plain.rules_owned is True
+    assert plain.rules_file == tmp_path / "cfg" / "rules.toml"
+    configured = load_config(_config_file(tmp_path, '[rules]\npath = "~/mine/layout.toml"\n'))
+    assert configured.rules_owned is False
+    assert configured.rules_file == Path("~/mine/layout.toml").expanduser()
+    absolute = load_config(_config_file(tmp_path, f'[rules]\npath = "{tmp_path}/x.toml"\n'))
+    assert absolute.rules_file == tmp_path / "x.toml"
+
+
+def test_a_config_built_in_memory_has_no_rules_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert parse_config({}).rules_file is None and parse_config({}).rules_owned is True
+    assert parse_config({"rules": {"path": "/x/y.toml"}}).rules_file == Path("/x/y.toml")
+
+
+def test_existing_users_without_a_rules_path_keep_the_packaged_defaults(tmp_path):
+    from drivemerge import classify
+    from drivemerge.service import Service
+    cfg = load_config(_config_file(tmp_path))
+    svc = Service(cfg, config_path=cfg.config_path)
+    assert svc.ruleset().rules == classify.default_rules().rules
+    assert svc.rules_state()["active"]["source"] == "default"
+    assert not (tmp_path / "cfg" / "rules.toml").exists()                 # nothing is written just by looking
+
+
+def test_an_owned_rules_toml_is_picked_up_without_a_rules_path(tmp_path):
+    from drivemerge.service import Service
+    cfg = load_config(_config_file(tmp_path))
+    (tmp_path / "cfg" / "rules.toml").write_text('[[rule]]\nname = "only"\ntarget = "X/{name}"\n')
+    svc = Service(cfg, config_path=cfg.config_path)
+    assert [r.name for r in svc.ruleset().rules] == ["only"]
+    assert svc.rules_state()["active"]["path"] == str(tmp_path / "cfg" / "rules.toml")
+
+
+def test_a_configured_rules_path_whose_file_is_missing_is_an_error_not_the_defaults(tmp_path):
+    from drivemerge.rulestore import RulesError
+    from drivemerge.service import Service
+    cfg = load_config(_config_file(tmp_path, f'[rules]\npath = "{tmp_path}/nope.toml"\n'))
+    svc = Service(cfg, config_path=cfg.config_path)
+    with pytest.raises(RulesError) as exc:
+        svc.ruleset()
+    assert exc.value.code == "RULES_FILE_MISSING" and exc.value.params == {"path": f"{tmp_path}/nope.toml"}
+    assert exc.value.status == 409
+    (tmp_path / "nope.toml").write_text('[[rule]]\nname = "here"\ntarget = "X"\n')
+    assert [r.name for r in svc.ruleset().rules] == ["here"]
+
+
+def test_the_configured_file_wins_over_an_owned_one_and_the_owned_one_is_never_written_by_loading(tmp_path):
+    from drivemerge.service import Service
+    cfg = load_config(_config_file(tmp_path, f'[rules]\npath = "{tmp_path}/mine.toml"\n'))
+    (tmp_path / "cfg" / "rules.toml").write_text('[[rule]]\nname = "owned"\ntarget = "O"\n')
+    (tmp_path / "mine.toml").write_text('[[rule]]\nname = "mine"\ntarget = "M"\n')
+    assert [r.name for r in Service(cfg, config_path=cfg.config_path).ruleset().rules] == ["mine"]
+    before = (tmp_path / "cfg" / "config.toml").read_bytes()
+    Service(cfg, config_path=cfg.config_path).rules_state()
+    assert (tmp_path / "cfg" / "config.toml").read_bytes() == before

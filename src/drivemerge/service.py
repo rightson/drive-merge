@@ -19,8 +19,8 @@ import tempfile
 from pathlib import Path
 
 from . import (
-    builders, classify, compare, coverage, db, dirstats, executor, explore, identity, plans, quarantine, search,
-    simulate, suggest, workspace,
+    builders, classify, compare, coverage, db, dirstats, executor, explore, identity, plans, quarantine,
+    rulepreview, rulestore, search, simulate, suggest, workspace,
 )
 from .config import DEFAULT_CONFIG_PATH, Config, load_config, sync_remotes
 from .models import Plan
@@ -29,8 +29,10 @@ from .rclone import Rclone
 from .scanner import scan_remote
 
 PLAN_KINDS = ("dedupe", "consolidate", "reorganize", "manual", "release")
-# Written only by workspace.preview; a proposer's params must never be able to claim a draft.
-RESERVED_PARAMS = ("draft_id", "draft_version")
+# draft_id and draft_version are written only by workspace.preview, rules_ref only by propose_plan (the rules a plan
+# was built with): a proposer's params must never be able to claim either.
+RESERVED_PARAMS = ("draft_id", "draft_version", "rules_ref")
+RULES_KINDS = ("consolidate", "reorganize")
 MAX_COMPARE_FILES = 100000
 MAX_COVERAGE_BARS = 64
 MAX_GROUP_PAGE = 200       # dedupe groups an estimate lists per page
@@ -82,6 +84,7 @@ class Service:
         sync_remotes(self.conn, config)
         self.rclone = rclone or make_rclone(config)
         self._connections_seen = self._connections_mtime()
+        self.previewer = rulepreview.Previewer()     # the rules preview's caches and its one-at-a-time machinery
         # Progress callback a background job hangs on its own service: restore and purge report to it when
         # their caller passes none (so the job can call purge(plan_id, older_than_days=...) as a person would).
         self.default_progress = None
@@ -177,23 +180,47 @@ class Service:
         """Search results grouped by content with one presence column per cloud (explore.py)."""
         return explore.explore(self.conn, q, **params)
 
-    def ruleset(self, rules_text: str | None = None) -> classify.RuleSet:
+    def ruleset(self, rules_text: str | None = None, *, rules_version: int | None = None) -> classify.RuleSet:
+        """The rules to use: version `rules_version` (any status), else `rules_text`, else the active rules
+        (rulestore.active: the rules file, else the packaged defaults). Both given is RULES_BOTH. Invalid rules
+        raise their RuleError, as ever; a configured file that is missing or unreadable raises RulesError."""
+        return self._resolve_rules(rules_text, rules_version)[0]
+
+    def _resolve_rules(self, rules_text: str | None, rules_version: int | None) -> tuple[classify.RuleSet, str, dict]:
+        """(rules, the exact text, rules ref) for the same inputs as `ruleset`."""
+        if rules_text is not None and rules_version is not None:
+            raise rulestore.RulesError(400, "RULES_BOTH", "pass either rules or rules_version, not both")
+        if rules_version is not None:
+            row = rulestore.get_version(self.conn, rules_version)
+            ref = {"source": "version", "version": row["id"], "sha256": row["sha256"], "path": None}
+            return classify.load_rules(row["text"]), row["text"], ref
         if rules_text is not None:
-            return classify.load_rules(rules_text)
-        if self.config.rules_path:
-            return classify.load_rules(Path(self.config.rules_path).expanduser().read_text(encoding="utf-8"))
-        return classify.default_rules()
+            ref = {"source": "inline", "version": None, "sha256": rulestore.sha256_of(rules_text), "path": None}
+            return classify.load_rules(rules_text), rules_text, ref
+        a = rulestore.active(self.conn, self.config)
+        if a.error is not None and a.error["code"] in ("RULES_FILE_MISSING", "RULES_FILE_UNREADABLE"):
+            path = a.error["params"]["path"]
+            what = "does not exist" if a.error["code"] == "RULES_FILE_MISSING" else "cannot be read"
+            raise rulestore.RulesError(409, a.error["code"], f"the rules file {path} {what}; "
+                                       "fix [rules] path in config.toml or restore the file", path=path)
+        rs = classify.load_rules(a.text)
+        return rs, a.text, {"source": a.source, "version": a.version_id, "sha256": a.sha256, "path": a.path}
 
     def validate_rules(self, rules_text: str) -> dict:
-        try:
-            rs = classify.load_rules(rules_text)
-        except classify.RuleError as e:
-            return {"ok": False, "error": str(e)}
-        return {"ok": True, "rules": [r.name for r in rs.rules]}
+        """{"ok": true, "rules": [names], "errors": [], "warnings": [...]} or {"ok": false, "error": first message,
+        "code", "params", "errors": [every error as {code, message, params}], "warnings"}."""
+        check = classify.check_rules(rules_text)
+        warnings = self._warnings(check)
+        if check.ok:
+            return {"ok": True, "rules": [r.name for r in check.ruleset.rules], "errors": [], "warnings": warnings}
+        first = check.errors[0]
+        return {"ok": False, "error": str(first), "code": first.code, "params": dict(first.params),
+                "errors": [classify.error_dict(e) for e in check.errors], "warnings": warnings}
 
     def preview_layout(self, *, rules_text: str | None = None, remotes: list[str] | None = None,
-                       target_root: str = "", path_prefix: str | None = None, limit: int = 200) -> dict:
-        rs = self.ruleset(rules_text)
+                       target_root: str = "", path_prefix: str | None = None, limit: int = 200,
+                       rules_version: int | None = None) -> dict:
+        rs = self.ruleset(rules_text, rules_version=rules_version)
         ids = [db.remote_id(self.conn, r) for r in remotes] if remotes else None
         placements = classify.plan_layout(self.conn, rs, remote_ids=ids, target_root=target_root,
                                           path_prefix=path_prefix)
@@ -201,6 +228,170 @@ class Service:
         for p in placements:
             by_rule[p.rule] = by_rule.get(p.rule, 0) + 1
         return {"total": len(placements), "by_rule": by_rule, "sample": _plain(placements[:limit])}
+
+    # ---------------------------------------------------------- layout rules (docs/RULES.md)
+    # Reads and proposals only: a draft, a proposal, a check, a preview. Making rules active is human-only
+    # (`activate_rules` below).
+
+    def _rules_of(self, row_or_text: str, *, ok: bool = True) -> classify.RuleSet | None:
+        try:
+            return classify.load_rules(row_or_text) if ok else None
+        except classify.RuleError:
+            return None
+
+    def _warnings(self, check: classify.RulesCheck) -> list[dict]:
+        """The check's warnings plus RULE_REMOTE_UNKNOWN for a `remote` that is not a cloud of this catalog."""
+        known = {r[0] for r in self.conn.execute("SELECT name FROM remotes")}
+        out = list(check.warnings)
+        for item in check.outline:
+            for value in item["match"]["remote"]:
+                if value not in known:
+                    out.append({"code": "RULE_REMOTE_UNKNOWN",
+                                "message": f"rule {item['name']!r}: remote {value!r} is not a cloud of this catalog",
+                                "params": {"line": item["line"], "rule_index": item["index"], "rule": item["name"],
+                                           "key": "remote", "value": classify._cap(value)}})
+        out.sort(key=lambda w: (w["params"]["line"] is None, w["params"]["line"] or 0))
+        return out
+
+    def check_rules(self, text: str, against: int | None = None) -> dict:
+        """Validate rules text without touching the catalog's files: every error and warning with codes and line
+        numbers, the outline, the resolved layout, and the text diff and rule changes against version `against`
+        (default the rules in force)."""
+        check = classify.check_rules(text)
+        if against is not None:
+            base_text = rulestore.get_version(self.conn, against)["text"]
+        else:
+            base_text = rulestore.active(self.conn, self.config).text
+        base = self._rules_of(base_text)
+        return {"ok": check.ok, "errors": [classify.error_dict(e) for e in check.errors],
+                "warnings": self._warnings(check), "outline": check.outline, "layout": check.layout,
+                "diff": rulestore.diff(base_text, text),
+                "changes": rulestore.rule_changes(base, check.ruleset) if base and check.ruleset else None,
+                "sha256": rulestore.sha256_of(text)}
+
+    def transform_rules(self, text: str, op: dict) -> dict:
+        """Move, remove or insert a whole rule in `text` (classify.transform_rules); {"text", "check"}."""
+        new = classify.transform_rules(text, op)
+        return {"text": new, "check": self.check_rules(new)}
+
+    def rules_default(self) -> dict:
+        text = classify.default_rules_text()
+        return {"text": text, "sha256": rulestore.sha256_of(text)}
+
+    def _summary(self, row: dict, active_rs: classify.RuleSet | None) -> dict:
+        rs = self._rules_of(row["text"], ok=row["ok"])
+        out = {k: row[k] for k in ("id", "status", "title", "created_by", "created_at", "updated_at", "activated_at",
+                                   "activated_by", "sha256", "ok", "base_id", "revision")}
+        out["rules"] = len(rs.rules) if rs else None
+        out["changes"] = rulestore.rule_changes(active_rs, rs) if rs and active_rs else None
+        return out
+
+    def rule_versions(self, status: str | None = None, limit: int = 50) -> list[dict]:
+        """Summaries of the rule versions, newest first: {id, status, title, created_by, created_at, updated_at,
+        activated_at, activated_by, sha256, ok, base_id, revision, rules (count), changes (against the active rules)}."""
+        active_rs = self._rules_of(rulestore.active(self.conn, self.config).text)
+        return [self._summary(row, active_rs) for row in rulestore.list_versions(self.conn, status=status, limit=limit)]
+
+    def rule_version(self, version_id: int) -> dict:
+        """One version: its summary, `note`, `text`, `check` (errors, warnings, outline, layout) and `diff` against
+        the rules in force."""
+        row = rulestore.get_version(self.conn, version_id)
+        active = rulestore.active(self.conn, self.config)
+        out = self._summary(row, self._rules_of(active.text))
+        check = self.check_rules(row["text"])
+        out.update(note=row["note"], text=row["text"], diff=check["diff"],
+                   check={k: check[k] for k in ("ok", "errors", "warnings", "outline", "layout")})
+        return out
+
+    def rules_state(self) -> dict:
+        """What the Rules view shows: the active rules (the file is observed first, so an edit made outside
+        drive-merge becomes a version by `file`), the proposals waiting, the drafts and the history."""
+        active = rulestore.observe(self.conn, self.config)
+        check = classify.check_rules(active.text)
+        row = rulestore.get_version(self.conn, active.version_id) if active.version_id is not None else None
+        active_rs = check.ruleset
+        info = active.as_dict()
+        info.update(
+            write_path=str(self.config.rules_file) if self.config.rules_file else None,
+            status=row["status"] if row else None, created_by=row["created_by"] if row else None,
+            since=row["activated_at"] if row else None, by=row["activated_by"] if row else None,
+            changed_outside=bool(row and row["status"] == "active" and row["created_by"] == "file"),
+            rules=len(check.ruleset.rules) if check.ruleset else None,
+            check={"ok": check.ok, "error_count": len(check.errors), "warning_count": len(check.warnings),
+                   "errors": [classify.error_dict(e) for e in check.errors[:10]], "warnings": self._warnings(check)})
+        history = [r for r in rulestore.list_versions(self.conn, limit=200) if r["status"] in ("active", "retired")]
+        return {"active": info,
+                "proposals": [self._summary(r, active_rs) for r in rulestore.list_versions(self.conn, status="proposed")],
+                "drafts": [self._summary(r, active_rs) for r in rulestore.list_versions(self.conn, status="draft")],
+                "history": [self._summary(r, active_rs) for r in history[:50]]}
+
+    def rules_brief(self) -> dict:
+        """The one-line state /v1/ui/config carries: {source, path, owned, active_version, proposals}. Reads only."""
+        a = rulestore.active(self.conn, self.config)
+        return {"source": a.source, "path": a.path, "owned": a.owned, "active_version": a.version_id,
+                "proposals": rulestore.count_proposals(self.conn)}
+
+    def rules_overview(self) -> dict:
+        """The rules in force and the proposals waiting, for a reader that must not write (MCP `get_rules`):
+        {source, path, version, sha256, text, error, proposals: [{id, title, created_by, created_at}]}. Unlike
+        `rules_state` it does not record an outside edit of the file."""
+        a = rulestore.active(self.conn, self.config)
+        return {"source": a.source, "path": a.path, "version": a.version_id, "sha256": a.sha256, "text": a.text,
+                "error": a.error,
+                "proposals": [{k: r[k] for k in ("id", "title", "created_by", "created_at")}
+                              for r in rulestore.list_versions(self.conn, status="proposed", limit=50)]}
+
+    def save_rule_version(self, text: str, *, created_by: str, title: str | None = None, note: str | None = None,
+                          base_id: int | None = None) -> dict:
+        """Store a draft (created_by "ui") or a proposal (anyone else; it must be valid). Never active by itself."""
+        row = rulestore.create_version(self.conn, text, created_by=created_by, title=title, note=note, base_id=base_id)
+        return self.rule_version(row["id"])
+
+    def update_rule_draft(self, version_id: int, text: str, *, revision: int, title: str | None = None,
+                          note: str | None = None) -> dict:
+        rulestore.update_draft(self.conn, version_id, text, revision=revision, title=title, note=note)
+        return self.rule_version(version_id)
+
+    def discard_rule_version(self, version_id: int, *, by: str) -> dict:
+        """Delete a draft or dismiss a proposal. Returns {"ok": true, "version", "status"}."""
+        row = rulestore.discard(self.conn, version_id, by=by)
+        return {"ok": True, "version": version_id, "status": "deleted" if row["status"] == "draft" else row["status"]}
+
+    def _rules_text_for(self, text: str | None, version_id: int | None, conn: sqlite3.Connection) -> str:
+        if text is not None and version_id is not None:
+            raise rulestore.RulesError(400, "RULES_BOTH", "pass either text or version_id, not both")
+        if version_id is not None:
+            return rulestore.get_version(conn, version_id)["text"]
+        if text is not None:
+            return text
+        return rulestore.active(conn, self.config).text
+
+    def preview_rules(self, *, text: str | None = None, version_id: int | None = None, remotes: list[str] | None = None,
+                      target_root: str = "", path_prefix: str | None = None, mode: str = "auto", limit: int = 100,
+                      filter: str = "changed", conn: sqlite3.Connection | None = None) -> dict:
+        """Where the files of a scope would go under the given rules (default the active rules) and what changes
+        against the active rules; see rulepreview. `conn` is a read-only connection to run on (default the
+        service's own). Writes nothing."""
+        conn = conn or self.conn
+        edited = self._rules_text_for(text, version_id, conn)
+        active = rulestore.active(conn, self.config)
+        return self.previewer.preview(conn, edited_text=edited, active_text=None if active.error and active.error["code"] in (
+            "RULES_FILE_MISSING", "RULES_FILE_UNREADABLE") else active.text, remotes=remotes or None,
+            target_root=target_root, path_prefix=path_prefix or None, mode=mode, limit=limit, filter=filter)
+
+    def preview_page(self, preview_id: str, *, filter: str = "changed", q: str | None = None, offset: int = 0,
+                     limit: int = 100) -> dict:
+        return self.previewer.page(preview_id, filter=filter, q=q, offset=offset, limit=limit)
+
+    def explain_layout(self, *, remote: str, path: str, text: str | None = None, version_id: int | None = None,
+                       target_root: str = "", conn: sqlite3.Connection | None = None) -> dict:
+        """Why a file lands where it does under the given rules and under the active rules: {"edited", "active"}."""
+        conn = conn or self.conn
+        edited = classify.load_rules(self._rules_text_for(text, version_id, conn))
+        active = self._rules_of(rulestore.active(conn, self.config).text)
+        rid = db.remote_id(conn, remote)
+        return {"edited": classify.explain(conn, edited, rid, path, target_root=target_root),
+                "active": classify.explain(conn, active, rid, path, target_root=target_root) if active else None}
 
     # ------------------------------------------------------------ maintain
 
@@ -262,41 +453,57 @@ class Service:
 
     # ------------------------------------------------------------- propose
 
-    def _build(self, kind: str, params: dict) -> tuple[builders.BuildResult, dict, str | None]:
-        """Run the builder of `kind`: (result, params without `rules`, the rules text or None). Persists nothing."""
+    def _build(self, kind: str, params: dict) -> tuple[builders.BuildResult, dict, str | None, dict | None]:
+        """Run the builder of `kind`: (result, params without `rules`/`rules_version`, the rules text or None, the
+        rules ref or None). For consolidate and reorganize the text and the ref are always those of the rules used.
+        Persists nothing."""
         if kind not in PLAN_KINDS:
             raise ServiceError(f"unknown plan kind {kind!r}; expected one of {PLAN_KINDS}")
         claimed = [k for k in RESERVED_PARAMS if k in params]
         if claimed:
+            if "rules_ref" in claimed:
+                raise ServiceError("params rules_ref is reserved: the service records which rules built a plan; "
+                                   "pass rules or rules_version to choose them")
             raise ServiceError(f"params {', '.join(claimed)} are reserved for workspace previews; "
                                "stage moves into a draft and preview it instead")
         params = dict(params)
         rules_text = params.pop("rules", None)
+        rules_version = params.pop("rules_version", None) if kind in RULES_KINDS else None
+        ref = None
         # Quarantined files are deleted content, not live copies; builders must know where they are.
         quarantine = {"quarantine_dir": self.config.safety.quarantine_dir}
+        if kind in RULES_KINDS:
+            ruleset, rules_text, ref = self._resolve_rules(rules_text, rules_version)
         if kind == "dedupe":
             result = builders.build_dedupe(self.conn, **{**quarantine, **params})
         elif kind == "consolidate":
-            result = builders.build_consolidate(self.conn, ruleset=self.ruleset(rules_text),
-                                                **{**quarantine, **params})
+            result = builders.build_consolidate(self.conn, ruleset=ruleset, **{**quarantine, **params})
         elif kind == "reorganize":
-            result = builders.build_reorganize(self.conn, ruleset=self.ruleset(rules_text),
-                                               **{**quarantine, **params})
+            result = builders.build_reorganize(self.conn, ruleset=ruleset, **{**quarantine, **params})
         elif kind == "release":
             from . import release
             result = release.build_release(self.conn, **{**quarantine, **params})
         else:
             result = builders.build_manual(self.conn, params.get("ops", []))
-        return result, params, rules_text
+        return result, params, rules_text, ref
 
     def propose_plan(self, kind: str, params: dict, *, created_by: str, title: str | None = None) -> dict:
-        """Build a plan, persist it as a draft and simulate it. Never touches a cloud."""
-        result, params, rules_text = self._build(kind, params)
+        """Build a plan, persist it as a draft and simulate it. Never touches a cloud.
+
+        Consolidate and reorganize plans record the exact rules text they were built with (`params.rules`) and where
+        it came from (`params.rules_ref`: source file, default, version or inline, version id, SHA-256, path), so
+        a plan stays reproducible after the rules file changes. The active file is observed first, so an edit made
+        outside drive-merge is in the history before a plan is built with it."""
+        if kind in RULES_KINDS:
+            rulestore.observe(self.conn, self.config)
+        result, params, rules_text, ref = self._build(kind, params)
         if not result.ops:
             return {"plan_id": None, "ops": 0, "skipped": result.skipped[:SAMPLE_SKIPPED], "stats": result.stats,
                     "message": "nothing to do", "code": "NOTHING_TO_DO"}
         if rules_text is not None:
             params["rules"] = rules_text
+        if ref is not None:
+            params["rules_ref"] = ref
         plan_id = plans.create_plan(self.conn, title or f"{kind} plan", kind, result.ops,
                                     created_by=created_by, params=params)
         report = self.simulate(plan_id)
@@ -321,7 +528,7 @@ class Service:
             params["group_window"] = window
         if isinstance(sample, bool) or not isinstance(sample, int) or sample < 0:
             raise ServiceError("sample must be a non-negative integer")
-        result, params, _ = self._build(kind, params)
+        result, params, _, ref = self._build(kind, params)
         names = {r[0]: r[1] for r in self.conn.execute("SELECT id, name FROM remotes")}
 
         def place(remote_id: int | None, path: str | None) -> dict | None:
@@ -342,6 +549,8 @@ class Service:
         if kind == "dedupe":
             out.update(groups=result.groups, group_offset=window[0], group_limit=window[1],
                        groups_total=result.stats["groups_examined"])
+        if ref is not None:
+            out["rules_ref"] = ref
         return out
 
     def policy(self) -> simulate.SafetyPolicy:
@@ -371,7 +580,7 @@ class Service:
     def plan_summaries(self, status: str | None = None, limit: int = 100) -> list[dict]:
         """One row per plan for a list view, newest first: the plan's header, its op count, whether its last
         simulation passed (`ok`, None when it never ran) with the number of violations (`problems`), its
-        scrubbed `params`, the `draft_id` it previews and `outdated`: the catalog was scanned again since that
+        scrubbed `params` (without the `rules` text), the `draft_id` it previews and `outdated`: the catalog was scanned again since that
         simulation, so it has to be simulated again before it can be approved."""
         rows = plans.list_plans(self.conn, status=status or None, limit=limit)
         counts = {r[0]: r[1] for r in self.conn.execute(
@@ -387,7 +596,9 @@ class Service:
                 "finished_at": p.finished_at, "ops": counts.get(p.id, 0),
                 "ok": None if sim is None else bool(sim.ok),
                 "problems": 0 if sim is None else sim.violations_total,
-                "params": scrub_secrets(p.params), "draft_id": draft_of(p),
+                # The rules text can be tens of KB per plan; a list carries `rules_ref` (where it came from) and the
+                # full plan (`plan`, the review) carries the text.
+                "params": scrub_secrets({k: v for k, v in p.params.items() if k != "rules"}), "draft_id": draft_of(p),
                 "outdated": p.status in ("draft", "simulated", "approved") and p.snapshot is not None
                             and p.snapshot != current,
             })
@@ -448,6 +659,13 @@ class Service:
         return found
 
     # ---------------------------------------------------------- human-only
+
+    def activate_rules(self, version_id: int, *, base_sha256: str, activated_by: str) -> dict:
+        """Make a version's text the active rules file (rulestore.activate). Human-only like approve: it changes
+        what every later plan built with "the active rules" does, so only the browser's human channel and the
+        CLI's terminal gate call it; the REST API and MCP never do."""
+        return rulestore.activate(self.conn, self.config, version_id, base_sha256=base_sha256,
+                                  activated_by=activated_by).as_dict()
 
     def approve(self, plan_id: int, code: str, *, approved_by: str) -> None:
         plans.approve_plan(self.conn, plan_id, code, approved_by=approved_by)
@@ -627,4 +845,4 @@ class Service:
             retention_days=self.config.safety.quarantine_retention_days, **kw)
 
 
-__all__ = ["Service", "ServiceError", "PLAN_KINDS", "RESERVED_PARAMS", "draft_of", "scrub_secrets"]
+__all__ = ["Service", "ServiceError", "PLAN_KINDS", "RESERVED_PARAMS", "RULES_KINDS", "draft_of", "scrub_secrets"]

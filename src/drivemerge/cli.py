@@ -1,8 +1,8 @@
 """The `drivemerge` command line.
 
 Every command goes through `service.Service` (plus config loading). Commands
-that change a cloud (`plan approve|execute|restore|purge`, `quarantine purge-due`) are human-only and
-share one gate, `_gate`. `plan reset` only fixes a plan's state in the catalog,
+that change a cloud (`plan approve|execute|restore|purge`, `quarantine purge-due`) and the one that makes layout rules
+active (`rules activate`) are human-only and share one gate, `_gate`. `plan reset` only fixes a plan's state in the catalog,
 so it is not gated.
 
 Exit codes: 0 ok, 1 error, 2 usage error or refused (not a human at a
@@ -30,7 +30,7 @@ from typing import Any
 
 from . import config as config_mod
 from . import connections
-from . import db, executor, plans
+from . import db, executor, plans, rulestore
 from . import quarantine as quarantine_mod
 from . import service as service_mod
 from .rclone import RcloneError
@@ -661,6 +661,11 @@ def _read_text(path: str) -> str:
         raise ValueError(f"cannot read {path}: {e.strerror or e}") from None
 
 
+def _where(params: dict) -> str:
+    line = params.get("line")
+    return f"line {line}: " if line else ""
+
+
 def cmd_rules_check(ctx: Ctx) -> int:
     res = ctx.service.validate_rules(_read_text(ctx.args.file))
     if ctx.json:
@@ -668,9 +673,98 @@ def cmd_rules_check(ctx: Ctx) -> int:
     elif res.get("ok"):
         rules = res.get("rules") or []
         print(f"OK: {len(rules)} rule(s)" + (": " + ", ".join(rules) if rules else ""))
+        for w in res.get("warnings") or []:
+            print(f"warning, {_where(w['params'])}{w['message']}")
     else:
-        print(f"Invalid rules: {res.get('error')}", file=sys.stderr)
+        errors = res.get("errors") or []
+        print(f"Invalid rules: {_n(len(errors) or 1)} problem(s)", file=sys.stderr)
+        for e in errors or [{"params": {}, "message": res.get("error")}]:
+            print(f"  {_where(e['params'])}{e['message']}", file=sys.stderr)
+        for w in res.get("warnings") or []:
+            print(f"warning, {_where(w['params'])}{w['message']}", file=sys.stderr)
     return EXIT_OK if res.get("ok") else EXIT_ERROR
+
+
+def cmd_rules_show(ctx: Ctx) -> int:
+    version = ctx.args.version
+    if version is None:
+        res = ctx.service.rules_overview()
+        if ctx.json:
+            _dump(res)
+            return EXIT_OK
+        where = res["path"] or "the packaged defaults"
+        print(f"# Active rules: {where} (version {res['version'] if res['version'] is not None else '-'}, "
+              f"sha256 {res['sha256'][:12]})", file=sys.stderr)
+        if res.get("error"):
+            print(f"# Problem: {res['error']['code']} {res['error']['params']}", file=sys.stderr)
+        sys.stdout.write(res["text"])
+        return EXIT_OK
+    res = ctx.service.rule_version(version)
+    if ctx.json:
+        _dump(res)
+        return EXIT_OK
+    title = f' "{res["title"]}"' if res.get("title") else ""
+    print(f"# Rules version {res['id']}{title}: {res['status']}, by {res['created_by']}, "
+          f"sha256 {res['sha256'][:12]}", file=sys.stderr)
+    sys.stdout.write(res["text"])
+    return EXIT_OK
+
+
+def cmd_rules_history(ctx: Ctx) -> int:
+    ctx.service.rules_state()                    # records an edit of the file made outside drive-merge
+    versions = ctx.service.rule_versions(limit=200)
+    if ctx.json:
+        _dump({"versions": versions})
+        return EXIT_OK
+    if not versions:
+        print("No rules versions yet")
+        return EXIT_OK
+    rows = [[str(v["id"]), v["status"], v["created_by"], v["updated_at"][:19].replace("T", " "),
+             v["sha256"][:8], v["title"] or ""] for v in versions]
+    print("\n".join(_table(["ID", "STATUS", "BY", "WHEN", "SHA", "TITLE"], rows, "rllll")))
+    return EXIT_OK
+
+
+def _show_rules_diff(ctx: Ctx, vid: int, version: dict, base: rulestore.ActiveRules) -> Callable[[], None]:
+    def show() -> None:
+        where = base.path or "the packaged defaults"
+        print(f"Make rules version {vid}" + (f' "{version["title"]}"' if version.get("title") else "")
+              + f" ({version['status']}, by {version['created_by']}) the active rules.")
+        print(f"It will write {ctx.config.rules_file}; the rules in force now are in {where} (sha256 {base.sha256[:12]}).")
+        changes = version.get("changes") or []
+        if changes:
+            print("Rules: " + ", ".join(f"{c['name']} ({c['change']})" for c in changes))
+        diff = version["diff"]
+        print(f"Diff against the active rules: +{_n(diff['added'])} -{_n(diff['removed'])} line(s)")
+        for h in diff["hunks"]:
+            print(f"@@ -{h['old_start']} +{h['new_start']} @@")
+            for line in h["lines"]:
+                print(f"{line['op']}{line['text']}")
+        for w in version["check"]["warnings"]:
+            print(f"warning, {_where(w['params'])}{w['message']}")
+        print("Plans already created keep the rules they were built with; new plans use these.\n")
+    return show
+
+
+def cmd_rules_activate(ctx: Ctx) -> int:
+    vid = ctx.args.id
+    base: list[rulestore.ActiveRules] = []
+
+    def prepare() -> Confirmation:
+        rulestore.require_activatable(ctx.service.conn, ctx.config, vid)      # the route's refusals, before asking
+        ctx.service.rules_state()                                              # an outside edit of the file is recorded first
+        base.append(rulestore.active(ctx.service.conn, ctx.config))
+        version = ctx.service.rule_version(vid)
+        return Confirmation(_show_rules_diff(ctx, vid, version, base[0]),
+                            'Type "activate" to make these the active rules: ', "activate")
+
+    _gate("activate layout rules", prepare)
+    res = ctx.service.activate_rules(vid, base_sha256=base[0].sha256, activated_by=f"cli:{_current_user()}")
+    if ctx.json:
+        _dump({"version": vid, "active": res})
+    else:
+        print(f"Rules version {vid} is now active ({res['path']}). Plans already created are unchanged.")
+    return EXIT_OK
 
 
 def cmd_rules_preview(ctx: Ctx) -> int:
@@ -1368,6 +1462,12 @@ def build_parser() -> argparse.ArgumentParser:
     rules = group_of(sub, "rules", "layout rules", "rules_command")
     p = add(rules, "check", cmd_rules_check, "validate a rules file")
     p.add_argument("file", metavar="FILE")
+    p = add(rules, "show", cmd_rules_show, "print the active rules (or one version) with their source")
+    p.add_argument("--version", type=int, metavar="N", help="a stored version instead of the active rules")
+    add(rules, "history", cmd_rules_history, "list the rules versions: active, retired, drafts and proposals")
+    p = add(rules, "activate", cmd_rules_activate,
+            "make a rules version the active rules (human, interactive terminal only)")
+    p.add_argument("id", type=int, metavar="VERSION")
     p = add(rules, "preview", cmd_rules_preview, "show where rules would put files")
     p.add_argument("--rules", metavar="FILE", help="rules file (default: configured or built-in rules)")
     p.add_argument("--remote", action="append", metavar="R", help="source remote (repeatable; default all)")
@@ -1495,7 +1595,7 @@ def main(argv: list[str] | None = None) -> int:
             os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
         return EXIT_OK
     except (ValueError, plans.PlanError, KeyError, OSError, executor.ExecutionError, RcloneError,
-            sqlite3.Error) as e:
+            rulestore.RulesError, sqlite3.Error) as e:
         return fail(_message(e))
 
 

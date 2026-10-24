@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hmac
 import re
+import sqlite3
 import threading
 import time
 from collections.abc import Callable
@@ -19,7 +20,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from . import __version__, builders, connections, plans, quarantine
+from . import __version__, builders, classify, connections, plans, quarantine, rulestore
 from .compare import CompareError
 from .config import Config
 from .service import Service, ServiceError, scrub_secrets
@@ -83,6 +84,49 @@ class LayoutBody(_Body):
     target_root: str = ""
     path_prefix: str | None = None
     limit: int = 200
+
+
+class RulesCheckBody(_Body):
+    text: str
+    against: int | None = None
+
+
+class RulesTransformBody(_Body):
+    text: str
+    op: dict[str, Any]
+
+
+class RuleVersionBody(_Body):
+    text: str
+    title: str | None = Field(default=None, max_length=rulestore.MAX_TITLE)
+    note: str | None = Field(default=None, max_length=rulestore.MAX_NOTE)
+    base_id: int | None = None
+
+
+class RuleDraftBody(_Body):
+    text: str
+    revision: int
+    title: str | None = Field(default=None, max_length=rulestore.MAX_TITLE)
+    note: str | None = Field(default=None, max_length=rulestore.MAX_NOTE)
+
+
+class RulesPreviewBody(_Body):
+    text: str | None = None
+    version_id: int | None = None
+    remotes: list[str] | None = None
+    target_root: str = ""
+    path_prefix: str | None = None
+    mode: Literal["auto", "exact"] = "auto"
+    filter: str = "changed"
+    limit: int = Field(default=100, ge=1, le=500)
+
+
+class RulesExplainBody(_Body):
+    text: str | None = None
+    version_id: int | None = None
+    remote: str
+    path: str
+    target_root: str = ""
 
 
 class PlanBody(_Body):
@@ -174,6 +218,13 @@ def install_error_handlers(app: FastAPI, *, coded: bool = False) -> None:
         # Always coded: compare, coverage and explore refusals are the same facts for a script and for the page.
         return _error(exc.status, str(exc), code=exc.code, params=exc.params)
 
+    def rule_error(_: Request, exc: classify.RuleError) -> JSONResponse:
+        # Always coded: a rule problem is the same fact for a script and for the page; `params` says where it is.
+        return _error(400, str(exc), code=exc.code, params=exc.params)
+
+    def rules_error(_: Request, exc: rulestore.RulesError) -> JSONResponse:
+        return _error(exc.status, str(exc), code=exc.code, params=exc.params)
+
     def quarantine_error(_: Request, exc: quarantine.QuarantineError) -> JSONResponse:
         # Always coded: the facts of a refused quarantine look-up are the same for a script and for the page.
         status = 404 if exc.code == "NOT_FOUND" else 400 if exc.code in ("BAD_OPS", "BAD_QUERY") else 409
@@ -187,6 +238,8 @@ def install_error_handlers(app: FastAPI, *, coded: bool = False) -> None:
     app.add_exception_handler(connections.ConnectError, connect_error)
     app.add_exception_handler(plans.PlanError, plan_error)
     app.add_exception_handler(quarantine.QuarantineError, quarantine_error)
+    app.add_exception_handler(classify.RuleError, rule_error)       # a ValueError, but with a code of its own
+    app.add_exception_handler(rulestore.RulesError, rules_error)
     app.add_exception_handler(KeyError, not_found)
 
 
@@ -334,6 +387,113 @@ def build_router(service: Service, lock: threading.Lock, *, dependencies: list[A
             return service.preview_layout(rules_text=body.rules, remotes=body.remotes,
                                           target_root=body.target_root, path_prefix=body.path_prefix,
                                           limit=body.limit)
+
+    # ---- layout rules (docs/RULES.md section E). Drafts, proposals, checks and previews only: making rules
+    # active is a human-channel route of ui_api, never here.
+
+    def who(request: Request) -> str:
+        return created_by(request) if created_by else "api"
+
+    readers: dict[str, sqlite3.Connection] = {}
+    explain_lock = threading.Lock()
+
+    def reader(name: str) -> sqlite3.Connection | None:
+        """A read-only connection to the catalog file for previews, outside the catalog lock (None for an
+        in-memory catalog: those run on the service connection under the lock)."""
+        conn = readers.get(name)
+        if conn is None:
+            with lock:
+                row = service.conn.execute("SELECT file FROM pragma_database_list WHERE name = 'main'").fetchone()
+            if not row or not row[0]:
+                return None
+            conn = sqlite3.connect(row[0], check_same_thread=False, isolation_level=None)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout = 5000")
+            conn.execute("PRAGMA query_only = ON")
+            readers[name] = conn
+        return conn
+
+    @api.get("/v1/rules")
+    def rules_state() -> dict:
+        with lock:
+            return scrub_secrets(service.rules_state())
+
+    @api.get("/v1/rules/default")
+    def rules_default() -> dict:
+        return service.rules_default()
+
+    @api.post("/v1/rules/check")
+    def check_rules(body: RulesCheckBody) -> dict:
+        with lock:
+            return service.check_rules(body.text, body.against)
+
+    @api.post("/v1/rules/transform")
+    def transform_rules(body: RulesTransformBody) -> dict:
+        with lock:
+            return service.transform_rules(body.text, body.op)
+
+    @api.get("/v1/rules/versions")
+    def rule_versions(status: str | None = None, limit: int = Query(default=50, ge=1, le=200)) -> dict:
+        with lock:
+            return {"versions": service.rule_versions(status=status or None, limit=limit)}
+
+    @api.post("/v1/rules/versions", status_code=201)
+    def create_rule_version(body: RuleVersionBody, request: Request) -> dict:
+        with lock:
+            return service.save_rule_version(body.text, created_by=who(request), title=body.title, note=body.note,
+                                             base_id=body.base_id)
+
+    @api.get("/v1/rules/versions/{version_id}")
+    def get_rule_version(version_id: int) -> dict:
+        with lock:
+            return service.rule_version(version_id)
+
+    @api.put("/v1/rules/versions/{version_id}")
+    def update_rule_draft(version_id: int, body: RuleDraftBody, request: Request) -> dict:
+        if who(request) != "ui":
+            raise rulestore.RulesError(403, "DRAFT_UI_ONLY", "only the browser session edits drafts", version=version_id)
+        with lock:
+            return service.update_rule_draft(version_id, body.text, revision=body.revision, title=body.title,
+                                             note=body.note)
+
+    @api.delete("/v1/rules/versions/{version_id}")
+    def discard_rule_version(version_id: int, request: Request) -> dict:
+        """Delete a draft (browser session only) or dismiss a proposal (the session, or the bearer token for a
+        proposal made through the API). Claude's proposals (created_by mcp) are dismissed by the person only."""
+        with lock:
+            row = rulestore.get_version(service.conn, version_id)
+            caller = who(request)
+            if caller != "ui" and not (row["status"] == "proposed" and row["created_by"] == "api"):
+                raise rulestore.RulesError(403, "DRAFT_UI_ONLY", "only the browser session edits or dismisses this version",
+                                           version=version_id)
+            service.discard_rule_version(version_id, by=caller)
+        return {"ok": True}
+
+    @api.post("/v1/rules/preview")
+    def preview_rules(body: RulesPreviewBody) -> dict:
+        args = dict(text=body.text, version_id=body.version_id, remotes=body.remotes, target_root=body.target_root,
+                    path_prefix=body.path_prefix, mode=body.mode, limit=body.limit, filter=body.filter)
+        conn = reader("preview")
+        if conn is None:
+            with lock:
+                return scrub_secrets(service.preview_rules(**args))
+        return scrub_secrets(service.preview_rules(conn=conn, **args))
+
+    @api.get("/v1/rules/previews/{preview_id}/files")
+    def preview_files(preview_id: str, filter: str = "changed", q: str | None = None,
+                      offset: int = Query(default=0, ge=0), limit: int = Query(default=100, ge=1, le=500)) -> dict:
+        return service.preview_page(preview_id, filter=filter, q=q or None, offset=offset, limit=limit)
+
+    @api.post("/v1/rules/explain")
+    def explain_rules(body: RulesExplainBody) -> dict:
+        args = dict(text=body.text, version_id=body.version_id, remote=body.remote, path=body.path,
+                    target_root=body.target_root)
+        conn = reader("explain")
+        if conn is None:
+            with lock:
+                return service.explain_layout(**args)
+        with explain_lock:
+            return service.explain_layout(conn=conn, **args)
 
     @api.get("/v1/plans")
     def list_plans(status: str | None = None, limit: int = 50) -> dict:

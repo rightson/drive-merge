@@ -144,7 +144,7 @@ def test_first_release_catalog_gets_the_current_schema(tmp_path, fresh_shape):
     make_v1_catalog(path)
     conn = db.connect(path)
     assert shape(conn) == fresh_shape                       # columns, indexes, triggers, new tables: all of it
-    assert meta(conn, "schema_version") == str(db.SCHEMA_VERSION) == "2"
+    assert meta(conn, "schema_version") == str(db.SCHEMA_VERSION) == "3"
     assert meta(conn, "fts_rebuild") is None
     assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
@@ -249,7 +249,7 @@ def test_an_upgrade_that_dies_while_counting_folders_is_finished_by_the_next_con
     assert raw.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()[0] == "1"
     raw.close()
     conn = db.connect(path)
-    assert meta(conn, "schema_version") == "2"
+    assert meta(conn, "schema_version") == str(db.SCHEMA_VERSION)
     assert dirstats.get(conn, 1, "Docs")["files"] == 2
 
 
@@ -260,7 +260,7 @@ def test_previous_release_catalog_gains_bridge_sources_filled_from_its_slot(tmp_
     ids = make_previous_catalog(path)
     conn = db.connect(path)
     assert shape(conn) == fresh_shape
-    assert meta(conn, "schema_version") == "2"
+    assert meta(conn, "schema_version") == str(db.SCHEMA_VERSION)
     assert meta(conn, "fts_rebuild") is None                  # its full-text index was already right: not touched
     (src,) = conn.execute("SELECT entry_id, size, mtime FROM bridge_sources").fetchall()
     assert tuple(src) == (ids["icloud"], 10, T0)
@@ -320,7 +320,7 @@ def test_an_interrupted_upgrade_is_finished_by_the_next_connection(tmp_path, mon
     raw.close()
 
     conn = db.connect(path)
-    assert meta(conn, "schema_version") == "2" and meta(conn, "fts_rebuild") is None
+    assert meta(conn, "schema_version") == str(db.SCHEMA_VERSION) and meta(conn, "fts_rebuild") is None
     assert shape(conn) == fresh_shape
     check_fts(conn)
     assert [r["id"] for r in search.search(conn, "résumé")] == [ids["icloud"]]
@@ -344,7 +344,7 @@ def test_a_failure_while_altering_rolls_the_whole_step_back(tmp_path, monkeypatc
     assert "source_mtime" not in [r[1] for r in raw.execute("PRAGMA table_info(hash_bridges)")]
     assert raw.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()[0] == "1"
     raw.close()
-    assert meta(db.connect(path), "schema_version") == "2"       # and a later attempt simply works
+    assert meta(db.connect(path), "schema_version") == str(db.SCHEMA_VERSION)       # and a later attempt simply works
 
 
 # --------------------------------------------------------------------------- groups made under older identity rules
@@ -469,3 +469,51 @@ def test_savepoint_outside_a_transaction_is_atomic_and_commits():
             conn.execute("INSERT INTO t VALUES (2)")
             raise ValueError("no")
     assert [r[0] for r in conn.execute("SELECT x FROM t")] == [1] and not conn.in_transaction
+
+
+# --------------------------------------------------------------------------- version 2 -> 3: rule_versions
+
+def _make_v2_catalog(path):
+    """A catalog as the release before the Rules view left it: current schema without rule_versions, version 2."""
+    conn = db.connect(path)
+    conn.execute("DROP INDEX rule_versions_active")
+    conn.execute("DROP TABLE rule_versions")
+    conn.execute("UPDATE meta SET value = '2' WHERE key = 'schema_version'")
+    conn.execute("INSERT INTO remotes(name, provider, read_remote, write_remote, case_insensitive, created_at) "
+                 "VALUES ('gd', 'drive', 'gd:', 'gd:', 0, ?)", (T0,))
+    conn.close()
+
+
+def test_version_two_catalog_gains_the_rule_versions_table(tmp_path, monkeypatch):
+    path = tmp_path / "v2.db"
+    _make_v2_catalog(path)
+    raw = sqlite3.connect(path)
+    assert not raw.execute("SELECT 1 FROM sqlite_master WHERE name = 'rule_versions'").fetchall()
+    raw.close()
+
+    calls = []
+    real = dirstats.refresh
+    monkeypatch.setattr(dirstats, "refresh", lambda *a, **k: calls.append(1) or real(*a, **k))
+    conn = db.connect(path)
+    assert calls == []                                    # nothing to fill: the table starts empty
+    assert meta(conn, "schema_version") == str(db.SCHEMA_VERSION) == "3"
+    assert conn.execute("SELECT COUNT(*) FROM rule_versions").fetchone()[0] == 0
+    assert conn.execute("SELECT name FROM remotes").fetchone()[0] == "gd"          # the rest is untouched
+    index = conn.execute("SELECT sql FROM sqlite_master WHERE name = 'rule_versions_active'").fetchone()[0]
+    assert "UNIQUE" in index and "status = 'active'" in index
+
+
+def test_rule_versions_allows_one_active_row_and_known_statuses(tmp_path):
+    conn = db.connect(tmp_path / "new.db")
+    now = db.utcnow()
+
+    def add(status):
+        conn.execute("INSERT INTO rule_versions(status, text, sha256, ok, created_by, created_at, updated_at) "
+                     "VALUES (?, '', 'x', 1, 'ui', ?, ?)", (status, now, now))
+
+    add("active")
+    add("retired")
+    with pytest.raises(sqlite3.IntegrityError):
+        add("active")
+    with pytest.raises(sqlite3.IntegrityError):
+        add("bogus")
