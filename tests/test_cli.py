@@ -1431,3 +1431,189 @@ def test_purge_due_is_denied_to_agents_in_the_project_settings():
     assert not settings["permissions"].get("allow")
     for restore in ("Bash(drivemerge plan restore:*)", "Bash(drivemerge plan purge:*)"):
         assert restore in deny
+
+
+# =========================================================================== layout rules (docs/RULES.md F)
+
+from drivemerge import rulestore  # noqa: E402
+
+RULES_A = '[[rule]]\nname = "photos"\ncategory = ["photo"]\ntarget = "Photos/{year}/{name}"\n'
+RULES_B = RULES_A + '# receipts\n[[rule]]\nname = "scans"\next = ["pdf"]\ntarget = "Scans/{name}"\n'
+
+
+def _svc(env):
+    cfg = config_mod.load_config(env.config)
+    return Service(cfg, config_path=env.config)
+
+
+def test_rules_check_prints_every_error_with_its_line(env, run):
+    bad = env.tmp / "bad.toml"
+    bad.write_text('[layout]\nfallback = "U/{nope}"\n[[rule]]\nname = "a"\ntarget = "{yeer}"\n[[rule]]\nname = "b"\nbogus = 1\n'
+                   'target = "x"\n')
+    rc, out, err = run("rules", "check", str(bad))
+    assert rc == 1 and out == ""
+    lines = err.splitlines()
+    assert lines[0] == "Invalid rules: 3 problem(s)"
+    assert lines[1].startswith("  line 2: ") and "unknown template variable {nope}" in lines[1]
+    assert lines[2].startswith("  line 5: ") and "did you mean 'year'" in lines[2]
+    assert lines[3].startswith("  line 8: ") and "unknown key 'bogus'" in lines[3]
+    rc, out, err = run("--json", "rules", "check", str(bad))
+    body = json.loads(out)
+    assert rc == 1 and body["ok"] is False and [e["code"] for e in body["errors"]] == [
+        "UNKNOWN_VARIABLE", "UNKNOWN_VARIABLE", "UNKNOWN_RULE_KEY"]
+
+
+def test_rules_check_prints_warnings_with_their_line(env, run):
+    shadow = env.tmp / "shadow.toml"
+    shadow.write_text('[[rule]]\nname = "all"\ntarget = "X/{name}"\n[[rule]]\nname = "photos"\ncategory = ["photo"]\ntarget = "P"\n')
+    rc, out, _ = run("rules", "check", str(shadow))
+    assert rc == 0 and out.splitlines()[0] == "OK: 2 rule(s): all, photos"
+    assert "warning, line 4: rule #2 ('photos') never matches" in out
+
+
+def test_rules_show_prints_the_source_and_the_text(env, run):
+    rc, out, err = run("rules", "show")
+    assert rc == 0 and "packaged defaults" in err and out.startswith("# Default layout rules")
+    (env.tmp / "rules.toml").write_text(RULES_A)                 # the owned file next to config.toml
+    rc, out, err = run("rules", "show")
+    assert rc == 0 and out == RULES_A and str(env.tmp / "rules.toml") in err and "version -" in err
+    rc, out, _ = run("--json", "rules", "show")
+    body = json.loads(out)
+    assert body["source"] == "file" and body["text"] == RULES_A and body["version"] is None
+    v = _svc(env).save_rule_version(RULES_B, created_by="mcp", title="More")
+    rc, out, err = run("rules", "show", "--version", str(v["id"]))
+    assert rc == 0 and out == RULES_B and f"Rules version {v['id']}" in err and "proposed" in err and '"More"' in err
+    rc, _, err = run("rules", "show", "--version", "99")
+    assert rc == 1 and "no rules version 99" in err
+
+
+def test_rules_history_lists_versions_and_records_an_outside_edit(env, run):
+    rc, out, _ = run("rules", "history")
+    assert rc == 0 and "default" in out and "active" in out                   # the packaged rules, observed
+    (env.tmp / "rules.toml").write_text(RULES_A)
+    _svc(env).save_rule_version(RULES_B, created_by="mcp", title="Scans too")
+    rc, out, _ = run("rules", "history")
+    rows = [line.split() for line in out.splitlines()[1:]]
+    assert {r[1] for r in rows} == {"proposed", "active", "retired"}
+    assert any(r[2] == "file" for r in rows) and "Scans too" in out
+    rc, out, _ = run("--json", "rules", "history")
+    versions = json.loads(out)["versions"]
+    assert {v["status"] for v in versions} == {"proposed", "active", "retired"} and "text" not in versions[0]
+
+
+def _activatable(env, text=RULES_B):
+    (env.tmp / "rules.toml").write_text(RULES_A)
+    svc = _svc(env)
+    svc.rules_state()
+    return svc.save_rule_version(text, created_by="mcp", title="Scans too")["id"]
+
+
+def test_activating_rules_is_refused_without_a_terminal_or_for_an_agent(env, run, trun, no_input, monkeypatch):
+    vid = _activatable(env)
+    rc, out, err = run("rules", "activate", str(vid))                         # captured stdin/stdout: not a terminal
+    assert rc == 2 and "interactive terminal" in err and "activate layout rules" in err
+    monkeypatch.setenv("CLAUDECODE", "1")
+    rc, out, err = trun("rules", "activate", str(vid))
+    assert rc == 2 and "CLAUDECODE" in err and "AI agent" in err
+    assert (env.tmp / "rules.toml").read_text() == RULES_A
+
+
+def test_the_gate_comes_before_any_catalog_access_for_activating_rules(env, capsys, no_input):
+    rc = cli.main(["--config", str(env.tmp / "does-not-exist.toml"), "rules", "activate", "1"])
+    assert rc == 2 and "interactive terminal" in capsys.readouterr().err
+    assert not env.db_path.exists()
+
+
+def test_activating_rules_shows_the_diff_and_needs_the_word(env, run, trun, monkeypatch):
+    vid = _activatable(env)
+    monkeypatch.setattr(cli.getpass, "getuser", lambda: "tester")
+    prompts = typed(monkeypatch, "activate")
+    rc, out, err = trun("rules", "activate", str(vid))
+    assert rc == 0, out + err
+    assert prompts == ['Type "activate" to make these the active rules: ']
+    assert f"Make rules version {vid} \"Scans too\" (proposed, by mcp) the active rules." in out
+    assert f"It will write {env.tmp / 'rules.toml'}" in out and "scans (added)" in out
+    assert "@@ -" in out
+    assert "+# receipts" in out and '+name = "scans"' in out and ' target = "Photos/{year}/{name}"' in out
+    assert "Plans already created keep the rules they were built with" in out
+    assert f"Rules version {vid} is now active ({env.tmp / 'rules.toml'})" in out
+    assert (env.tmp / "rules.toml").read_text() == RULES_B
+    state = _svc(env).rules_state()
+    assert state["active"]["version_id"] == vid and state["active"]["by"] == "cli:tester"
+    assert [h["status"] for h in state["history"]] == ["active", "retired"]
+    assert (env.tmp / "config.toml").read_text() == _config_text(env.tmp, False)         # never edited
+
+
+def test_activating_rules_in_json_mode(env, run, trun, monkeypatch):
+    vid = _activatable(env)
+    typed(monkeypatch, "activate")
+    rc, out, _ = trun("--json", "rules", "activate", str(vid))
+    body = json.loads(out[out.rindex("\n{") + 1:] if not out.startswith("{") else out)
+    assert rc == 0 and body["version"] == vid and body["active"]["version_id"] == vid
+
+
+@pytest.mark.parametrize("answer", ["", "yes", "ACTIVATE now", "approve"])
+def test_anything_but_the_word_changes_nothing(env, run, trun, monkeypatch, answer):
+    vid = _activatable(env)
+    typed(monkeypatch, answer)
+    rc, _, err = trun("rules", "activate", str(vid))
+    assert rc == 1 and "aborted: confirmation did not match" in err
+    assert (env.tmp / "rules.toml").read_text() == RULES_A
+    assert rulestore.get_version(_svc(env).conn, vid)["status"] == "proposed"
+
+
+def test_ctrl_d_at_the_rules_prompt_aborts(env, run, trun, monkeypatch):
+    vid = _activatable(env)
+
+    def eof(prompt=""):
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", eof)
+    rc, _, err = trun("rules", "activate", str(vid))
+    assert rc == 1 and "aborted" in err and (env.tmp / "rules.toml").read_text() == RULES_A
+
+
+def test_rules_refusals_come_before_the_prompt(env, run, trun, no_input):
+    vid = _activatable(env)
+    rc, _, err = trun("rules", "activate", "99")
+    assert rc == 1 and "there is no rules version 99" in err
+    svc = _svc(env)
+    bad = svc.save_rule_version("[[rule]]\nname = 'a'\n", created_by="ui")["id"]
+    rc, _, err = trun("rules", "activate", str(bad))
+    assert rc == 1 and "do not pass validation" in err and "target" in err
+    svc.discard_rule_version(vid, by="test")
+    rc, _, err = trun("rules", "activate", str(vid))
+    assert rc == 1 and "dismissed" in err and "cannot be activated" in err
+    assert (env.tmp / "rules.toml").read_text() == RULES_A
+
+
+def test_a_file_changed_while_the_person_reads_the_diff_is_refused(env, run, trun, monkeypatch):
+    vid = _activatable(env)
+
+    def edit_then_confirm(prompt):
+        (env.tmp / "rules.toml").write_text(RULES_A + "# edited meanwhile\n")          # an editor, while the diff is on screen
+        return "activate"
+
+    typed(monkeypatch, edit_then_confirm)
+    rc, _, err = trun("rules", "activate", str(vid))
+    assert rc == 1 and "changed since you reviewed" in err
+    assert (env.tmp / "rules.toml").read_text() == RULES_A + "# edited meanwhile\n"
+    assert rulestore.get_version(_svc(env).conn, vid)["status"] == "proposed"
+
+
+def test_an_outside_edit_is_recorded_before_the_diff_is_shown(env, run, trun, monkeypatch):
+    vid = _activatable(env)
+    (env.tmp / "rules.toml").write_text(RULES_A + "# hand edit\n")
+    typed(monkeypatch, "activate")
+    rc, out, _ = trun("rules", "activate", str(vid))
+    assert rc == 0 and "-# hand edit" in out                    # the diff is against the file as it stands now
+    assert "file" in {r["created_by"] for r in _svc(env).conn.execute("SELECT created_by FROM rule_versions")}
+
+
+def test_activating_rules_is_denied_to_agents_in_the_project_settings():
+    settings = json.loads((Path(__file__).parent.parent / ".claude" / "settings.json").read_text())
+    deny = settings["permissions"]["deny"]
+    assert "Bash(drivemerge rules activate:*)" in deny and "Bash(*drivemerge rules activate*)" in deny
+    assert "Edit(~/.config/drive-merge/rules.toml)" in deny and "Write(~/.config/drive-merge/rules.toml)" in deny
+    assert not settings["permissions"].get("allow")
+    assert "Bash(drivemerge plan approve:*)" in deny                       # the older entries are still there

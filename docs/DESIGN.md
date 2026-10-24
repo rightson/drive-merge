@@ -109,6 +109,8 @@ Observation: **classifying by file extension alone destroys context** (the PDFs 
 
 **The LLM's role: propose "rules", not per-file operations.** What the LLM sees are **folder profiles** (for each folder: file count, size, category distribution, top 5 extensions, date range, 5 sample filenames, whether it is a unit, duplicate ratio), not a million filenames. It proposes rules → the service applies them deterministically → produces a Plan → simulation → you review. The benefits: it scales, it is reproducible and auditable, and the LLM can neither see nor touch the clouds.
 
+**Editing the rules.** The active rules are a file (`rules.toml` next to `config.toml`, or the file named by `[rules] path`); the packaged defaults apply until there is one. They are edited in the browser's Rules view (live validation, a before/after preview over the catalog, history and undo) or in any text editor. Claude can only *propose* a rule change (`propose_rules`); making rules active is a human act, on the browser's human channel or in your own terminal, and every plan records the exact rules it was built with. The design is [RULES.md](RULES.md).
+
 ## 7. Safety Model: Plan → Simulate → Approve → Execute
 
 **Any action that writes to a cloud can only come from an approved Plan.** There is no exceptional path.
@@ -165,9 +167,9 @@ Plans can be created in batches (by folder or by cloud), with each batch simulat
 
 ## 9. Interfaces
 
-- **CLI** `drivemerge`: `init`, `remotes`, `scan`, `identity rebuild`, `bridge`, `search`, `stats`, `duplicates`, `profiles`, `rules check/preview`, `plan dedupe|consolidate|reorganize|show|simulate|approve|execute|restore|purge`, `changes`, `serve`, `mcp`, `rclone-combine`.
-- **REST API** (bound to 127.0.0.1 only, Bearer token): `/v1/stats`, `/v1/search`, `/v1/entries/{id}`, `/v1/entries/{id}/locations`, `/v1/duplicates`, `/v1/profiles`, `/v1/changes`, `/v1/plans` (create/list/simulate/report). Approval and execution **do not go through the API** (CLI/TTY only). No plan route (list, show, create, simulate, or the progress journal of the workspace server) returns the digest, the approval code or the snapshot, and creating a plan refuses the parameters `draft_id` and `draft_version`, which only a workspace preview sets: running a plan closes a workspace draft only when the plan is that draft's own preview.
-- **MCP (for Claude Code)**: `search_files`, `catalog_stats`, `find_duplicates`, `file_locations`, `folder_profiles`, `validate_rules`, `preview_layout`, `propose_plan`, `simulate_plan`, `get_plan`.
+- **CLI** `drivemerge`: `init`, `remotes`, `scan`, `identity rebuild`, `bridge`, `search`, `stats`, `duplicates`, `profiles`, `rules check|preview|show|history|activate`, `plan dedupe|consolidate|reorganize|show|simulate|approve|execute|restore|purge`, `changes`, `serve`, `mcp`, `rclone-combine`.
+- **REST API** (bound to 127.0.0.1 only, Bearer token): `/v1/stats`, `/v1/search`, `/v1/entries/{id}`, `/v1/entries/{id}/locations`, `/v1/duplicates`, `/v1/profiles`, `/v1/changes`, `/v1/plans` (create/list/simulate/report), `/v1/rules/*` (check, versions, preview; proposals and drafts only). Approval and execution **do not go through the API** (CLI/TTY only). No plan route (list, show, create, simulate, or the progress journal of the workspace server) returns the digest, the approval code or the snapshot, and creating a plan refuses the parameters `draft_id` and `draft_version`, which only a workspace preview sets: running a plan closes a workspace draft only when the plan is that draft's own preview.
+- **MCP (for Claude Code)**: `search_files`, `catalog_stats`, `find_duplicates`, `file_locations`, `folder_profiles`, `validate_rules`, `preview_layout`, `propose_plan`, `simulate_plan`, `get_plan`, `get_rules`, `propose_rules`. Making rules active is not an API or MCP action: it is the browser's human channel or `rules activate` in your own terminal ([RULES.md](RULES.md)).
 
 ## 10. Syncing to an External Database
 

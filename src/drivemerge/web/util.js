@@ -65,6 +65,9 @@ export function wordParams(ns, params) {
   if (out.side === 'left' || out.side === 'right') out.side = t(`cmp.side.${out.side}`);
   // The state a plan is in ('done', 'cancelled'), as a word of the page's language.
   if (typeof out.plan_status === 'string') out.plan_status = t(`pstatus.${out.plan_status}`, null, out.plan_status);
+  // The state a rules version is in ('draft', 'retired'), as a word of the page's language.
+  if (typeof out.version_status === 'string') out.version_status = t(`rstatus.${out.version_status}`, null, out.version_status);
+  if (out.active_version === null) out.active_version = '?';
   if (typeof out.files === 'number') out.files = fmtNum(out.files);
   if (typeof out.limit === 'number') out.limit = fmtNum(out.limit);
   return out;

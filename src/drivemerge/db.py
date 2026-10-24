@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from importlib import resources
 from pathlib import Path
 
-SCHEMA_VERSION = 2          # 2: hash_bridges.source_mtime, FTS on name_norm, bridge_sources
+SCHEMA_VERSION = 3          # 2: hash_bridges.source_mtime, FTS on name_norm, bridge_sources; 3: rule_versions
 # What may join two files into one content_group (identity.py). 1: any shared hash; 2: only a strong one
 # (sha1, sha256, the Dropbox hash), because md5 and QuickXor agree for different bytes too; 3: sha1 is no longer
 # strong (collisions can be crafted), so only sha256 and the Dropbox hash are. A catalog whose
@@ -105,7 +105,19 @@ def _upgrade_before(conn: sqlite3.Connection) -> None:
 
 
 def _upgrade_after(conn: sqlite3.Connection) -> None:
-    """Fill what schema.sql just created from the old data, then record the new version."""
+    """Fill what schema.sql just created from the old data, then record the new version.
+
+    Version 3 only adds the rule_versions table, which schema.sql creates empty (with AUTOINCREMENT, so ids of deleted
+    drafts are never reused): from 2 there is nothing to fill. Version 3 is unreleased (main is at 2), so no catalog
+    holds the table in an earlier shape and no rebuild is needed.
+    """
+    if (_schema_version(conn) or 0) < 2:              # still the old version: it is written last
+        _fill_version_2(conn)
+    conn.execute("INSERT INTO meta(key, value) VALUES ('schema_version', ?) "
+                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (str(SCHEMA_VERSION),))
+
+
+def _fill_version_2(conn: sqlite3.Connection) -> None:
     with transaction(conn):
         if conn.execute("SELECT 1 FROM meta WHERE key = 'fts_rebuild'").fetchone():
             conn.execute("INSERT INTO entries_fts(entries_fts) VALUES ('rebuild')")
@@ -117,8 +129,6 @@ def _upgrade_after(conn: sqlite3.Connection) -> None:
     # upgraded catalog would read as empty in the workspace until the next scan. Late import: dirstats needs db.
     from . import dirstats
     dirstats.refresh(conn)
-    conn.execute("INSERT INTO meta(key, value) VALUES ('schema_version', ?) "
-                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (str(SCHEMA_VERSION),))
 
 
 def digest_secret(conn: sqlite3.Connection) -> bytes:

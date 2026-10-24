@@ -94,7 +94,7 @@ def test_both_languages_have_the_same_keys_and_no_placeholder_goes_missing():
 
 def test_chinese_strings_are_chinese_and_english_strings_are_not():
     zh, en = DICTS["zh-TW"], DICTS["en"]
-    loose = {"app.language", "common.listSep", "sug.q", "sug.sep", "sug.joinReasons"}      # punctuation or both languages
+    loose = {"app.language", "common.listSep", "sug.q", "sug.sep", "sug.joinReasons", "rules.problemLine"}      # punctuation or both languages
     for key, raw in en.items():
         if key in loose:
             continue
@@ -478,3 +478,131 @@ def test_the_page_starts_in_english(name):
     html = (SRC / "web" / name).read_text(encoding="utf-8")
     assert '<html lang="en">' in html and "<title>drive-merge workspace</title>" in html
     assert html.index("The drive-merge workspace needs JavaScript.") < html.index("drive-merge 工作區")
+
+
+# --------------------------------------------------------------------------- the Rules view (docs/RULES.md)
+
+# The params each code carries besides the four every RuleError has (docs/RULES.md section B and C).
+RULE_COMMON = {"line", "rule_index", "rule", "key"}
+RULE_PARAMS = {
+    "TOML_SYNTAX": {"column"}, "UNKNOWN_TOP_KEY": {"suggestion"}, "LAYOUT_NOT_TABLE": set(), "UNKNOWN_LAYOUT_KEY": {"suggestion"},
+    "MARKER_HAS_SLASH": {"value"}, "RULES_NOT_ARRAY": set(), "RULE_NOT_TABLE": set(), "UNKNOWN_RULE_KEY": {"suggestion"},
+    "NAME_REQUIRED": set(), "NAME_RESERVED": set(), "NAME_DUPLICATE": {"name"}, "TARGET_REQUIRED": set(), "BAD_UNIT_FLAG": set(),
+    "TEMPLATE_EMPTY": {"where"}, "TEMPLATE_SYNTAX": {"where"}, "TEMPLATE_FORMAT_SPEC": {"where", "variable"},
+    "UNKNOWN_VARIABLE": {"where", "variable", "suggestion"}, "TEMPLATE_DOT_SEGMENT": {"where"}, "UNIT_NEEDS_RELPATH": set(),
+    "UNIT_VAR_NOT_UNIT": set(), "BAD_STRING_LIST": set(), "UNKNOWN_CATEGORY": {"value", "suggestion"}, "BAD_EXT": set(),
+    "BAD_GLOB": set(), "BAD_REGEX": {"value"}, "BAD_SIZE": {"value"}, "SIZE_RANGE_EMPTY": {"min", "max"},
+    "RULES_TOO_LARGE": {"limit"}, "RULES_CANNOT_EDIT": {"reason"}, "TARGET_ROOT_DOT": set(),
+}
+RULE_WARN_PARAMS = {"RULE_SHADOWED": {"rule", "by"}, "FALLBACK_LOSES_STRUCTURE": set(), "RULE_REMOTE_UNKNOWN": {"rule", "value"}}
+RULESTORE_PARAMS = {
+    "RULES_VERSION_NOT_FOUND": {"version"}, "RULES_NOT_DRAFT": {"version", "version_status"}, "RULES_DRAFT_CHANGED": {"version", "revision"},
+    "RULES_INVALID": {"errors"}, "RULES_ACTIVE_CHANGED": {"active_sha256", "active_version"}, "RULES_FILE_UNWRITABLE": {"path"},
+    "RULES_FILE_MISSING": {"path"}, "RULES_FILE_UNREADABLE": {"path"}, "RULES_NO_FILE": set(), "RULES_NOT_ACTIVATABLE": {"version", "version_status"},
+    "RULES_BOTH": set(), "DRAFT_UI_ONLY": {"version"}, "PREVIEW_EXPIRED": {"preview_id"}, "PREVIEW_SUPERSEDED": set(),
+    "PREVIEW_TOO_LARGE": {"files", "limit"},
+}
+# Params whose value the page does not write into a sentence as it is (a list of errors the page lists itself, hashes, ids).
+NOT_WORDED = {"errors", "active_sha256", "preview_id"}
+
+
+def rule_error_sites() -> dict[str, list[set[str]]]:
+    """{code: [own keyword params of each RuleError(...) site with a literal code]} in classify.py."""
+    sites: dict[str, list[set[str]]] = {}
+    for call in calls("classify.py", "RuleError"):
+        code = const(call.args[0]) if call.args else None
+        if isinstance(code, str):
+            sites.setdefault(code, []).append(keyword_names(call) - RULE_COMMON - {"message"})
+    return sites
+
+
+def test_the_rule_code_lists_are_the_ones_the_spec_names():
+    from drivemerge import classify, rulestore
+
+    assert set(classify.RULE_CODES) == set(RULE_PARAMS), sorted(set(classify.RULE_CODES) ^ set(RULE_PARAMS))
+    assert set(classify.RULE_WARN_CODES) == set(RULE_WARN_PARAMS), sorted(set(classify.RULE_WARN_CODES) ^ set(RULE_WARN_PARAMS))
+    assert set(rulestore.CODES) == set(RULESTORE_PARAMS), sorted(set(rulestore.CODES) ^ set(RULESTORE_PARAMS))
+
+
+def test_every_rule_error_code_has_a_sentence_in_both_languages_that_uses_only_the_params_the_server_sends():
+    from drivemerge import classify
+
+    sites = rule_error_sites()
+    for code in classify.RULE_CODES:
+        need(f"rulecheck.{code}")
+        own = RULE_PARAMS[code]
+        # the server really sends nothing beyond what the spec says (a site may send fewer: those words are not used)
+        for site in sites.get(code, []):
+            assert site <= own, f"{code}: a site sends {site - own} that the spec does not list"
+        for lang, d in DICTS.items():
+            assert placeholders(d[f"rulecheck.{code}"]) <= RULE_COMMON | own, (
+                f"{lang} rulecheck.{code}: {placeholders(d[f'rulecheck.{code}']) - RULE_COMMON - own}")
+        if "suggestion" in own:                       # "did you mean ...?" follows the sentence when the server has a suggestion
+            need(f"rulecheck.{code}.hint")
+            for lang, d in DICTS.items():
+                assert placeholders(d[f"rulecheck.{code}.hint"]) == {"suggestion"}, (lang, code)
+    assert keys_of(r"rulecheck\.[A-Z_]+") == {f"rulecheck.{c}" for c in classify.RULE_CODES}       # no sentence for a code nobody raises
+    # a TOML error without a column and the three reasons of an edit that could not be made
+    need("rulecheck.TOML_SYNTAX.nocol")
+    for reason in ("unparsed", "not_found", "mismatch"):
+        need(f"rulecheck.RULES_CANNOT_EDIT.reason.{reason}")
+    for lang, d in DICTS.items():
+        assert not placeholders(d["rulecheck.TOML_SYNTAX.nocol"]), lang
+        assert placeholders(d["rulecheck.RULES_CANNOT_EDIT"]) == {"reason"}, lang
+        assert {f"rulecheck.RULES_CANNOT_EDIT.reason.{r}" for r in ("unparsed", "not_found", "mismatch")} <= set(d)
+    # the words for `where` of the template codes
+    need("rules.tpl.target")
+    need("rules.tpl.fallback")
+
+
+def test_every_rule_warning_code_has_a_sentence_that_uses_only_its_params():
+    from drivemerge import classify
+
+    for code in classify.RULE_WARN_CODES:
+        need(f"rulewarn.{code}")
+        for lang, d in DICTS.items():
+            assert placeholders(d[f"rulewarn.{code}"]) <= RULE_COMMON | RULE_WARN_PARAMS[code], (
+                f"{lang} rulewarn.{code}: {placeholders(d[f'rulewarn.{code}']) - RULE_COMMON - RULE_WARN_PARAMS[code]}")
+    assert keys_of(r"rulewarn\.[A-Z_]+") == {f"rulewarn.{c}" for c in classify.RULE_WARN_CODES}
+    # RULE_SHADOWED names the earlier rule, which is the one thing the reader needs
+    for d in DICTS.values():
+        assert "{by}" in d["rulewarn.RULE_SHADOWED"]
+        assert "{value}" in d["rulewarn.RULE_REMOTE_UNKNOWN"]
+
+
+def test_every_rules_refusal_has_a_sentence_in_both_languages_that_uses_only_its_params():
+    from drivemerge import rulestore
+
+    for code in rulestore.CODES:
+        need(f"err.{code}")
+        own = RULESTORE_PARAMS[code]
+        for lang, d in DICTS.items():
+            used = placeholders(d[f"err.{code}"])
+            assert used <= own, f"{lang} err.{code}: {used - own}"
+            assert not used & NOT_WORDED, f"{lang} err.{code} writes {used & NOT_WORDED} into the sentence"
+    # a refusal that says what state a version is in has the state as a word
+    for status in ("draft", "proposed", "active", "retired", "dismissed"):
+        need(f"rstatus.{status}")
+
+
+def test_the_rules_view_has_its_words_for_sources_statuses_authors_and_changes_in_both_languages():
+    for key in ("nav.rules", "nav.rulesTip", "rules.railTip", "plans.newReorganize", "plans.sum.reorganize", "reorg.title", "reorg.hint",
+                "plan.rules.title", "plan.rules.proposed", "plan.rules.inline", "plan.rules.version", "plan.rules.replaced", "ex.rules"):
+        need(key)
+    for source in ("file", "default", "version", "inline"):
+        need(f"rsrc.{source}")
+    for by in ("ui", "cli", "file", "mcp", "api", "default"):
+        need(f"rby.{by}")
+    for change in ("added", "removed", "changed", "moved"):
+        need(f"rchange.{change}")
+        for lang, d in DICTS.items():
+            assert placeholders(d[f"rchange.{change}"]) == {"n"}, (lang, change)
+    for flt in ("changed", "fallback", "all"):
+        need(f"rules.files.{flt}")
+    for part in ("outline", "text", "preview"):
+        need(f"rules.pane.{part}")
+    # no sentence of the Rules view tells anyone to use only the terminal for what the page now does
+    for lang, d in DICTS.items():
+        assert "cons.rulesHelp" not in d, lang
+    for lang, d in DICTS.items():
+        assert "drivemerge rules activate" not in d["rules.activated"], lang

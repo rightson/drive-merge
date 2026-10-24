@@ -133,6 +133,10 @@ class ImportBody(_Body):
     name: str | None = None
 
 
+class ActivateRulesBody(_Body):
+    base_sha256: str = Field(min_length=1, max_length=128)    # the active rules' SHA-256 the person reviewed against
+
+
 class PurgeBody(_Body):
     confirm: str = ""
     older_than_days: int = Field(default=0, ge=0, le=36500)
@@ -374,9 +378,11 @@ def _disabled_message(request: Request) -> str:
                "`drivemerge disconnect` / `drivemerge connections`")
     elif "/rclone/" in path:
         cli = "`drivemerge connect` (it tells you how to install rclone)"
+    elif "/rules/" in path:
+        cli = f"`drivemerge rules activate {request.path_params.get('version_id', 'N')}`"
     else:
         cli = "`drivemerge scan --all`"
-    return ("approving, executing, syncing, bridging, restoring, purging and connecting clouds from the browser is off: "
+    return ("approving, executing, syncing, bridging, restoring, purging, connecting clouds and activating rules from the browser is off: "
             "`drivemerge ui` must be started from "
             "an interactive terminal, outside an AI agent. In your own terminal run "
             f"{cli} (plans are approved with `drivemerge plan approve ID` and run with `drivemerge plan execute ID`)")
@@ -545,6 +551,7 @@ def create_ui_app(service: Service, *, config: Config, api_token: str, ui_token:
                 "SELECT id, name, provider, write_remote, case_insensitive FROM remotes ORDER BY id").fetchall()
             outdated = _outdated_remotes(service.conn)
             live = {r.name for r in service.config.remotes}
+            rules = service.rules_brief()
         return {
             "approvals_enabled": approvals_enabled,
             "execution_enabled": service.config.safety.execution_enabled,
@@ -557,6 +564,8 @@ def create_ui_app(service: Service, *, config: Config, api_token: str, ui_token:
             "csrf": auth.session.csrf if auth.session else None,
             # Clouds a run changed since their last completed scan: the catalog (and so the tree) is behind them.
             "outdated": outdated,
+            # Where the layout rules come from and how many proposals wait for review (the rail badge).
+            "rules": rules,
         }
 
     @router.get("/v1/tree/roots")
@@ -742,6 +751,15 @@ def create_ui_app(service: Service, *, config: Config, api_token: str, ui_token:
                 raise UiError(409, "STALE_PREVIEW", f"{stale}; preview the draft again before approving", plan=plan_id)
             service.approve(plan_id, body.code.strip().lower(), approved_by=f"ui:{_current_user()}")
         return {"ok": True}
+
+    @human.post("/v1/ui/rules/versions/{version_id}/activate")
+    def activate_rules(version_id: int, body: ActivateRulesBody) -> dict:
+        """Make a version's exact text the active rules file, if the file still holds what the person reviewed
+        (`base_sha256`). Human channel only: the rules decide where every later plan puts files."""
+        with lock:
+            active = service.activate_rules(version_id, base_sha256=body.base_sha256,
+                                            activated_by=f"ui:{_current_user()}")
+        return {"active": active}
 
     @human.post("/v1/ui/plans/{plan_id}/execute", status_code=202)
     def execute(plan_id: int) -> dict:
