@@ -35,6 +35,7 @@ from .builders import BuildError
 from .compare import CompareError
 from .config import load_config
 from .plans import PlanError
+from .quarantine import QuarantineError
 from .service import Service
 from .workspace import WorkspaceError
 
@@ -101,7 +102,8 @@ one with a "mkdir" step first.
 CASE_ONLY_RENAME) on to the human. undo_last and remove_staged retract staged moves, whoever made them. A step \
 flagged stale no longer fits the catalog after a rescan: it does nothing, so tell the human or remove it.
 - The quarantine folder holds files deleted by executed plans; it cannot be staged (QUARANTINE). Only the human \
-restores or purges it with the command line.
+restores or purges it, in the browser's Quarantine view or with the command line. quarantine_report and \
+quarantine_items only read what is held, from where and since when; they restore and purge nothing.
 - preview_draft turns the draft into a simulated plan for the human to review. Give them its ok, conflicts, \
 violations, warnings and summary; it never includes an approval code.\
 """
@@ -115,6 +117,8 @@ MAX_PROFILES = 200
 MAX_PREVIEW = 200
 MAX_OPS = 200
 MAX_PLANS = 50
+MAX_QUARANTINE_PLANS = 100
+MAX_QUARANTINE_ITEMS = 200
 MAX_MANUAL_OPS = 200
 MAX_TITLE = 200
 MAX_MESSAGE = 1000
@@ -161,7 +165,7 @@ def _pick(row: dict, keys: tuple[str, ...]) -> dict:
 
 
 def _error_message(exc: Exception) -> str:
-    if isinstance(exc, (WorkspaceError, CompareError, BuildError)):
+    if isinstance(exc, (WorkspaceError, CompareError, BuildError, QuarantineError)):
         text = f"{exc.code}: {exc}"
     elif isinstance(exc, sqlite3.Error):
         text = f"catalog database error (try again if a scan or execution is running): {exc}"
@@ -626,6 +630,39 @@ def build_server(service: Service) -> MCPServer:
         keys = ("id", "title", "kind", "status", "created_by", "created_at", "simulated_at", "approved_at",
                 "approved_by", "finished_at")
         return _wrap({"count": len(rows), "plans": [_pick(r, keys) for r in rows]})
+
+    # ------------------------------------------------------------ quarantine (read-only)
+
+    @tool()
+    def quarantine_report() -> dict:
+        """What executed plans parked in quarantine: per cloud the files and bytes held, how many are past the
+        retention period (due), and per plan what it holds and since when. Also lists
+        files in the quarantine folder that no plan of this catalog put there (unknown; nobody can restore or
+        purge those). Read-only: there is no tool to restore or purge; the human does that in the browser's
+        Quarantine view or with `drivemerge plan restore <id>` / `drivemerge plan purge <id>`.
+        """
+        report = _scrub(service.quarantine_report())
+        plans_ = report["plans"]
+        if len(plans_) > MAX_QUARANTINE_PLANS:
+            report["plans"], report["plans_total"] = plans_[:MAX_QUARANTINE_PLANS], len(plans_)
+        return _wrap(report)
+
+    @tool()
+    def quarantine_items(plan_id: int, state: Literal["held", "restored", "purged", "all"] = "held",
+                         remote: str | None = None, path_prefix: str | None = None, limit: int = 100) -> dict:
+        """The files one plan parked in quarantine: original path, where it waits, size, why it was removed, which
+        surviving copy vouched for it (witness), when it is due, and what the catalog saw at the last scan. Read-only.
+
+        Args:
+            plan_id: id from quarantine_report or list_plans.
+            state: held (default, still in quarantine), restored, purged or all.
+            remote: only items of this cloud.
+            path_prefix: only originals at or below this folder.
+            limit: items to return, default 100, at most 200 (total says how many match).
+        """
+        return _wrap(_scrub(service.quarantine_items(
+            plan_id, state=state, remote=remote or None, path_prefix=path_prefix or None,
+            limit=_clamp(limit, 1, MAX_QUARANTINE_ITEMS))))
 
     # ------------------------------------------------------------ workspace drafts
 

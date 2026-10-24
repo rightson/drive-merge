@@ -353,6 +353,94 @@ def test_the_codes_of_the_removed_setup_screen_are_gone_from_the_page():
         assert f"err.{gone}" not in DICTS["en"] and f"err.{gone}" not in DICTS["zh-TW"], gone
 
 
+# --------------------------------------------------------------------------- the Quarantine view (docs/QUARANTINE.md)
+
+def quarantine_error_sites() -> dict[str, list[set[str]]]:
+    """{code: [parameter names of each site]} of every `QuarantineError(code, message, **params)` in quarantine.py,
+    including the `_bad_query(param, message)` helper, which raises BAD_QUERY {param}."""
+    sites: dict[str, list[set[str]]] = {}
+    for call in calls("quarantine.py", "QuarantineError"):
+        code = const(call.args[0]) if call.args else None
+        if isinstance(code, str):
+            sites.setdefault(code, []).append(keyword_names(call))
+    if any(True for _ in calls("quarantine.py", "_bad_query")):
+        sites.setdefault("BAD_QUERY", []).append({"param"})
+    return sites
+
+
+def op_failed_sites() -> dict[str, list[set[str]]]:
+    """{code: [parameter names of each site]} of every `_OpFailed(message, code, **params)` in executor.py with a
+    literal code; the others are OP_FAILED with no params."""
+    sites: dict[str, list[set[str]]] = {"OP_FAILED": [set()]}
+    for call in calls("executor.py", "_OpFailed"):
+        code = next((const(k.value) for k in call.keywords if k.arg == "code"), None)
+        if code is None and len(call.args) > 1:
+            code = const(call.args[1])
+        if isinstance(code, str):
+            sites.setdefault(code, []).append(keyword_names(call) - {"code"})
+    return sites
+
+
+def test_every_quarantine_error_code_has_a_sentence_that_uses_only_what_every_site_sends():
+    """QuarantineError is answered as {error, code, params} (404 NOT_FOUND, 400 BAD_OPS / BAD_QUERY, else 409); the page
+    words err.<CODE> from the params."""
+    from drivemerge import quarantine
+
+    sites = quarantine_error_sites()
+    assert set(sites) == set(quarantine.CODES) == {"NOT_FOUND", "NOTHING_QUARANTINED", "BAD_OPS", "BAD_QUERY"}, sorted(sites)
+    spec = {"NOT_FOUND": {"plan"}, "NOTHING_QUARANTINED": {"plan"}, "BAD_OPS": {"plan", "op_ids"}, "BAD_QUERY": {"param"}}
+    for code, per_site in sites.items():
+        need(f"err.{code}")
+        assert all(site == spec[code] for site in per_site), (code, per_site)      # the server sends exactly what the spec says
+        usable = set.intersection(*per_site)
+        for lang, d in DICTS.items():
+            assert placeholders(d[f"err.{code}"]) <= usable, f"{lang} err.{code}: {placeholders(d[f'err.{code}']) - usable}"
+
+
+def test_every_restore_and_purge_failure_code_has_a_sentence_in_both_languages_that_uses_only_its_params():
+    """`ExecResult.failures` carries {code, params}; the page words each as qr.fail.<CODE> and shows the executor's English
+    `error` only for OP_FAILED and for a code it does not know."""
+    sites = op_failed_sites()
+    assert set(sites) == {"ORIGINAL_TAKEN", "QUARANTINE_GONE", "READ_ONLY", "BAD_PATH", "VERIFY_FAILED", "NO_WITNESS_RECORD",
+                          "WITNESS_UNPROVEN", "OP_FAILED"}, sorted(sites)
+    spec = {"ORIGINAL_TAKEN": {"remote", "path"}, "QUARANTINE_GONE": {"remote", "path"}, "READ_ONLY": {"remote"}, "BAD_PATH": {"path"},
+            "VERIFY_FAILED": {"remote", "path"}, "NO_WITNESS_RECORD": {"remote", "path"},
+            "WITNESS_UNPROVEN": {"remote", "path", "witness"}, "OP_FAILED": set()}
+    for code, per_site in sites.items():
+        need(f"qr.fail.{code}")
+        assert all(site == spec[code] for site in per_site), (code, per_site)
+        usable = set.intersection(*per_site)
+        for lang, d in DICTS.items():
+            assert placeholders(d[f"qr.fail.{code}"]) <= usable, f"{lang} qr.fail.{code}: {placeholders(d[f'qr.fail.{code}']) - usable}"
+    assert keys_of(r"qr\.fail\.[A-Z_]+") == {f"qr.fail.{c}" for c in sites}          # no sentence for a code nobody raises
+
+
+def test_a_plan_that_is_executing_is_refused_with_a_coded_sentence():
+    sites = [keyword_names(c) - {"code"} for c in calls("executor.py", "ExecutionError")
+             if any(k.arg == "code" and const(k.value) == "PLAN_EXECUTING" for k in c.keywords)]
+    assert sites and all(site == {"plan"} for site in sites), sites
+    ui = [keyword_names(c) for c in calls("ui_api.py", "UiError") if const(c.args[1]) == "PLAN_EXECUTING"]
+    assert ui and all("plan" in site for site in ui), ui
+    need("err.PLAN_EXECUTING")
+    for lang, d in DICTS.items():
+        assert placeholders(d["err.PLAN_EXECUTING"]) <= {"plan"}, lang
+
+
+def test_the_quarantine_view_has_its_state_words_and_the_sentences_that_replace_the_terminal_ones():
+    for state in ("held", "restored", "purged", "all"):
+        need(f"qr.state.{state}")
+    for key in ("nav.quarantine", "nav.quarantineTip", "quarantine.tipPage", "quarantine.insidePage", "err.QUARANTINE_PAGE",
+                "prog.failedHelpPage"):
+        need(key)
+    for lang, d in DICTS.items():
+        for page_key, terminal_key in (("quarantine.tipPage", "quarantine.tip"), ("quarantine.insidePage", "quarantine.inside"),
+                                       ("err.QUARANTINE_PAGE", "err.QUARANTINE"), ("prog.failedHelpPage", "prog.failedHelp")):
+            assert "drivemerge plan" not in d[page_key], (lang, page_key)           # the page version never sends anyone to a terminal
+            assert "drivemerge plan" in d[terminal_key], (lang, terminal_key)       # the terminal wording stays for the read-only page
+        assert placeholders(d["quarantine.tipPage"]) == placeholders(d["quarantine.tip"]) == {"dir"}, lang
+        assert placeholders(d["prog.failedHelpPage"]) <= {"id"}, lang
+
+
 # --------------------------------------------------------------------------- suggestions
 
 def test_every_suggestion_code_has_a_title_and_a_reason():

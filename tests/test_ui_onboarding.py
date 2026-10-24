@@ -1257,7 +1257,7 @@ def test_the_rail_starts_with_clouds_has_no_setup_and_alt_0_does_nothing(make_on
     ui.mock.connect_clouds("gdrive")
     start(ui)
     order = ui.page.eval_on_selector_all('[data-testid="rail"] a', "els => els.map(e => e.dataset.testid)")
-    assert order == ["rail-clouds", "rail-overview", "rail-explore", "rail-compare", "rail-plans", "rail-workspace"]
+    assert order == ["rail-clouds", "rail-overview", "rail-explore", "rail-compare", "rail-plans", "rail-quarantine", "rail-workspace"]
     expect(ui.tid("rail-setup")).to_have_count(0)
     ui.page.keyboard.press("Alt+0")
     expect(ui.tid("pane-left")).to_be_visible()                        # still the workspace

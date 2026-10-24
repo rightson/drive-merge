@@ -120,7 +120,7 @@ export function PreviewModal({ draft, onClose }) {
         <${Icon} name="alert" size=${16} /><span>${t('catalog.blocked')}</span>
         ${config.approvals_enabled && html`<button class="btn btn-small" data-testid="outdated-rescan" onClick=${run.rescan}>
           <${Icon} name="refresh" size=${14} /> ${t('catalog.rescan')}</button>`}</div>`}
-      ${afterRun && html`<${ProgressBox} phase=${phase} job=${job} prog=${prog} planId=${planId} error=${error} />`}
+      ${afterRun && html`<${ProgressBox} phase=${phase} job=${job} prog=${prog} planId=${planId} error=${error} onLeave=${onClose} />`}
       ${data && planId && html`
         <section class="cards" data-testid="preview-summary">
           <${Card} id="files" label=${t('prev.files')} value=${fmtNum(summary.moved_files)}

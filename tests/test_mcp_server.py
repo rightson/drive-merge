@@ -34,14 +34,14 @@ ALLOWED_TOOLS = {
     "validate_rules", "preview_layout", "propose_plan", "simulate_plan", "get_plan", "list_plans",
     "list_drafts", "get_draft", "create_draft", "browse_tree", "suggest_reorganization", "stage_moves",
     "undo_last", "remove_staged", "preview_draft", "compare_folders", "coverage",
-    "free_space_report",
+    "free_space_report", "quarantine_report", "quarantine_items",
 }
 WRITING_TOOLS = {"propose_plan", "simulate_plan", "create_draft", "stage_moves", "undo_last", "remove_staged",
                  "preview_draft"}
 # Tools whose description must say where staged moves show up and who decides.
 WORKSPACE_TOOLS = {"list_drafts", "get_draft", "create_draft", "suggest_reorganization", "stage_moves",
                    "undo_last", "remove_staged", "preview_draft"}
-HUMAN_ONLY = ("approve", "execute", "restore", "purge", "cancel", "scan", "bridge", "rebuild_identity",
+HUMAN_ONLY = ("approve", "execute", "restore", "purge", "purge_due", "cancel", "scan", "bridge", "rebuild_identity",
               "sync", "start_connect", "finish_connect", "cancel_connect", "test_connection", "disconnect",
               "enable_writes", "reload_config", "list_connections", "setup_status")
 # Facade methods that exist but are deliberately not reachable from MCP (redo and discard are the user's).
@@ -174,7 +174,8 @@ def test_source_never_references_human_only_service_methods():
     assert used <= {"stats", "search", "entry", "locations", "duplicates", "profiles", "validate_rules",
                     "preview_layout", "propose_plan", "simulate", "plan", "plans", "release_report",
                     "list_drafts", "get_draft", "create_draft", "list_dir", "tree_roots", "stage_action",
-                    "undo_action", "remove_action", "preview_draft", "suggestions", "compare", "coverage"}
+                    "undo_action", "remove_action", "preview_draft", "suggestions", "compare", "coverage",
+                    "quarantine_report", "quarantine_items"}
     for name in NOT_EXPOSED:
         assert not re.search(rf"service\.{name}\b", source), name
 
@@ -210,6 +211,8 @@ def test_human_only_service_methods_are_never_called(fx, server, monkeypatch):
     patch(monkeypatch, fx.service, "remove_action", {"draft_version": 2, "removed": [1]})
     patch(monkeypatch, fx.service, "preview_draft", {"plan_id": None, "message": "nothing to do"})
     patch(monkeypatch, fx.service, "release_report", {"proven": {"files": 0, "bytes": 0}})
+    patch(monkeypatch, fx.service, "quarantine_report", {"totals": {}, "remotes": [], "plans": [], "unknown": []})
+    patch(monkeypatch, fx.service, "quarantine_items", {"plan": {}, "total": 0, "items": []})
     move = {"items": [{"remote": "gdrive", "path": "Docs"}], "dst": {"remote": "dropbox", "path": ""}}
     args = {"compare_folders": {"left_remote": "gdrive", "left_path": "", "right_remote": "dropbox", "right_path": ""},
             "file_locations": {"entry_id": fx.photo_g}, "validate_rules": {"rules_toml": ""},
@@ -217,7 +220,7 @@ def test_human_only_service_methods_are_never_called(fx, server, monkeypatch):
             "get_plan": {"plan_id": 1}, "get_draft": {"draft_id": 1}, "create_draft": {"title": "t"},
             "stage_moves": {"draft_id": 1, "moves": [move]}, "undo_last": {"draft_id": 1},
             "remove_staged": {"draft_id": 1, "action_id": 1}, "preview_draft": {"draft_id": 1},
-            "free_space_report": {"remote": "gdrive"}}
+            "free_space_report": {"remote": "gdrive"}, "quarantine_items": {"plan_id": 1}}
     for name in sorted(ALLOWED_TOOLS):
         ok(server, name, **args.get(name, {}))
 
@@ -1444,8 +1447,8 @@ def test_an_mcp_proposal_with_a_bad_override_is_a_clean_error(fx, server):
     assert "g:424242" in text
 
 
-def test_the_plans_view_adds_no_mcp_tool():
-    assert ALLOWED_TOOLS == {"catalog_stats", "search_files", "file_locations", "find_duplicates", "folder_profiles",
+def test_the_quarantine_view_adds_only_its_two_read_tools():
+    assert ALLOWED_TOOLS - {"quarantine_report", "quarantine_items"} == {"catalog_stats", "search_files", "file_locations", "find_duplicates", "folder_profiles",
                              "validate_rules", "preview_layout", "propose_plan", "simulate_plan", "get_plan",
                              "list_plans", "list_drafts", "get_draft", "create_draft", "browse_tree",
                              "suggest_reorganization", "stage_moves", "undo_last", "remove_staged", "preview_draft",
@@ -1482,3 +1485,73 @@ def test_release_plan_end_to_end_through_mcp(server, fx):
     assert out["data"]["proven"]["files"] == 1                 # IMG_0001 has a live copy on dropbox
     plan = ok(server, "propose_plan", kind="release", params={"remote": "gdrive"})
     assert plan["data"]["plan_id"] is not None and plan["data"]["simulation"]["contents_lost"] == 0
+
+
+# --------------------------------------------------------------------------- quarantine (read-only)
+
+QDIR = ".drive-merge-quarantine"
+
+
+def _park(fx, *, days_ago=40, path=f"Docs/{INJECTION}", status="done"):
+    """A done dedupe whose one delete waits in quarantine on gdrive; returns (plan id, op id)."""
+    from datetime import datetime, timedelta, timezone
+    when = (datetime.now(timezone.utc) - timedelta(days=days_ago)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    pid = fx.conn.execute(
+        "INSERT INTO plans(title, kind, status, created_by, params, digest, snapshot, created_at, finished_at) "
+        "VALUES ('dedupe', 'dedupe', ?, 'mcp', '{\"remote\": \"gdrive\", \"digest\": \"secret\"}', "
+        "'0123456789abcdef', '{}', ?, ?) RETURNING id", (status, when, when)).fetchone()[0]
+    op = fx.conn.execute(
+        "INSERT INTO plan_ops(plan_id, seq, op, src_remote_id, src_path, witness_remote_id, witness_path, "
+        "expect_size, reason, status, executed_at) VALUES (?, 1, 'delete', ?, ?, ?, 'Photos/2019/IMG_0001.jpg', 5, "
+        "'duplicate', 'done', ?) RETURNING id", (pid, fx.g, path, fx.g, when)).fetchone()[0]
+    fx.conn.execute("INSERT INTO journal(ts, plan_id, op_id, action, detail) VALUES (?, ?, ?, 'quarantine', '{}')",
+                    (when, pid, op))
+    return pid, op
+
+
+def test_quarantine_tools_are_read_only_and_nothing_restores_or_purges(server, fx):
+    tools = {t.name: t for t in list_tools(server)}
+    for name in ("quarantine_report", "quarantine_items"):
+        assert tools[name].annotations.read_only_hint is True and name not in WRITING_TOOLS
+    assert not any(word in name for name in tools for word in ("restore", "purge", "release_quarantine"))
+    assert "restore and purge nothing" in server.instructions
+    assert "restore" in tools["quarantine_report"].description.lower()
+    source = inspect.getsource(mcp_server)
+    assert not re.search(r"service\.(restore|purge|purge_due|quarantine_check)\b", source)
+
+
+def test_quarantine_report_lists_what_plans_parked_as_untrusted_data(server, fx):
+    pid, _ = _park(fx)
+    fx.service.config.safety.quarantine_dir = QDIR
+    out = ok(server, "quarantine_report")
+    assert out["note"] == UNTRUSTED_NOTE
+    data = out["data"]
+    assert data["totals"] == {"files": 1, "bytes": 5, "due_files": 1, "due_bytes": 5}
+    [row] = [p for p in data["plans"] if p["plan_id"] == pid]
+    assert row["held"] == {"files": 1, "bytes": 5} and row["remotes"] == ["gdrive"] and row["created_by"] == "mcp"
+    assert row["params"] == {"remote": "gdrive"}
+    text = json.dumps(out)
+    assert "0123456789abcdef" not in text and "secret" not in text and "digest" not in text
+
+
+def test_quarantine_items_lists_one_plans_files_and_maps_arguments(server, fx):
+    pid, op = _park(fx)
+    out = ok(server, "quarantine_items", plan_id=pid)
+    assert out["note"] == UNTRUSTED_NOTE and out["data"]["total"] == 1
+    [item] = out["data"]["items"]
+    assert item["op_id"] == op and item["path"] == f"Docs/{INJECTION}" and item["state"] == "held"
+    assert item["witness"] == {"remote": "gdrive", "path": "Photos/2019/IMG_0001.jpg"}
+    assert item["catalog"]["witness_live"] is True
+    assert ok(server, "quarantine_items", plan_id=pid, state="restored")["data"]["total"] == 0
+    assert ok(server, "quarantine_items", plan_id=pid, remote="dropbox")["data"]["total"] == 0
+    assert ok(server, "quarantine_items", plan_id=pid, path_prefix="Docs")["data"]["total"] == 1
+    assert ok(server, "quarantine_items", plan_id=pid, path_prefix="Doc")["data"]["total"] == 0
+    assert ok(server, "quarantine_items", plan_id=pid, limit=10**6)["data"]["limit"] == mcp_server.MAX_QUARANTINE_ITEMS
+
+
+def test_quarantine_tool_errors_name_their_code(server, fx):
+    pid, _ = _park(fx)
+    assert "NOT_FOUND: no plan 9999" in err(server, "quarantine_items", plan_id=9999)
+    assert "BAD_QUERY:" in err(server, "quarantine_items", plan_id=pid, remote="nosuchcloud")
+    assert not call(server, "quarantine_items", plan_id=pid, state="all").is_error
+    assert call(server, "quarantine_items", plan_id=pid, state="everything").is_error

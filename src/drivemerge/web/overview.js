@@ -10,12 +10,14 @@ import { AppCtx } from './ctx.js';
 import { AgeChip, CloudDot, CloudName, cloudColor } from './clouds.js';
 import { Modal, ViewHeader } from './ui.js';
 import { compareHash, exploreHash, freeHash, parseSize, plansHash } from './query.js';
+import { cloudHolds, quarantineHash, useQuarantine } from './qstore.js';
 import { errorText, fmtBytes, fmtDateTime, fmtLoc, fmtNum, sleep, suggestionText } from './util.js';
 
 const CATEGORIES = ['photo', 'video', 'audio', 'document', 'pdf', 'spreadsheet', 'presentation', 'archive', 'code', 'design', 'other'];
 const MAX_BARS = 24;
 
-function CloudCard({ remote, remotes, category, onOpen, onBridge, onConsolidate, onFree }) {
+function CloudCard({ remote, remotes, category, onOpen, onBridge, onConsolidate, onFree, onQuarantine }) {
+  const held = cloudHolds(useQuarantine().data, remote.name);
   const only = remote.only_here || { contents: 0, bytes: 0 };
   const unverified = remote.unverified_files || 0;
   const scan = remote.last_scan;
@@ -38,6 +40,10 @@ function CloudCard({ remote, remotes, category, onOpen, onBridge, onConsolidate,
       title=${t('ov.gatherTip')} onClick=${() => onConsolidate(remote.name)}>${t('ov.gather')}</button>`}
     ${onFree && html`<button class="link cloud-gather" data-testid=${'cloud-free-' + remote.name} title=${t('ov.freeTip')}
       onClick=${() => onFree(remote.name)}>${t('ov.free')}</button>`}
+    ${held && held.files > 0 && onQuarantine && html`<a class="link cloud-gather" href=${quarantineHash(null, { remote: remote.name })}
+      data-testid=${'cloud-quarantine-' + remote.name} data-due=${held.due_files}
+      onClick=${(e) => { if (e.ctrlKey || e.metaKey || e.shiftKey || e.button) return; e.preventDefault(); onQuarantine(remote.name); }}>
+      ${t(held.due_files > 0 ? 'qr.here' : 'qr.hereNoDue', { bytes: fmtBytes(held.bytes), n: fmtNum(held.due_files) })}</a>`}
     <p class=${'cloud-unverified' + (unverified > 0 ? ' warn' : '')} data-testid=${'cloud-unverified-' + remote.name}>
       ${t('ov.noHash')}: <strong>${fmtNum(unverified)}</strong></p>
     ${unverified > 0 && html`<p class="cloud-undercount" data-testid=${'cloud-undercount-' + remote.name}>
@@ -316,6 +322,7 @@ export function Overview() {
         ${(data.remotes || []).map((r) => html`<${CloudCard} key=${r.name} remote=${r} remotes=${remotes} category=${category} onOpen=${openExplore}
           onBridge=${ctx.config.approvals_enabled ? () => setBridge(true) : undefined}
           onFree=${(name) => ctx.nav(freeHash(name))}
+          onQuarantine=${(name) => ctx.nav(quarantineHash(null, { remote: name }))}
           onConsolidate=${(remotes.some((o) => o.name !== r.name && o.writable !== false) ? (name) => openConsolidate(name) : undefined)} />`)}
       </div>`}
       ${data && html`<section class="ov-panel" aria-labelledby="ov-chart-h">

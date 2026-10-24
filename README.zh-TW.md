@@ -6,7 +6,7 @@
 
 drive-merge 在你的電腦上執行。它透過 [rclone](https://rclone.org) 將每個雲端的 **中繼資料**（絕不包含檔案內容）彙整進本機 SQLite 資料庫，告訴你每一份內容存放在哪裡，證明哪些檔案是重複的，提出整潔的資料夾架構建議，並且——僅透過經過模擬且經人工核准的計畫——將所有內容整合到單一雲端。
 
-設計文件：[docs/DESIGN.zh-TW.md](docs/DESIGN.zh-TW.md) — 架構、安全模型，以及你可以調整的待決事項；[docs/WORKSPACE.zh-TW.md](docs/WORKSPACE.zh-TW.md) — 視覺化工作區；以及 [docs/EXPLORE.zh-TW.md](docs/EXPLORE.zh-TW.md) — 總覽、探索與比較三個檢視；以及 [docs/PLANS.zh-TW.md](docs/PLANS.zh-TW.md) — 計畫檢視。繁體中文版本位於 `docs/*.zh-TW.md`。
+設計文件：[docs/DESIGN.zh-TW.md](docs/DESIGN.zh-TW.md) — 架構、安全模型，以及你可以調整的待決事項；[docs/WORKSPACE.zh-TW.md](docs/WORKSPACE.zh-TW.md) — 視覺化工作區；以及 [docs/EXPLORE.zh-TW.md](docs/EXPLORE.zh-TW.md) — 總覽、探索與比較三個檢視；[docs/PLANS.zh-TW.md](docs/PLANS.zh-TW.md) — 計畫檢視；以及 [docs/QUARANTINE.zh-TW.md](docs/QUARANTINE.zh-TW.md) — 隔離區檢視。繁體中文版本位於 `docs/*.zh-TW.md`。
 
 ## 設計理由
 
@@ -88,6 +88,8 @@ drivemerge ui                              # opens http://127.0.0.1:8765/ui/ (on
 頁面左側的導覽列還能開啟三個唯讀的檢視，它們都會通往工作區：**總覽**（各雲端的內容重疊多少：用交集圖呈現哪些內容在哪些雲端，以及哪些只存在於單一雲端）、**探索**（用名稱或像 `type:pdf not:gdrive copies:1` 這樣的查詢找檔案；內容相同的副本會歸成一列，每個雲端一欄）與**比較**（對任意雲端上的任意兩個資料夾做對齊的差異檢視：相同、不同、搬動過、只在一邊，並有按鈕可把合併加入你的草稿）。它們不會寫入任何雲端，也不會更動 catalog。請參閱 [docs/EXPLORE.zh-TW.md](docs/EXPLORE.zh-TW.md)。
 
 **計畫**檢視讓你直接在頁面上建立並審閱整批計畫：去重計畫（有即時預估，並可逐組選擇要保留哪一份）、整併計畫（預設只複製；清理來源藏在有防護的區塊後面），以及審閱任何計畫（包含 Claude 提出的），使用同樣的模擬與同樣的輸入確認碼核准。總覽也能橋接沒有可比對雜湊的檔案。請參閱 [docs/PLANS.zh-TW.md](docs/PLANS.zh-TW.md)。
+
+**隔離區**檢視（在計畫之後，`Alt+6`）列出每個已執行的計畫放進隔離資料夾的檔案：依雲端、依計畫顯示佔多少空間、從什麼時候開始。可以把整個計畫、一個資料夾或單一檔案放回原處（絕不覆蓋任何東西），並把已超過保留期限（`[safety] quarantine_retention_days`，預設 30 天）的內容永久清除；動手前會先依目錄做唯讀檢查，並要求輸入確認字（`restore` 或 `purge`），和 `drivemerge plan restore`、`drivemerge plan purge` 完全一樣。沒有核准功能時，頁面改為顯示終端機指令。請參閱 [docs/QUARANTINE.zh-TW.md](docs/QUARANTINE.zh-TW.md)。
 
 **雲端**檢視（導覽列的第一個項目；開啟時如果還沒有東西可處理，頁面會直接停在這裡）帶你從 `pip install` 走到同步好的目錄。Dropbox、OneDrive 與 Google Drive 會在新分頁登入雲端服務，透過 rclone 在 `127.0.0.1:53682` 提供的登入輔助程式，所以 drive-merge 不會接觸到權杖；**iCloud Drive** 則輸入 Apple ID 與密碼，雙重驗證碼再由表單詢問。如果瀏覽器不在執行 drive-merge 的那台電腦上，**在另一台電腦上登入**會顯示要在那裡執行的 `rclone authorize` 指令，並接收你貼回來的權杖。**已經在使用 rclone？**會列出你自己 rclone 設定裡的 remote，並把其中一個匯入為唯讀連線，不會動到那個檔案；你在 `config.toml` 手動設定的雲端也會有一張卡片。測試結果會依原因說明（登入已過期、沒有網路、找不到）。只有從你自己的終端機啟動的 `drivemerge ui` 頁面才能連接與同步；否則這個檢視是唯讀的，只會顯示該執行的 `drivemerge connect` 指令。請參閱 [docs/ONBOARDING.zh-TW.md](docs/ONBOARDING.zh-TW.md)。
 

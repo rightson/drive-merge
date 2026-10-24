@@ -28,7 +28,7 @@
 - **預覽一定經過模擬器**：視覺化介面只是另一種產生 Plan 的方式，安全不變式完全相同（[DESIGN.zh-TW.md](DESIGN.zh-TW.md) §7）。
 - **草稿版本綁定預覽**：草稿只要有任何變動，之前的預覽就失效，必須重新預覽才能核准。
 - **重掃後失效的步驟**：重新掃描可能讓草稿裡某一步的來源消失（被搬走或刪除）。這種步驟不會產生任何操作，所以草稿與預覽都會把它標成「失效」並說明原因，而不是默默略過；其餘步驟照常預覽。
-- **隔離區不能拖放**：隔離資料夾裡是已刪除的檔案，只能用 CLI 還原（`drivemerge plan restore`）或清除（`purge`）；畫面上它有獨立的樣式，不能拖出、也不能拖進，暫存這種搬移會被拒絕（`QUARANTINE`）。
+- **隔離區不能拖放**：隔離資料夾裡是已刪除的檔案，請在「隔離區」頁面（[QUARANTINE.zh-TW.md](QUARANTINE.zh-TW.md)）或用 CLI 還原（`drivemerge plan restore`）或清除（`purge`）；畫面上它有獨立的樣式，不能拖出、也不能拖進，暫存這種搬移會被拒絕（`QUARANTINE`）。
 
 ## 3. 建議引擎
 
@@ -90,7 +90,7 @@
 - `NAME_EXISTS`：*檔案*項目的目標名稱已被檔案佔用（或目錄對上檔案／檔案對上目錄）。目錄搬到已存在的同名目錄上是允許的，並成為合併（以警告 `MERGE` 回傳）。
 - `NOOP`：每個項目都會落在它原本所在的位置（拒絕；沒有東西可暫存）。
 - `BAD_NAME`：new_name 為空、含有 '/'、為 '.' 或 '..'，或含有 NUL。
-- `QUARANTINE`：某個項目位於隔離資料夾（`db.quarantine_dir(conn)`，預設 `.drive-merge-quarantine`，每個 remote 上都有；在不分大小寫的 remote 上以 NFC+casefold 比較）本身或其底下；某個項目是包含該隔離資料夾的資料夾（只有 `quarantine_dir` 為巢狀路徑時才可能發生）；或某個項目的目標路徑（目的地加上其名稱或 `new_name`）、某個 `mkdir` 的目標路徑，位於隔離資料夾本身或其底下。已刪除的檔案只能由命令列還原或清除（`drivemerge plan restore` / `purge`），絕不能透過草稿。此項最先檢查，早於 `SRC_NOT_FOUND`：它只取決於路徑。
+- `QUARANTINE`：某個項目位於隔離資料夾（`db.quarantine_dir(conn)`，預設 `.drive-merge-quarantine`，每個 remote 上都有；在不分大小寫的 remote 上以 NFC+casefold 比較）本身或其底下；某個項目是包含該隔離資料夾的資料夾（只有 `quarantine_dir` 為巢狀路徑時才可能發生）；或某個項目的目標路徑（目的地加上其名稱或 `new_name`）、某個 `mkdir` 的目標路徑，位於隔離資料夾本身或其底下。已刪除的檔案只能由「隔離區」頁面或命令列還原或清除（`drivemerge plan restore` / `purge`），絕不能透過草稿。此項最先檢查，早於 `SRC_NOT_FOUND`：它只取決於路徑。
 - 警告（非致命）：`MERGE`、`READ_ONLY`（來源或目的地 remote 沒有 write_remote）、`CROSS_REMOTE`（位元組會經由這台機器複製）、`CASE_COLLISION`（不分大小寫的目的地 remote 上已有大小寫不同的同名項目）、`CASE_ONLY_RENAME`（在兩者都不分的 remote 上，只改變名稱的大小寫或 Unicode 形式的更名：暫存時允許，預覽則把它當成衝突拒絕，見 §G）。
 
 暫存時各項檢查的順序：`BAD_NAME`（new_name）、`BAD_REQUEST`（沒有項目）、`QUARANTINE`、`SRC_NOT_FOUND`、`DST_NOT_DIR`、`INTO_ITSELF`、`NAME_EXISTS`、`NOOP`。

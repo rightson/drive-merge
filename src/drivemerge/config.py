@@ -54,6 +54,7 @@ class SafetyConfig:
     allow_probable_delete: bool = False     # never delete on a name+size match alone
     quarantine_dir: str = ".drive-merge-quarantine"
     min_copies: int = 1
+    quarantine_retention_days: int = 30     # when quarantined files count as due; nothing is purged by itself
 
 
 @dataclass
@@ -125,6 +126,10 @@ def parse_config(data: dict) -> Config:
     names = [r.name for r in remotes]
     if len(names) != len(set(names)):
         raise ValueError("duplicate remote names in config")
+    safety = SafetyConfig(**data.get("safety", {}))
+    days = safety.quarantine_retention_days
+    if not isinstance(days, int) or isinstance(days, bool) or days < 1:
+        raise ValueError(f"[safety] quarantine_retention_days must be a whole number of days, at least 1, not {days!r}")
     return Config(
         db_path=db.get("path", DEFAULT_DB_PATH),
         rclone_binary=rc.get("binary", "rclone"),
@@ -132,7 +137,7 @@ def parse_config(data: dict) -> Config:
         rclone_extra_args=tuple(rc.get("extra_args", ())),
         rules_path=data.get("rules", {}).get("path"),
         remotes=remotes,
-        safety=SafetyConfig(**data.get("safety", {})),
+        safety=safety,
         api=ApiConfig(**data.get("api", {})),
     )
 

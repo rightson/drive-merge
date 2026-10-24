@@ -10,6 +10,7 @@ import { AppCtx } from './ctx.js';
 import { AgeChip, CloudDot } from './clouds.js';
 import { ViewHeader } from './ui.js';
 import { freeHash, plansHash } from './query.js';
+import { cloudHolds, quarantineHash, useQuarantine } from './qstore.js';
 import {
   ago, buildText, errorText, fmtBytes, fmtNum, sleep,
 } from './util.js';
@@ -50,6 +51,7 @@ function Bucket({ id, icon, tone, label, help, data, children }) {
 
 export function Free({ remote, params }) {
   const ctx = useContext(AppCtx);
+  const held = cloudHolds(useQuarantine().data, remote);
   const remotes = ctx.config.remotes || [];
   const names = remotes.map((r) => r.name);
   const others = names.filter((n) => n !== remote);
@@ -207,6 +209,10 @@ export function Free({ remote, params }) {
         <span class="free-ages">${Object.keys(freshness).map((n) => html`<span key=${n} class="free-age"><${CloudDot} remotes=${remotes} name=${n} size=${8} />
           ${n}<${AgeChip} iso=${freshness[n].synced_at} testid=${'free-age-' + n} /></span>`)}</span>
       </section>
+      ${held && held.files > 0 && html`<p class="free-quarantine-held" data-testid="free-quarantine-held"><${Icon} name="lock" size=${14} />
+        <a href=${quarantineHash(null, { remote })} data-testid="free-quarantine-link" data-due=${held.due_files}
+        onClick=${(e) => { e.preventDefault(); ctx.nav(quarantineHash(null, { remote })); }}>
+        ${t(held.due_files > 0 ? 'qr.here' : 'qr.hereNoDue', { bytes: fmtBytes(held.bytes), n: fmtNum(held.due_files) })}</a></p>`}
       ${rep.error && html`<p class="view-error" role="alert" data-testid="free-error">${errorText(rep.error)}</p>`}
       ${rep.loading && !data && !rep.error && html`<p class="empty-hint">${t('common.loading')}</p>`}
       ${data && html`
@@ -267,7 +273,9 @@ export function Free({ remote, params }) {
           <${Icon} name="info" size=${16} />
           <span>${t('free.pending', { cloud: remote })}
             ${finished.slice(0, 3).map((p) => html`<a key=${p.id} href=${plansHash(`/${p.id}`)} data-testid=${'free-pending-' + p.id}
-              onClick=${(e) => { e.preventDefault(); ctx.nav(plansHash(`/${p.id}`)); }}>#${p.id}</a> `)}</span></section>`}
+              onClick=${(e) => { e.preventDefault(); ctx.nav(plansHash(`/${p.id}`)); }}>#${p.id}</a>
+              (<a href=${quarantineHash(p.id)} data-testid=${'free-pending-q-' + p.id}
+              onClick=${(e) => { e.preventDefault(); ctx.nav(quarantineHash(p.id)); }}>${t('qr.freePending')}</a>) `)}</span></section>`}
         <footer class="free-foot">
           ${!writable && html`<p class="pl-warn" data-testid="free-readonly" role="note"><${Icon} name="lock" size=${14} /> ${t('free.readOnly', { cloud: remote })}
             <a href="#/clouds" onClick=${(e) => { e.preventDefault(); ctx.nav('#/clouds'); }}>${t('free.readOnlyLink')}</a></p>`}

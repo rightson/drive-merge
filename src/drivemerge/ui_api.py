@@ -5,7 +5,7 @@ Two kinds of caller reach this app, and they are not equal:
 * normal routes (catalog, drafts, trees, suggestions, previews) accept the API
   bearer token or the UI session cookie, so scripts and Claude can stage and
   preview changes alongside the person using the browser;
-* the human channel (approve, execute, sync, bridge, purge, connect, disconnect, install rclone) accepts only the session cookie
+* the human channel (approve, execute, sync, bridge, restore, purge, connect, disconnect, install rclone) accepts only the session cookie
   plus a CSRF header, a same-origin check, and a server that was started from an
   interactive terminal. A bearer token never reaches it: whatever an LLM can do
   here ends in a proposal that a person still has to approve.
@@ -38,7 +38,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from . import __version__, connections, plans
+from . import __version__, connections, plans, quarantine
 from .api import (
     LOOPBACK_HOSTS, QuotaCache, bearer_ok, build_router, install_error_handlers, scrub_secrets,
 )
@@ -136,6 +136,17 @@ class ImportBody(_Body):
 class PurgeBody(_Body):
     confirm: str = ""
     older_than_days: int = Field(default=0, ge=0, le=36500)
+    op_ids: list[int] | None = Field(default=None, max_length=5000)   # only these quarantined items
+
+
+class RestoreBody(_Body):
+    confirm: str = ""
+    op_ids: list[int] | None = Field(default=None, max_length=5000)   # only these quarantined items
+
+
+class PurgeDueBody(_Body):
+    confirm: str = ""
+    remote: str | None = None             # only the items on this cloud
 
 
 def _refusal(status: int, payload: dict, headers: dict[str, str] | None = None) -> JSONResponse:
@@ -298,6 +309,7 @@ def _outdated_remotes(conn) -> list[str]:
     The executor never touches the catalog, so after a run the tree describes the cloud as it was; the page
     says so until a scan completes. Read from the journal of executed operations (done, or failed part way)
     rather than from page memory, so a reload, another tab or a run from the terminal show it as well.
+    A restore or a purge changes a cloud as well: each item it moved back or deleted counts for the op's cloud.
     """
     return [r[0] for r in conn.execute(
         """SELECT r.name FROM remotes r WHERE EXISTS (
@@ -306,7 +318,12 @@ def _outdated_remotes(conn) -> list[str]:
                               UNION ALL
                               SELECT dst_remote_id, executed_at FROM plan_ops
                               WHERE status IN ('done', 'failed') AND dst_remote_id IS NOT NULL
-                                AND executed_at IS NOT NULL) x
+                                AND executed_at IS NOT NULL
+                              UNION ALL
+                              SELECT o.src_remote_id, j.ts FROM journal j JOIN plan_ops o ON o.id = j.op_id
+                              WHERE json_valid(j.detail)
+                                AND ((j.action = 'restore' AND json_extract(j.detail, '$.status') = 'restored')
+                                     OR (j.action = 'purge' AND json_extract(j.detail, '$.status') = 'purged'))) x
                WHERE x.rid = r.id AND x.t > COALESCE((SELECT MAX(s.finished_at) FROM scans s
                                                       WHERE s.remote_id = r.id AND s.status = 'complete'), ''))
            ORDER BY r.id""")]
@@ -346,6 +363,10 @@ def _disabled_message(request: Request) -> str:
         cli = f"`drivemerge plan execute {plan_id}`"
     elif path.endswith("/bridge"):
         cli = "`drivemerge bridge`"
+    elif path.endswith("/quarantine/purge"):
+        cli = "`drivemerge quarantine purge-due`"
+    elif path.endswith("/restore"):
+        cli = f"`drivemerge plan restore {plan_id}`"
     elif path.endswith("/purge"):
         cli = f"`drivemerge plan purge {plan_id}`"
     elif "/connect" in path or "/connections" in path:
@@ -355,7 +376,7 @@ def _disabled_message(request: Request) -> str:
         cli = "`drivemerge connect` (it tells you how to install rclone)"
     else:
         cli = "`drivemerge scan --all`"
-    return ("approving, executing, syncing, bridging, purging and connecting clouds from the browser is off: "
+    return ("approving, executing, syncing, bridging, restoring, purging and connecting clouds from the browser is off: "
             "`drivemerge ui` must be started from "
             "an interactive terminal, outside an AI agent. In your own terminal run "
             f"{cli} (plans are approved with `drivemerge plan approve ID` and run with `drivemerge plan execute ID`)")
@@ -814,29 +835,99 @@ def create_ui_app(service: Service, *, config: Config, api_token: str, ui_token:
     def rescan(body: SyncBody = SyncBody()) -> dict:
         return start_sync(body)
 
+    def execution_gate() -> None:
+        if not service.config.safety.execution_enabled:
+            raise UiError(403, "EXECUTION_DISABLED", "execution is disabled: set `execution_enabled = true` under "
+                                                     "[safety] in config.toml, then restart `drivemerge ui`")
+
+    def quarantine_gate(plan_id: int, action: str, op_ids: list[int] | None, older_than_days: int = 0, *,
+                        allow_empty: bool = False) -> dict:
+        """The refusals every restore and purge shares, answered before any job starts; returns the check.
+
+        `allow_empty` is for a plan-wide purge, which has always been a no-op job for a plan that parked nothing."""
+        with lock:
+            plan = plans.get_plan(service.conn, plan_id, with_ops=False)         # no plan: 404 NOT_FOUND
+            if plan.status == "executing":
+                raise UiError(409, "PLAN_EXECUTING", f"plan {plan_id} is executing; wait for it to finish",
+                              plan=plan_id)
+            if plan.status not in ("done", "failed"):
+                raise UiError(409, "CONFLICT", f"plan {plan_id} is {plan.status}; only a plan that has run "
+                                               "has anything in quarantine", plan=plan_id, plan_status=plan.status)
+            # NOTHING_QUARANTINED (409) and BAD_OPS (400) come from the check
+            try:
+                return service.quarantine_check(plan_id, action, op_ids=op_ids, older_than_days=older_than_days)
+            except quarantine.QuarantineError as e:
+                if allow_empty and e.code == "NOTHING_QUARANTINED":
+                    return {"files": 0, "op_ids": []}
+                raise
+
+    @human.post("/v1/ui/plans/{plan_id}/restore", status_code=202)
+    def restore(plan_id: int, body: RestoreBody) -> dict:
+        """Put this plan's quarantined files (all, or `op_ids`) back where they were; never overwrites."""
+        if body.confirm != "restore":
+            raise UiError(400, "BAD_REQUEST", 'type "restore" to confirm putting the quarantined files back')
+        execution_gate()
+        checked = quarantine_gate(plan_id, "restore", body.op_ids)
+
+        def work(job: _Job) -> tuple[Any, str | None]:
+            svc = job_service()
+            try:
+                result = svc.restore(
+                    plan_id, op_ids=checked["op_ids"] if body.op_ids is not None else None,
+                    progress=lambda done, failed, total: jobs.update(job, restored=done, failed=failed, total=total))
+                return result, (str(result.get("error")) if result.get("failed") else None)
+            finally:
+                svc.conn.close()
+
+        return {"job_id": jobs.start("restore", work, plan_id=plan_id, restored=0, failed=0,
+                                     total=checked["files"]).id}
+
     @human.post("/v1/ui/plans/{plan_id}/purge", status_code=202)
     def purge(plan_id: int, body: PurgeBody) -> dict:
         """Permanently delete this plan's quarantined files (each re-proven against its witness first)."""
         if body.confirm != "purge":
             raise UiError(400, "BAD_REQUEST", 'type "purge" to confirm deleting the quarantined files for good')
-        if not service.config.safety.execution_enabled:
-            raise UiError(403, "EXECUTION_DISABLED", "execution is disabled: set `execution_enabled = true` under "
-                                                     "[safety] in config.toml, then restart `drivemerge ui`")
-        with lock:
-            plan = plans.get_plan(service.conn, plan_id, with_ops=False)
-            if plan.status not in ("done", "failed"):
-                raise UiError(409, "CONFLICT", f"plan {plan_id} is {plan.status}; only a plan that has run "
-                                                    "has anything in quarantine", plan=plan_id, plan_status=plan.status)
+        execution_gate()
+        checked = quarantine_gate(plan_id, "purge", body.op_ids, body.older_than_days,
+                                  allow_empty=body.op_ids is None)
 
         def work(job: _Job) -> tuple[Any, str | None]:
             svc = job_service()
             try:
-                result = svc.purge(plan_id, older_than_days=body.older_than_days)
+                svc.default_progress = lambda settled, failed, total: jobs.update(
+                    job, purged=settled, failed=failed, total=total)
+                if body.op_ids is None:
+                    result = svc.purge(plan_id, older_than_days=body.older_than_days)
+                else:
+                    result = svc.purge(plan_id, older_than_days=body.older_than_days, op_ids=body.op_ids)
                 return result, (str(result.get("error")) if result.get("failed") else None)
             finally:
                 svc.conn.close()
 
-        return {"job_id": jobs.start("purge", work, plan_id=plan_id).id}
+        return {"job_id": jobs.start("purge", work, plan_id=plan_id, purged=0, failed=0,
+                                     total=checked["files"]).id}
+
+    @human.post("/v1/ui/quarantine/purge", status_code=202)
+    def purge_due(body: PurgeDueBody) -> dict:
+        """Purge, plan after plan, every item past its retention period (optionally only on one cloud)."""
+        if body.confirm != "purge":
+            raise UiError(400, "BAD_REQUEST", 'type "purge" to confirm deleting the quarantined files for good')
+        execution_gate()
+        if body.remote:
+            service.config.remote(body.remote)         # KeyError -> 404 before any job starts
+
+        def work(job: _Job) -> tuple[Any, str | None]:
+            svc = job_service()
+            try:
+                result = svc.purge_due(
+                    remote=body.remote or None,
+                    progress=lambda **counts: jobs.update(job, **counts))
+                return result, (str(result.get("error") or "some files could not be purged")
+                                if result.get("failed") else None)
+            finally:
+                svc.conn.close()
+
+        return {"job_id": jobs.start("purge", work, plans_total=0, plans_done=0, purged=0, failed=0).id}
 
     # ---- connections (human channel; slow rclone calls run outside the catalog lock)
 

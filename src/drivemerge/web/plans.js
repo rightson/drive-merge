@@ -12,8 +12,10 @@ import { CloudDot, CloudName } from './clouds.js';
 import { Modal, ViewHeader } from './ui.js';
 import { freeHash, parseSize, plansHash } from './query.js';
 import {
-  ApprovalFields, Card, CliBox, CloudTable, ExecNote, ProgressBox, Problems, SimStatus, useRunner,
+  ApprovalFields, Card, CliBox, CloudTable, ExecNote, FailedHelp, ProgressBox, Problems, SimStatus, useRunner,
 } from './report.js';
+import { PlanQuarantineBox } from './quarantine.js';
+import { quarantineHash, refreshQuarantine } from './qstore.js';
 import {
   ago, baseName, buildText, errorText, fmtBytes, fmtDateTime, fmtNum, parentOf, rootCauses, sleep,
 } from './util.js';
@@ -138,6 +140,7 @@ function PurgeBox({ plan, planId, sim }) {
       if (!alive.current) return;
       setPhase('done');
       ctx.markOutdated(cloud ? [cloud] : undefined);
+      refreshQuarantine();
       ctx.toast('success', t('purge.toast', { cloud }));
     } catch (e) {
       if (!alive.current) return;
@@ -159,7 +162,9 @@ function PurgeBox({ plan, planId, sim }) {
     ${(phase === 'idle' || phase === 'dialog' || phase === 'running') && html`<div class="purge-actions">
       <button class="btn btn-danger" data-testid="purge-now" disabled=${phase === 'running'} onClick=${() => { setTyped(''); setPhase('dialog'); }}>
         ${phase === 'running' ? html`<span class="spinner" aria-hidden="true"></span>` : null} ${t('purge.now')}</button>
-      <button class="btn" data-testid="purge-later" disabled=${phase === 'running'} onClick=${() => setPhase('later')}>${t('purge.later')}</button></div>`}
+      <button class="btn" data-testid="purge-later" disabled=${phase === 'running'} onClick=${() => setPhase('later')}>${t('purge.later')}</button>
+      <a class="btn" href=${quarantineHash(planId)} data-testid="purge-open-quarantine"
+        onClick=${(e) => { if (e.ctrlKey || e.metaKey || e.shiftKey || e.button) return; e.preventDefault(); ctx.nav(quarantineHash(planId)); }}>${t('qr.openLink')}</a></div>`}
     ${phase === 'later' && html`<button class="btn btn-small" data-testid="purge-undo-later" onClick=${() => setPhase('idle')}>${t('purge.reconsider')}</button>`}
     ${(phase === 'dialog' || (phase === 'running' && typed)) && html`<${Modal} label=${t('purge.title')} onClose=${() => setPhase('idle')} testid="purge-dialog"
       dismissable=${phase !== 'running'} initialFocus="input">
@@ -446,7 +451,7 @@ function PlanReview({ id }) {
       </div>`}
       ${phase === 'closed' && html`<div class="banner banner-info pl-banner" data-testid="plan-closed" role="note"><${Icon} name="info" size=${16} />
         <span>${t('err.PLAN_CLOSED', { plan: id, plan_status: t(`pstatus.${closed.status}`, null, closed.status) })}
-          ${closed.status === 'failed' ? ` ${t('prog.failedHelp', { id })}` : ''}</span></div>`}
+          ${closed.status === 'failed' ? html` <${FailedHelp} planId=${id} />` : ''}</span></div>`}
       ${phase === 'review' && ctx.outdated && html`<div class="banner banner-warn" data-testid="outdated-note">
         <${Icon} name="alert" size=${16} /><span>${t('catalog.blocked')}</span>
         ${config.approvals_enabled && html`<button class="btn btn-small" data-testid="outdated-rescan" onClick=${run.rescan}>
@@ -454,6 +459,8 @@ function PlanReview({ id }) {
       ${afterRun && html`<${ProgressBox} phase=${phase} job=${run.job} prog=${run.prog} planId=${id} error=${run.error} />`}
       ${plan && plan.kind === 'release' && (phase === 'done' || phase === 'rescanned' || (phase === 'closed' && plan.status === 'done'))
         && html`<${PurgeBox} key=${id} plan=${plan} planId=${id} sim=${sim} />`}
+      ${plan && plan.kind !== 'release' && (['done', 'failed'].includes(status) || phase === 'rescanned')
+        && html`<${PlanQuarantineBox} key=${id + ':' + status + ':' + phase} planId=${id} />`}
       ${plan && sim && Object.keys(sim).length > 0 && html`
         <section class="cards" data-testid="plan-summary">
           <${Card} id="ops" label=${t('plans.card.ops')} value=${fmtNum(opsTotal)} />

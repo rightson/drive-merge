@@ -1252,3 +1252,182 @@ def test_connecting_is_a_human_only_command(argv, run, trun, monkeypatch, no_inp
 def test_connections_without_any(run):
     rc, out, _ = run("connections")
     assert rc == 0 and "No connections yet" in out
+
+
+# ------------------------------------------------------------------------ quarantine (docs/QUARANTINE.md section D)
+
+def _park(env, *, days_ago=40, files=("Docs/old.pdf",), kind="dedupe", remote="alpha"):
+    """A finished plan whose deletes wait in quarantine on `remote`; returns (plan id, [op ids])."""
+    from datetime import datetime, timedelta, timezone
+    when = (datetime.now(timezone.utc) - timedelta(days=days_ago)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    conn = db.connect(env.db_path)
+    try:
+        rid = conn.execute("SELECT id FROM remotes WHERE name = ?", (remote,)).fetchone()[0]
+        pid = conn.execute(
+            "INSERT INTO plans(title, kind, status, created_by, params, created_at, finished_at) "
+            "VALUES ('parked', ?, 'done', 'mcp', '{}', ?, ?) RETURNING id", (kind, when, when)).fetchone()[0]
+        ops = []
+        for seq, path in enumerate(files, start=1):
+            op = conn.execute(
+                "INSERT INTO plan_ops(plan_id, seq, op, src_remote_id, src_path, witness_remote_id, witness_path, "
+                "expect_size, reason, status, executed_at) VALUES (?, ?, 'delete', ?, ?, ?, 'Docs/report.pdf', "
+                "2048, 'duplicate', 'done', ?) RETURNING id", (pid, seq, rid, path, rid, when)).fetchone()[0]
+            conn.execute("INSERT INTO journal(ts, plan_id, op_id, action, detail) VALUES (?, ?, ?, 'quarantine', '{}')",
+                         (when, pid, op))
+            ops.append(op)
+        return pid, ops
+    finally:
+        conn.close()
+
+
+def test_quarantine_prints_what_is_held_per_cloud_and_plan(env, catalog_db, run):
+    rc, out, _ = run("quarantine")
+    assert rc == 0 and "Nothing in quarantine." in out
+    pid, ops = _park(env, files=("Docs/old.pdf", "Docs/older.pdf"))
+    rc, out, _ = run("quarantine")
+    assert rc == 0
+    assert "2 file(s)" in out and "4.0 KiB" in out and "past the 30-day retention" in out
+    assert "alpha" in out and "dedupe" in out and "drivemerge quarantine show PLAN" in out
+    assert "Nothing is ever deleted on a timer" in out
+    rc, out, _ = run("--json", "quarantine")
+    report = json.loads(out)
+    assert rc == 0 and report["totals"]["files"] == 2 and report["plans"][0]["plan_id"] == pid
+    assert report["retention_days"] == 30 and report["plans"][0]["created_by"] == "mcp"
+
+
+def test_quarantine_show_lists_a_plans_files_with_their_op_ids_and_filters(env, catalog_db, run, jrun):
+    pid, ops = _park(env, files=("Docs/old.pdf", "Photos/older.jpg"))
+    rc, out, _ = run("quarantine", "show", str(pid))
+    assert rc == 0 and "2 held file(s)" in out
+    assert "Docs/old.pdf" in out and "Photos/older.jpg" in out and str(ops[0]) in out
+    assert "not-seen" in out, "the catalog never saw these quarantined copies"
+    assert "drivemerge plan restore PLAN --op OP" in out
+    rc, out, _ = run("quarantine", "show", str(pid), "--prefix", "Photos")
+    assert "Photos/older.jpg" in out and "Docs/old.pdf" not in out
+    rc, out, _ = run("quarantine", "show", str(pid), "--state", "restored")
+    assert rc == 0 and "0 restored file(s)" in out
+    rc, data = jrun("quarantine", "show", str(pid), "--remote", "alpha", "--limit", "1")
+    assert rc == 0 and data["total"] == 2 and len(data["items"]) == 1 and data["items"][0]["op_id"] == ops[0]
+    rc, out, _ = run("quarantine", "show", str(pid), "--limit", "1")
+    assert "1 more (--offset 1)" in out
+    rc, _, err = run("quarantine", "show", "999")
+    assert rc == 1 and "no plan 999" in err
+    rc, _, err = run("quarantine", "show", str(pid), "--state", "everything")
+    assert rc == 2
+    rc, _, err = run("quarantine", "show", str(pid), "--remote", "nosuch")
+    assert rc == 1 and "unknown cloud" in err
+
+
+def test_quarantine_commands_are_read_only_and_need_no_terminal(env, catalog_db, run, no_input, monkeypatch):
+    pid, _ = _park(env)
+    spies = _spy_gated(monkeypatch)
+    for argv in (("quarantine",), ("quarantine", "show", str(pid)), ("--json", "quarantine")):
+        assert run(*argv)[0] == 0
+    assert not any(spies.values())
+
+
+def test_plan_restore_takes_chosen_ops_and_checks_them_after_the_human_check(env, catalog_db, run, trun, no_input,
+                                                                            monkeypatch):
+    pid, ops = _park(env, files=("Docs/old.pdf", "Docs/older.pdf"))
+    restore = record(monkeypatch, "restore", {"plan_id": pid, "status": "done", "done": 1, "failed": 0, "skipped": 0,
+                                              "error": None})
+    # no terminal: refused before anything about the ops is looked at
+    rc, _, err = run("plan", "restore", str(pid), "--op", "999999")
+    assert rc == 2 and "interactive terminal" in err and not restore
+    # a terminal: a stranger's op id is refused, never passed on
+    prompts = typed(monkeypatch, f"restore {pid}")
+    rc, _, err = trun("plan", "restore", str(pid), "--op", str(ops[0]), "--op", "999999")
+    assert rc == 1 and "999999" in err
+    assert not restore and not prompts
+    rc, out, _ = trun("plan", "restore", str(pid), "--op", str(ops[1]), "--op", str(ops[1]))
+    assert rc == 0 and restore == [((pid,), {"op_ids": [ops[1]]})]
+    assert "1 chosen file(s)" in prompts[0] and f'Type "restore {pid}"' in prompts[0]
+
+
+def test_plan_purge_takes_chosen_ops_and_defaults_to_the_configured_retention(env, catalog_db, run, trun, monkeypatch):
+    pid, ops = _park(env, files=("Docs/old.pdf", "Docs/older.pdf"))
+    purge = record(monkeypatch, "purge", {"plan_id": pid, "status": "done", "done": 1, "failed": 0, "skipped": 0,
+                                          "error": None})
+    typed(monkeypatch, f"purge {pid}", f"purge {pid}", f"purge {pid}")
+    assert trun("plan", "purge", str(pid))[0] == 0
+    assert purge[-1] == ((pid,), {"older_than_days": 30})
+    assert trun("plan", "purge", str(pid), "--older-than-days", "0", "--op", str(ops[0]))[0] == 0
+    assert purge[-1] == ((pid,), {"older_than_days": 0, "op_ids": [ops[0]]})
+    env.config.write_text(env.config.read_text().replace("[safety]\n", "[safety]\nquarantine_retention_days = 9\n"))
+    assert trun("plan", "purge", str(pid))[0] == 0
+    assert purge[-1] == ((pid,), {"older_than_days": 9}), "[safety] quarantine_retention_days is the default"
+
+
+def test_plan_purge_refuses_an_op_that_is_not_a_held_item(env, catalog_db, trun, monkeypatch):
+    pid, ops = _park(env)
+    purge = record(monkeypatch, "purge", {"status": "done"})
+    prompts = typed(monkeypatch, f"purge {pid}")
+    rc, _, err = trun("plan", "purge", str(pid), "--op", "424242")
+    assert rc == 1 and "424242" in err and not purge and not prompts
+
+
+def test_purge_due_is_human_only_and_needs_the_word_purge(env, catalog_db, run, trun, no_input, monkeypatch):
+    _park(env)
+    purge_due = record(monkeypatch, "purge_due", {"plans": [], "done": 0, "failed": 0, "skipped": 0, "error": None})
+    rc, _, err = run("quarantine", "purge-due", config=env.config_enabled)
+    assert rc == 2 and "interactive terminal" in err and not purge_due
+    for one_side in ((True, False), (False, True)):
+        with monkeypatch.context() as m:
+            m.setattr(sys.stdin, "isatty", lambda v=one_side[0]: v, raising=False)
+            m.setattr(sys.stdout, "isatty", lambda v=one_side[1]: v, raising=False)
+            assert run("quarantine", "purge-due", config=env.config_enabled)[0] == 2
+    monkeypatch.setenv("CLAUDECODE", "1")
+    rc, _, err = trun("quarantine", "purge-due", config=env.config_enabled)
+    assert rc == 2 and "AI agent" in err and not purge_due
+
+
+def test_purge_due_asks_for_the_word_shows_what_is_due_and_passes_the_cloud(env, catalog_db, trun, monkeypatch):
+    _park(env, files=("Docs/old.pdf", "Docs/older.pdf"))
+    _park(env, days_ago=3, files=("Docs/new.pdf",))
+    result = {"plans": [{"plan_id": 1, "status": "done", "done": 2, "failed": 0, "skipped": 0, "failures": [],
+                         "error": None}], "done": 2, "failed": 0, "skipped": 0, "error": None}
+    purge_due = record(monkeypatch, "purge_due", result)
+    prompts = typed(monkeypatch, "yes", "purge 1", "purge", "purge")
+    rc, _, err = trun("quarantine", "purge-due", config=env.config_enabled)
+    assert rc == 1 and not purge_due, "the word is exactly `purge`"
+    assert trun("quarantine", "purge-due", config=env.config_enabled)[0] == 1 and not purge_due
+    rc, out, _ = trun("quarantine", "purge-due", config=env.config_enabled)
+    assert rc == 0 and purge_due == [((), {"remote": None})]
+    assert "2 file(s)" in prompts[2] and 'Type "purge"' in prompts[2] and "deleted for good" in prompts[2]
+    assert "Purged 2 file(s) from 1 plan(s)" in out and "alpha" in out and "30 day" in out
+    rc, out, _ = trun("quarantine", "purge-due", "--remote", "alpha", config=env.config_enabled)
+    assert rc == 0 and purge_due[-1] == ((), {"remote": "alpha"})
+
+
+def test_purge_due_reports_failures_and_exits_non_zero(env, catalog_db, trun, monkeypatch):
+    _park(env)
+    record(monkeypatch, "purge_due", {"plans": [{"plan_id": 1, "status": "partial", "done": 0, "failed": 1,
+                                                 "skipped": 0, "failures": [], "error": "witness gone"}],
+                                      "done": 0, "failed": 1, "skipped": 0, "error": "witness gone"})
+    typed(monkeypatch, "purge")
+    rc, out, err = trun("quarantine", "purge-due", config=env.config_enabled)
+    assert rc == 1 and "1 failed" in out and "witness gone" in err
+
+
+def test_purge_due_with_nothing_due_or_with_execution_off_does_not_prompt(env, catalog_db, trun, no_input,
+                                                                        monkeypatch):
+    purge_due = record(monkeypatch, "purge_due", {})
+    rc, out, _ = trun("quarantine", "purge-due", config=env.config_enabled)
+    assert rc == 0 and "Nothing in quarantine is past its retention period." in out and not purge_due
+    _park(env, days_ago=2)
+    rc, out, _ = trun("quarantine", "purge-due", config=env.config_enabled)
+    assert rc == 0 and "Nothing in quarantine is past" in out
+    _park(env)
+    rc, _, err = trun("quarantine", "purge-due")                     # execution disabled
+    assert rc == 1 and "execution is disabled" in err and not purge_due
+    rc, _, err = trun("quarantine", "purge-due", "--remote", "nosuch", config=env.config_enabled)
+    assert rc == 1 and "nosuch" in err and not purge_due
+
+
+def test_purge_due_is_denied_to_agents_in_the_project_settings():
+    settings = json.loads((Path(__file__).parent.parent / ".claude" / "settings.json").read_text())
+    deny = settings["permissions"]["deny"]
+    assert "Bash(drivemerge quarantine purge-due:*)" in deny and "Bash(*drivemerge quarantine purge-due*)" in deny
+    assert not settings["permissions"].get("allow")
+    for restore in ("Bash(drivemerge plan restore:*)", "Bash(drivemerge plan purge:*)"):
+        assert restore in deny

@@ -1912,7 +1912,9 @@ def test_the_quarantine_folder_is_drawn_apart_and_is_neither_draggable_nor_a_dro
     expect(q).to_have_attribute("draggable", "false")
     assert q.get_attribute("data-droptarget") is None
     tip = q.get_attribute("title")
-    assert "drivemerge plan restore" in tip and "drivemerge plan purge" in tip and QUARANTINE in tip
+    # With approvals the Quarantine view restores and purges, so the tooltip points there (docs/QUARANTINE.md section 7);
+    # tests/test_ui_quarantine.py keeps the terminal wording for the read-only page.
+    assert "隔離區」頁面" in tip and "drivemerge plan" not in tip and QUARANTINE in tip
     assert q.get_by_test_id("quarantine-label").get_attribute("title") == tip   # the label itself carries it too
     assert ui.node("left", "gdrive:研究").get_attribute("title") is None        # ordinary folders have no such tooltip
     posts = len(ui.mock.calls_to("POST", "/v1/drafts/1/actions"))
@@ -1933,7 +1935,7 @@ def test_the_quarantine_folder_is_drawn_apart_and_is_neither_draggable_nor_a_dro
     inner = ui.node("left", f"gdrive:{QUARANTINE}/7/學校")
     expect(inner).to_have_attribute("data-quarantine", "inside")
     expect(inner).to_have_attribute("draggable", "false")
-    assert "drivemerge plan restore" in inner.get_attribute("title")
+    assert "隔離區" in inner.get_attribute("title") and "drivemerge plan" not in inner.get_attribute("title")
     expect(ui.node("left", f"gdrive:{QUARANTINE}/7/scan.zip")).to_have_attribute("draggable", "false")
     ui.drag(("left", f"gdrive:{QUARANTINE}/7/scan.zip"), ("right", "dropbox:學校"))
     ui.drag(("left", "gdrive:研究/資料"), ("left", f"gdrive:{QUARANTINE}/7/學校"))
@@ -1987,7 +1989,8 @@ def test_a_refusal_from_the_server_about_the_quarantine_folder_is_explained(make
     ui.mock.force_error = ("QUARANTINE", "the quarantine folder holds deleted files")
     ui.drag(("left", "gdrive:研究/資料"), ("right", "dropbox:學校"))
     toast = ui.page.get_by_test_id("toast").filter(has_text="隔離區")
-    expect(toast).to_contain_text("drivemerge plan restore")
+    expect(toast).to_contain_text("隔離區」頁面")                                # approvals on: the view, not the terminal
+    expect(toast).not_to_contain_text("drivemerge plan restore")
     expect(ui.page.get_by_test_id("staged-count")).to_have_text("0")
 
 
@@ -3685,7 +3688,7 @@ def _query(ui: Ui) -> dict:
 def test_plans_sits_between_compare_and_the_workspace_and_alt_5_opens_it(make_ui):
     ui = make_ui(locale="en-US").open()
     order = ui.page.eval_on_selector_all('[data-testid="rail"] a', "els => els.map(e => e.dataset.testid)")
-    assert order == ["rail-clouds", "rail-overview", "rail-explore", "rail-compare", "rail-plans", "rail-workspace"]
+    assert order == ["rail-clouds", "rail-overview", "rail-explore", "rail-compare", "rail-plans", "rail-quarantine", "rail-workspace"]
     ui.page.keyboard.press("Alt+5")
     expect(ui.tid("rail-plans")).to_have_attribute("aria-current", "page")
     expect(ui.tid("view-plans")).to_be_visible()

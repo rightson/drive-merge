@@ -34,8 +34,8 @@ import sqlite3
 import tempfile
 import unicodedata
 import uuid
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Collection
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -49,7 +49,20 @@ _TS_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"   # db.utcnow(): fixed width, so strings co
 
 
 class ExecutionError(Exception):
-    pass
+    """Execution cannot start. `code` / `params` are set for the refusals a page words itself (PLAN_EXECUTING)."""
+
+    code: str | None = None
+    params: dict = {}
+
+    def __init__(self, *args: object, code: str | None = None, **params: object):
+        super().__init__(*args)
+        if code is not None:
+            self.code = code
+        self.params = params
+
+
+def _plan_executing(plan_id: int) -> ExecutionError:
+    return ExecutionError(f"plan {plan_id} is executing; wait for it to finish", code="PLAN_EXECUTING", plan=plan_id)
 
 
 class ExecutionDisabled(ExecutionError):
@@ -64,10 +77,26 @@ class ExecResult:
     failed: int = 0
     skipped: int = 0
     error: str | None = None
+    # restore and purge only: one entry per item that stayed, at most MAX_FAILURES,
+    # {op_id, seq, remote, path (the original path), code, params, error}
+    failures: list[dict] = field(default_factory=list)
+
+
+MAX_FAILURES = 200
 
 
 class _OpFailed(Exception):
-    """An op cannot run or did not verify; the message is stored as plan_ops.error."""
+    """An op cannot run or did not verify; the message is stored as plan_ops.error.
+
+    `code` and `params` let a page word the failure in its own language (restore and purge failures are
+    reported with them): ORIGINAL_TAKEN, QUARANTINE_GONE, READ_ONLY, BAD_PATH, VERIFY_FAILED,
+    NO_WITNESS_RECORD, WITNESS_UNPROVEN; anything else is OP_FAILED with no params.
+    """
+
+    def __init__(self, message: str = "", code: str = "OP_FAILED", **params: object):
+        super().__init__(message)
+        self.code = code
+        self.params = params
 
 
 # --------------------------------------------------------------------------- #
@@ -226,7 +255,8 @@ class _Run:
         """The rclone path the executor may modify on this remote, or fail the op."""
         name, rc, _ = self.remote(rid)
         if not rc.write:
-            raise _OpFailed(f"{what} remote {name!r} is read-only (no write remote configured)")
+            raise _OpFailed(f"{what} remote {name!r} is read-only (no write remote configured)",
+                            "READ_ONLY", remote=name)
         return rc.write
 
     # ------------------------------------------------------------- live state
@@ -574,39 +604,46 @@ class _Run:
 
     def restore(self, op: Op) -> None:
         rid = op.src_remote_id
-        if problem := _path_problem(op.src_path):
-            raise _OpFailed(f"original path {op.src_path!r} {problem}")
         name = self.name(rid)
+        if problem := _path_problem(op.src_path):
+            raise _OpFailed(f"original path {op.src_path!r} {problem}", "BAD_PATH", path=op.src_path)
         qpath = quarantine_path(self.config, self.plan_id, op.src_path)
         if not _inside_quarantine(self.config, self.plan_id, qpath):
-            raise _OpFailed(f"refusing quarantine path {qpath!r}")
+            raise _OpFailed(f"refusing quarantine path {qpath!r}", "BAD_PATH", path=qpath)
         write = self.writable(rid, "restore")
         held = self.probe("quarantined copy", rid, qpath)
         if held is None:
-            raise _OpFailed(f"quarantined copy {name}:{qpath} is gone (purged or moved)")
+            raise _OpFailed(f"quarantined copy {name}:{qpath} is gone (purged or moved)",
+                            "QUARANTINE_GONE", remote=name, path=op.src_path)
         taken = self.probe("original location", rid, op.src_path)
         if taken is not None:
-            raise _OpFailed(f"original path {taken.loc} is occupied; nothing was overwritten")
+            raise _OpFailed(f"original path {taken.loc} is occupied; nothing was overwritten",
+                            "ORIGINAL_TAKEN", remote=name, path=op.src_path)
         self.log("intent", op, kind="restore", remote=name, **{"from": qpath, "to": op.src_path})
         self.rclone.moveto(write, qpath, write, op.src_path)
         back = self.probe("restored file", rid, op.src_path)
         if back is None:
-            raise _OpFailed(f"{name}:{op.src_path} is missing after the restore")
-        self.same_object(held, back, "restored file")
+            raise _OpFailed(f"{name}:{op.src_path} is missing after the restore",
+                            "VERIFY_FAILED", remote=name, path=op.src_path)
+        try:
+            self.same_object(held, back, "restored file")
+        except _OpFailed as e:
+            raise _OpFailed(str(e), "VERIFY_FAILED", remote=name, path=op.src_path) from e
         if self.probe("quarantined copy", rid, qpath) is not None:
-            raise _OpFailed(f"{name}:{qpath} is still in quarantine after the restore")
+            raise _OpFailed(f"{name}:{qpath} is still in quarantine after the restore",
+                            "VERIFY_FAILED", remote=name, path=op.src_path)
         self.log("restore", op, status="restored", remote=name, **{"from": qpath, "to": op.src_path})
 
     def purge(self, op: Op) -> bool:
         """Delete one quarantined file. False when it was already gone."""
         rid = op.src_remote_id
-        if problem := _path_problem(op.src_path):
-            raise _OpFailed(f"original path {op.src_path!r} {problem}")
         name = self.name(rid)
+        if problem := _path_problem(op.src_path):
+            raise _OpFailed(f"original path {op.src_path!r} {problem}", "BAD_PATH", path=op.src_path)
         qpath = quarantine_path(self.config, self.plan_id, op.src_path)
         if not _inside_quarantine(self.config, self.plan_id, qpath):
             raise _OpFailed(f"refusing to purge {name}:{qpath}: not inside {_quarantine_root(self.config)}"
-                            f"/{self.plan_id}/")
+                            f"/{self.plan_id}/", "BAD_PATH", path=qpath)
         write = self.writable(rid, "purge")
         held = self.probe("quarantined copy", rid, qpath)
         if held is None:
@@ -617,17 +654,20 @@ class _Run:
         else:  # a move that met identical content: the destination vouches
             wit_rid, wit_path = op.dst_remote_id, op.dst_path
         if wit_rid is None or not wit_path:
-            raise _OpFailed(f"{name}:{qpath} is kept: the op names no surviving copy")
+            raise _OpFailed(f"{name}:{qpath} is kept: the op names no surviving copy",
+                            "NO_WITNESS_RECORD", remote=name, path=op.src_path)
         if problem := _path_problem(wit_path):
-            raise _OpFailed(f"{name}:{qpath} is kept: witness path {wit_path!r} {problem}")
+            raise _OpFailed(f"{name}:{qpath} is kept: witness path {wit_path!r} {problem}", "BAD_PATH", path=wit_path)
         try:
             self.require_same(op, held, self._witness(wit_rid, wit_path, held), "witness re-check before purge")
         except _OpFailed as e:
-            raise _OpFailed(f"{name}:{qpath} is kept: {e}") from e
+            raise _OpFailed(f"{name}:{qpath} is kept: {e}", "WITNESS_UNPROVEN", remote=name, path=op.src_path,
+                            witness=f"{self.name(wit_rid)}:{wit_path}") from e
         self.log("intent", op, kind="purge", remote=name, path=qpath)
         self.rclone.deletefile(write, qpath)
         if self.probe("quarantined copy", rid, qpath) is not None:
-            raise _OpFailed(f"{name}:{qpath} is still there after the purge")
+            raise _OpFailed(f"{name}:{qpath} is still there after the purge",
+                            "VERIFY_FAILED", remote=name, path=op.src_path)
         self.log("purge", op, status="purged", remote=name, path=qpath)
         return True
 
@@ -740,38 +780,67 @@ def _quarantined_ops(conn: sqlite3.Connection, plan: plans.Plan) -> list[Op]:
     return [o for o in plan.ops if o.status == "done" and (o.op == "delete" or (o.op == "move" and o.id in parked))]
 
 
-def restore_plan(conn: sqlite3.Connection, rclone: Rclone, config: Config, plan_id: int) -> ExecResult:
+def _record_failure(result: ExecResult, run: _Run, op: Op, exc: Exception) -> str:
+    """Count a failed restore / purge item; keeps at most MAX_FAILURES details. Returns the English text."""
+    text = _failure_text(exc)
+    result.failed += 1
+    result.error = result.error or f"{_describe(run, op)}: {text}"
+    if len(result.failures) < MAX_FAILURES:
+        coded = isinstance(exc, _OpFailed)
+        result.failures.append({
+            "op_id": op.id, "seq": op.seq, "remote": run.name(op.src_remote_id), "path": op.src_path,
+            "code": exc.code if coded else "OP_FAILED", "params": dict(exc.params) if coded else {},
+            "error": text})
+    return text
+
+
+def _selected(ops: list[Op], op_ids: Collection[int] | None) -> list[Op]:
+    """The quarantined ops a caller asked for; an id that is not one of them is ignored, never acted on."""
+    if op_ids is None:
+        return ops
+    wanted = set(op_ids)
+    return [o for o in ops if o.id in wanted]
+
+
+def restore_plan(conn: sqlite3.Connection, rclone: Rclone, config: Config, plan_id: int, *,
+                 op_ids: Collection[int] | None = None,
+                 progress: Callable[[int, int, int], None] | None = None) -> ExecResult:
     """Move every quarantined file of this plan back to its original path (newest delete first).
 
     An original path that is taken again is a failure for that file only: it
     stays in quarantine and the rest are still restored. A restored op
     is marked 'skipped' so a second restore, a purge or a resume ignores it.
+    `op_ids` restricts the run to those quarantined ops (anything else is ignored);
+    `progress(done, failed, total)` is called after each item.
     """
     _require_enabled(config)
     plan = plans.get_plan(conn, plan_id)
     if plan.status == "executing":
-        raise ExecutionError(f"plan {plan_id} is executing; wait for it to finish")
+        raise _plan_executing(plan_id)
     result = ExecResult(plan_id, "done")
     run = _Run(conn, rclone, config, plan_id)
-    for op in sorted(_quarantined_ops(conn, plan), key=lambda o: o.seq, reverse=True):
+    todo = sorted(_selected(_quarantined_ops(conn, plan), op_ids), key=lambda o: o.seq, reverse=True)
+    for op in todo:
         failure = None
         try:
             run.restore(op)
         except Exception as e:
-            failure = _failure_text(e)
+            failure = e
         if failure is None:
             plans.set_op_status(conn, op.id, "skipped", "restored from quarantine")
             result.done += 1
-            continue
-        run.log("restore", op, status="failed", error=failure)
-        result.failed += 1
-        result.error = result.error or f"{_describe(run, op)}: {failure}"
+        else:
+            run.log("restore", op, status="failed", error=_record_failure(result, run, op, failure))
+        if progress:
+            progress(result.done, result.failed, len(todo))
     result.status = "done" if result.failed == 0 else "partial"
     return result
 
 
 def purge_quarantine(conn: sqlite3.Connection, rclone: Rclone, config: Config, plan_id: int, *,
-                     older_than_days: int = 30, tmpdir: str | Path | None = None) -> ExecResult:
+                     older_than_days: int = 30, tmpdir: str | Path | None = None,
+                     op_ids: Collection[int] | None = None,
+                     progress: Callable[[int, int, int], None] | None = None) -> ExecResult:
     """Permanently delete quarantined files of this plan that were quarantined long enough ago.
 
     Only files of ops that quarantined their source ('done' deletes, and moves onto identical
@@ -779,39 +848,48 @@ def purge_quarantine(conn: sqlite3.Connection, rclone: Rclone, config: Config, p
     files left alone (too recent, or already gone). A file is purged only if what vouched for it
     (the delete's witness, the move's destination) still exists live and is proven identical now,
     since the quarantined copy may have become the last one; otherwise it fails and stays.
+    `op_ids` restricts the run to those quarantined ops (anything else is ignored); `progress(done, failed,
+    total)` is called after each item old enough to be attempted, `done` counting those purged or already gone.
     """
     _require_enabled(config)
     if older_than_days < 0:
         raise ExecutionError("older_than_days must not be negative")
     plan = plans.get_plan(conn, plan_id)
     if plan.status == "executing":
-        raise ExecutionError(f"plan {plan_id} is executing; wait for it to finish")
+        raise _plan_executing(plan_id)
     cutoff = (datetime.now(timezone.utc) - timedelta(days=older_than_days)).strftime(_TS_FORMAT)
     executed = {r[0]: r[1] for r in conn.execute(
         "SELECT id, executed_at FROM plan_ops WHERE plan_id = ? AND status = 'done'", (plan_id,))}
     result = ExecResult(plan_id, "done")
+    chosen = _selected(_quarantined_ops(conn, plan), op_ids)
+    todo = []
+    for op in chosen:
+        if executed[op.id] is None or executed[op.id] >= cutoff:
+            result.skipped += 1
+        else:
+            todo.append(op)
     with contextlib.ExitStack() as stack:
         # Proving a witness identical may mean downloading something, and that needs scratch space.
         tmp = Path(tmpdir) if tmpdir is not None else Path(stack.enter_context(
             tempfile.TemporaryDirectory(prefix="drivemerge-purge-")))
         tmp.mkdir(parents=True, exist_ok=True)
         run = _Run(conn, rclone, config, plan_id, tmp)
-        for op in _quarantined_ops(conn, plan):
-            if executed[op.id] is None or executed[op.id] >= cutoff:
-                result.skipped += 1
-                continue
+        settled = 0
+        for op in todo:
             failure = None
             try:
                 purged = run.purge(op)
             except Exception as e:
-                failure = _failure_text(e)
+                failure = e
             if failure is not None:
-                run.log("purge", op, status="failed", error=failure)
-                result.failed += 1
-                result.error = result.error or f"{_describe(run, op)}: {failure}"
-            elif purged:
-                result.done += 1
+                run.log("purge", op, status="failed", error=_record_failure(result, run, op, failure))
             else:
-                result.skipped += 1
+                settled += 1
+                if purged:
+                    result.done += 1
+                else:
+                    result.skipped += 1
+            if progress:
+                progress(settled, result.failed, len(todo))
     result.status = "done" if result.failed == 0 else "partial"
     return result
