@@ -40,7 +40,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from . import __version__, connections, plans, quarantine
 from .api import (
-    LOOPBACK_HOSTS, QuotaCache, bearer_ok, build_router, install_error_handlers, scrub_secrets,
+    LOOPBACK_HOSTS, bearer_ok, build_router, install_error_handlers, scrub_secrets,
 )
 from .config import Config
 from .models import Op, Plan
@@ -445,12 +445,12 @@ def create_ui_app(service: Service, *, config: Config, api_token: str, ui_token:
     sessions = _Sessions()
     jobs = _Jobs()
     web = _web_root()
-    quotas = QuotaCache()
+    quotas = service.quotas  # the simulator checks free space from the same cache the page fills
 
     def job_service() -> Service:
         """A service for a job thread: its own catalog connection and rclone, the same config object and file,
         so reload_config in a job reads the right file and clouds connected meanwhile are seen."""
-        return Service(service.config, config_path=service.config_path)
+        return Service(service.config, config_path=service.config_path, quotas=quotas)
 
     app = FastAPI(title="drive-merge workspace", version=__version__,
                   docs_url=None, redoc_url=None, openapi_url=None)
@@ -740,8 +740,7 @@ def create_ui_app(service: Service, *, config: Config, api_token: str, ui_token:
             stale = _stale_reason(service.conn, plan)
             if stale:
                 raise UiError(409, "STALE_PREVIEW", f"{stale}; preview the draft again before approving", plan=plan_id)
-            plans.approve_plan(service.conn, plan_id, body.code.strip().lower(),
-                               approved_by=f"ui:{_current_user()}")
+            service.approve(plan_id, body.code.strip().lower(), approved_by=f"ui:{_current_user()}")
         return {"ok": True}
 
     @human.post("/v1/ui/plans/{plan_id}/execute", status_code=202)
@@ -763,6 +762,7 @@ def create_ui_app(service: Service, *, config: Config, api_token: str, ui_token:
             if stale:
                 raise UiError(409, "STALE_PREVIEW", f"{stale}; preview and approve it again before executing",
                               plan=plan_id)
+            service.require_room(plan_id)
 
         def work(job: _Job) -> tuple[Any, str | None]:
             svc = job_service()  # own connection and rclone: this thread never touches the request connection

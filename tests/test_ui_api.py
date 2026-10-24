@@ -1174,3 +1174,41 @@ def test_run_ui_brackets_an_ipv6_host_in_the_url(launched, tmp_path, monkeypatch
     ui_api.run_ui(_run_config(tmp_path), host="::1", open_browser=False)
     assert "http://[::1]:8765/ui/#token=" in capsys.readouterr().out
     assert launched["host"] == "::1"
+
+
+# ----------------------------------------------------------------- free space at approval and execution
+
+def _free(service, name, free):
+    service.quotas.put(name, {"ok": True, "quota": {"used": 1, "total": 1 + free, "free": free}})
+
+
+def test_approve_refuses_when_the_page_now_knows_too_little_free_space(browser, service):
+    client, headers = browser
+    pid, code = _simulated_plan(service.conn, service)       # writes 500 bytes into dropbox
+    _free(service, "dropbox", 499)                            # e.g. the Clouds view fetched it meanwhile
+    r = client.post(f"/v1/ui/plans/{pid}/approve", headers=headers, json={"code": code})
+    assert r.status_code == 400 and "simulate again" in r.json()["error"]
+    assert plans.get_plan(service.conn, pid, with_ops=False).status == "simulated"
+
+
+def test_execute_refuses_before_starting_a_job_when_free_space_shrank(browser, service, monkeypatch):
+    client, headers = browser
+    fake = _Executor(monkeypatch)
+    pid = _approved_plan(service.conn, service)
+    _free(service, "dropbox", 0)
+    r = client.post(f"/v1/ui/plans/{pid}/execute", headers=headers)
+    assert r.status_code == 400 and "simulate again" in r.json()["error"]
+    assert fake.calls == []
+
+
+def test_a_job_service_reads_the_same_quota_cache_as_the_page(browser, service, monkeypatch):
+    client, headers = browser
+    _Executor(monkeypatch)
+    seen = []
+    real = Service.require_room
+    monkeypatch.setattr(Service, "require_room", lambda self, plan_id: (seen.append(self), real(self, plan_id))[1])
+    pid = _approved_plan(service.conn, service)
+    job = _wait(client, client.post(f"/v1/ui/plans/{pid}/execute", headers=headers).json()["job_id"])
+    assert job["status"] == "done"
+    assert [s is service for s in seen] == [True, False]      # the route's check, then the job's own service
+    assert seen[1].quotas is service.quotas
