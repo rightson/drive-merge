@@ -1,6 +1,6 @@
 // The rail and the router (docs/EXPLORE.md section F). The route lives in location.hash:
 //   #/overview   #/explore?q=...   #/compare?l=remote:path&r=remote:path   #/workspace
-//   #/setup   #/plans   #/plans/<id>   #/plans/new/dedupe?...   #/plans/new/consolidate?...   (docs/PLANS.md)
+//   #/plans   #/plans/<id>   #/plans/new/dedupe?...   #/plans/new/consolidate?...   (docs/PLANS.md)
 //   #/clouds   #/free/<remote>?path=...&keep=a,b   (docs/ONBOARDING.md)
 // No route (or the token exchange's #token=) means the workspace, so a page opened as before shows the workspace.
 import { html, useEffect, useState } from './vendor/htm-preact-standalone.mjs';
@@ -11,17 +11,14 @@ import { Overview } from './overview.js';
 import { Explore } from './explore.js';
 import { Compare } from './compare.js';
 import { Plans } from './plans.js';
-import { Setup } from './setup.js';
 import { Clouds } from './onboarding.js';
 import { Free } from './free.js';
 
-// The keys Alt+1 ... Alt+5 select, in order, and Alt+0 opens Setup; the rail shows Setup first and Plans between
-// Compare and the workspace.
+// The keys Alt+1 ... Alt+5 select, in order; the rail shows Plans between Compare and the workspace.
 export const VIEWS = ['overview', 'explore', 'compare', 'workspace', 'plans'];
-export const RAIL = ['setup', 'clouds', 'overview', 'explore', 'compare', 'plans', 'workspace'];
-const VIEW_ICON = { setup: 'setup', clouds: 'cloud', overview: 'chart', explore: 'search', compare: 'swap', workspace: 'columns', plans: 'plans' };
-const shortcutOf = (view) => (view === 'setup' ? 0 : VIEWS.indexOf(view) + 1);
-const ROUTE = /^\/(setup|clouds|overview|explore|compare|workspace)(?:\?(.*))?$/;
+export const RAIL = ['clouds', 'overview', 'explore', 'compare', 'plans', 'workspace'];
+const VIEW_ICON = { clouds: 'cloud', overview: 'chart', explore: 'search', compare: 'swap', workspace: 'columns', plans: 'plans' };
+const ROUTE = /^\/(clouds|overview|explore|compare|workspace)(?:\?(.*))?$/;
 const FREE_ROUTE = /^\/free\/([^/?]+)(?:\?(.*))?$/;
 const PLANS_ROUTE = /^\/plans((?:\/[^?]*)?)(?:\?(.*))?$/;
 
@@ -36,7 +33,8 @@ function plansPage(sub) {
 }
 
 export function parseHash(hash) {
-  const h = String(hash || '').replace(/^#/, '');
+  // The Setup screen is gone (docs/ONBOARDING.md section G): an old #/setup bookmark means the Clouds view.
+  const h = String(hash || '').replace(/^#/, '').replace(/^\/setup(?=$|\?)/, '/clouds');
   const m = ROUTE.exec(h);
   if (m) return { view: m[1], params: new URLSearchParams(m[2] || ''), hash: `#${h}`, explicit: true };
   const f = FREE_ROUTE.exec(h);
@@ -73,7 +71,10 @@ export function navigate(to, { replace = false } = {}) {
 export function useRoute() {
   const [hash, setHash] = useState(window.location.hash);
   useEffect(() => {
-    const on = () => setHash(window.location.hash);
+    // The Setup screen is gone: an old #/setup address is rewritten to #/clouds, also when it is typed while the page is open.
+    const old = () => /^#\/setup(?:\?|$)/.test(window.location.hash);
+    const on = () => { if (old()) navigate('#/clouds', { replace: true }); else setHash(window.location.hash); };
+    if (old()) navigate('#/clouds', { replace: true });
     listeners.add(on);
     window.addEventListener('hashchange', on);
     return () => { listeners.delete(on); window.removeEventListener('hashchange', on); };
@@ -85,15 +86,14 @@ export function useRoute() {
 
 const isTyping = (el) => !!el && (['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName) || el.isContentEditable);
 
-/** Alt+0 opens Setup, Alt+1 ... Alt+5 switch the other views; "/" jumps to the Explore box unless a text field has the keyboard. */
+/** Alt+1 ... Alt+5 switch views; "/" jumps to the Explore box unless a text field has the keyboard. */
 export function useShortcuts(route) {
   useEffect(() => {
     const onKey = (e) => {
       if (document.querySelector('.modal-backdrop')) return;
-      if (e.altKey && !e.ctrlKey && !e.metaKey && /^Digit[0-5]$/.test(e.code)) {
+      if (e.altKey && !e.ctrlKey && !e.metaKey && /^Digit[1-5]$/.test(e.code)) {
         e.preventDefault();
-        const digit = Number(e.code.slice(5));
-        const view = digit === 0 ? 'setup' : VIEWS[digit - 1];
+        const view = VIEWS[Number(e.code.slice(5)) - 1];
         navigate(remembered[view] || `#/${view}`);
         return;
       }
@@ -115,7 +115,7 @@ export function Rail({ route, waiting = 0 }) {
   return html`<nav class="rail" aria-label=${t('nav.label')} data-testid="rail">
     ${RAIL.map((view) => html`<a key=${view} class=${'rail-item' + (route.view === view ? ' on' : '')} href=${`#/${view}`}
       data-testid=${'rail-' + view} aria-current=${route.view === view ? 'page' : undefined}
-      title=${view === 'setup' || VIEWS.includes(view) ? `${t(`nav.${view}Tip`)} (Alt+${shortcutOf(view)})` : t(`nav.${view}Tip`)}
+      title=${VIEWS.includes(view) ? `${t(`nav.${view}Tip`)} (Alt+${VIEWS.indexOf(view) + 1})` : t(`nav.${view}Tip`)}
       onClick=${(e) => { if (e.ctrlKey || e.metaKey || e.shiftKey || e.button) return; e.preventDefault(); navigate(remembered[view] || `#/${view}`); }}>
       <${Icon} name=${VIEW_ICON[view]} size=${20} /><span class="rail-label">${t(`nav.${view}`)}</span>
       ${view === 'plans' && waiting > 0 && html`<span class="rail-badge" data-testid="rail-plans-badge" data-count=${waiting}
@@ -126,7 +126,6 @@ export function Rail({ route, waiting = 0 }) {
 
 /** The read-only views; the workspace is not here: it stays mounted by the App and is only hidden. */
 export function ViewHost({ route }) {
-  if (route.view === 'setup') return html`<${Setup} />`;
   if (route.view === 'clouds') return html`<${Clouds} />`;
   if (route.view === 'free') return html`<${Free} key=${route.remote} remote=${route.remote} params=${route.params} />`;
   if (route.view === 'overview') return html`<${Overview} />`;

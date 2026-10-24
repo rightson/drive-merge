@@ -344,7 +344,7 @@ export function Overview() {
         ${hasBars
     ? html`<${Intersections} data=${data} remotes=${remotes} measure=${measure} category=${category} onOpen=${openExplore} />`
     : html`<p class="empty-hint" data-testid="ov-empty">${t('ov.noData')}
-      <button class="link" data-testid="ov-setup-link" onClick=${() => ctx.nav('#/setup')}>${t('ov.setupLink')}</button></p>`}
+      <button class="link" data-testid="ov-clouds-link" onClick=${() => ctx.nav('#/clouds')}>${t('ov.cloudsLink')}</button></p>`}
       </section>`}
       <${Similar} items=${sims.items} state=${sims} remotes=${remotes}
         onCompare=${(a, b) => ctx.nav(compareHash({ remote: a.remote, path: a.path }, { remote: b.remote, path: b.path }))} />

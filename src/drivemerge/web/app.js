@@ -334,15 +334,6 @@ function App() {
   };
   const catalogRefreshed = () => { setOutdated(null); setTick((x) => x + 1); };
 
-  /** Setup added a cloud or finished a scan: fetch the cloud list again (colours, panes, Overview) and refresh the trees. */
-  const reloadConfig = async () => {
-    try {
-      const cfg = await api.config();
-      setConfig((prev) => ({ ...cfg, approvals_enabled: cfg.approvals_enabled === undefined ? prev.approvals_enabled : cfg.approvals_enabled }));
-      setTick((x) => x + 1);
-    } catch (e) { /* the next navigation shows the real problem */ }
-  };
-
   async function clearDraft() {
     const ok = await confirmDialog({
       title: t('staged.clearTitle'), message: t('staged.clearText'), okLabel: t('staged.clearOk'), danger: true,
@@ -442,21 +433,14 @@ function App() {
         setConfig(cfg);
         // A run that changed a cloud since its last scan: say so again after a reload, as the page did right after the run.
         if (cfg.outdated && cfg.outdated.length) setOutdated({ remotes: cfg.outdated });
-        // The connections decide where the page opens (no route, nothing connected: the Welcome screen). A server that
-        // does not know the route (older, or a test double) leaves the page as it was.
+        // The connections decide where the page opens: no route and nothing to work on yet (no cloud configured, or a
+        // cloud without a complete scan) is the Clouds view. A route in the address, or a server that does not answer
+        // or does not say `needed` (older, or a test double), leaves the page as it was.
         try {
           const data = await api.setup();
           setSetup({ loaded: true, data, error: null });
-          if (!window.location.hash && (data.first_run || (!(data.connections || []).length && !(cfg.remotes || []).length))) navigate('#/clouds', { replace: true });
+          if (!parseHash(window.location.hash).explicit && data.needed === true) navigate('#/clouds', { replace: true });
         } catch (e) { setSetup({ loaded: true, data: null, error: e }); }
-        // Still without a route after the Welcome check: Setup while there is nothing to work on yet (a cloud without
-        // a complete scan). A route in the address, or a server that does not answer or does not say `needed`, changes nothing.
-        if (!parseHash(window.location.hash).explicit) {
-          try {
-            const first = await api.setupState();
-            if (first && first.needed === true) navigate('#/setup', { replace: true });
-          } catch (e) { /* no Setup on this server: the workspace, as always */ }
-        }
         const list = await api.listDrafts();
         setDrafts(list);
         const saved = Number(safeStorage('get', DRAFT_KEY));
@@ -573,7 +557,7 @@ function App() {
   const ctx = {
     config, draft, toast, confirm: confirmDialog, prompt: promptDialog, reveal,
     stageMove, stageMkdir, stageMany, rename: renameItem, afterExecution, resolveClash,
-    outdated, markOutdated, catalogRefreshed, reloadConfig,
+    outdated, markOutdated, catalogRefreshed,
     setup, refreshSetup, sync, syncEpoch,
     plans: plansState, refreshPlans, openWorkspacePreview,
     nav: navigate, lang, switchLang, revealInWorkspace, openWorkspace: () => navigate('#/workspace'),
