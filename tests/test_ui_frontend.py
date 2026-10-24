@@ -621,6 +621,15 @@ class MockApi:
                 return 401, {"error": "missing or invalid credentials", "code": "UNAUTHENTICATED"}
             return 200, {"approvals_enabled": self.approvals_enabled, "execution_enabled": self.execution_enabled,
                          "remotes": self.remotes, "version": "0.1.0", "csrf": self.CSRF, "outdated": self.outdated}
+        if (method, path) == ("GET", "/v1/setup"):       # docs/ONBOARDING.md section D (tests/test_ui_onboarding.py mocks it in depth)
+            return 200, {"first_run": False, "config_path": "/home/u/.config/drive-merge/config.toml",
+                         "rclone": {"found": True, "path": "/usr/bin/rclone", "version": "1.75.0", "ok": True, "managed": False},
+                         "connections": [{"name": r["name"], "provider": r["provider"], "account": f"me@{r['name']}.example",
+                                          "read": True, "write": r["writable"], "writable": r["writable"], "created_at": "2024-01-01T00:00:00Z"}
+                                         for r in self.remotes],
+                         "providers": [{"key": "drive", "label": "Google Drive", "needs_client": True},
+                                       {"key": "onedrive", "label": "OneDrive", "needs_client": False},
+                                       {"key": "dropbox", "label": "Dropbox", "needs_client": False}]}
         if (method, path) == ("GET", "/v1/tree/roots"):
             return 200, {"roots": self.roots()}
         if (method, path) == ("GET", "/v1/tree"):
@@ -2715,6 +2724,9 @@ def test_a_rescan_from_the_finished_run_dialog_clears_the_banner_and_it_does_not
 def test_a_preview_made_while_the_catalog_is_out_of_date_cannot_be_approved_until_a_rescan(make_ui):
     ui = make_ui().open()
     _run_to_done(ui).get_by_test_id("preview-close").click()
+    # Closing the finished run swaps the applied draft for a fresh one and reloads both trees; a drag that starts
+    # meanwhile is swallowed (the layout moves under the mouse), so wait until the page is on the new draft.
+    expect(ui.page.get_by_test_id("draft-select")).to_have_value("2")
     ui.drag(("left", "gdrive:Photos"), ("right", "dropbox:Archive"))
     ui.page.get_by_test_id("preview-button").click()
     modal = ui.page.get_by_test_id("preview-modal")
@@ -3755,7 +3767,8 @@ def _query(ui: Ui) -> dict:
 def test_plans_sits_between_compare_and_the_workspace_and_alt_5_opens_it(make_ui):
     ui = make_ui(locale="en-US").open()
     order = ui.page.eval_on_selector_all('[data-testid="rail"] a', "els => els.map(e => e.dataset.testid)")
-    assert order == ["rail-setup", "rail-overview", "rail-explore", "rail-compare", "rail-plans", "rail-workspace"]
+    assert order == ["rail-setup", "rail-clouds", "rail-overview", "rail-explore", "rail-compare", "rail-plans",
+                     "rail-workspace"]
     ui.page.keyboard.press("Alt+5")
     expect(ui.tid("rail-plans")).to_have_attribute("aria-current", "page")
     expect(ui.tid("view-plans")).to_be_visible()
@@ -4284,7 +4297,7 @@ def test_a_server_that_does_not_know_setup_lands_on_the_workspace_and_the_rail_h
     ui = make_ui(locale="en-US").open()                       # /v1/ui/setup is not mocked: 404
     assert ui.page.evaluate("location.hash") == ""
     order = ui.page.eval_on_selector_all('[data-testid="rail"] a', "els => els.map(e => e.dataset.testid)")
-    assert order[0] == "rail-setup" and len(order) == 6
+    assert order[:2] == ["rail-setup", "rail-clouds"] and len(order) == 7
     expect(ui.tid("rail-setup")).to_have_attribute("title", re.compile(r"\(Alt\+0\)"))
     ui.page.keyboard.press("Alt+0")
     expect(ui.tid("view-setup")).to_be_visible()

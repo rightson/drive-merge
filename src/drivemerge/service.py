@@ -3,16 +3,17 @@
 Everything returns JSON-serialisable values. Methods are grouped by trust level:
 
 * read        — catalog queries, compare/coverage/explore and workspace trees; safe for anyone with access to the service
-* maintain    — scans, hash bridging and directory statistics; read-only on the clouds
+* maintain    — scans, syncs, hash bridging and directory statistics; read-only on the clouds
 * propose     — build and simulate plans, stage workspace drafts; writes only to the local catalog
-* human-only  — approve / execute / restore / purge. The MCP server and the
-                REST API never call these; the CLI gates them behind a TTY and
+* human-only  — approve / execute / restore / purge, and the connection facade (sign-in, writes, disconnect).
+                The MCP server and the REST API never call these; the CLI gates them behind a TTY and
                 the browser workspace behind its own session (ui_api).
 """
 
 from __future__ import annotations
 
 import dataclasses
+from datetime import datetime, timezone
 import sqlite3
 import tempfile
 import threading
@@ -23,12 +24,13 @@ from . import (
     builders, classify, compare, coverage, db, dirstats, executor, explore, identity, plans, search, simulate,
     suggest, workspace,
 )
-from .config import Config, provider_of, sync_remotes
+from .config import DEFAULT_CONFIG_PATH, Config, load_config, provider_of, sync_remotes
+from .connections import make_rclone
 from .models import Plan
 from .rclone import Rclone, RcloneError
 from .scanner import scan_remote
 
-PLAN_KINDS = ("dedupe", "consolidate", "reorganize", "manual")
+PLAN_KINDS = ("dedupe", "consolidate", "reorganize", "manual", "release")
 # Written only by workspace.preview; a proposer's params must never be able to claim a draft.
 RESERVED_PARAMS = ("draft_id", "draft_version")
 MAX_COMPARE_FILES = 100000
@@ -78,7 +80,7 @@ class Service:
     def __init__(self, config: Config, conn: sqlite3.Connection | None = None, rclone: Rclone | None = None,
                  config_path: str | Path | None = None):
         self.config = config
-        self.config_path = str(config_path) if config_path else None
+        self.config_path = config_path if config_path is not None else config.config_path
         self.conn = conn if conn is not None else db.connect(config.db_path)
         sync_remotes(self.conn, config)
         self.rclone = rclone or self._make_rclone(config)
@@ -87,20 +89,63 @@ class Service:
 
     @staticmethod
     def _make_rclone(config: Config) -> Rclone:
-        return Rclone(config.rclone_binary, config=config.rclone_config, extra_args=config.rclone_extra_args)
+        return make_rclone(config)
 
-    def reload_config(self, config: Config) -> None:
-        """Adopt a changed config (the setup screen added a cloud): sync its remotes into the catalog and rebuild
-        the rclone wrapper when its settings changed. A wrapper that was handed in (tests) is kept otherwise."""
-        old = self.config
-        self.config = config
-        sync_remotes(self.conn, config)
-        if (old.rclone_binary, old.rclone_config, old.rclone_extra_args) != (
-                config.rclone_binary, config.rclone_config, config.rclone_extra_args):
-            self.rclone = self._make_rclone(config)
+    def reload_config(self, config: Config | None = None) -> Config:
+        """Adopt a changed config, sync its remotes into the catalog and rebuild the rclone wrapper.
+
+        With `config` (the setup screen added a cloud): that object replaces `self.config`; the wrapper is rebuilt
+        only when its settings changed, so one that was handed in (tests) is kept otherwise.
+
+        Without it: re-read the merged config (config.toml plus connections.toml) so connections added while the
+        service runs become visible. `self.config` is updated in place, so every holder of it sees the new remotes,
+        and the Rclone is rebuilt (its config file may have changed). A config file that does not exist (tests, a
+        service built from an in-memory Config) leaves everything as it is."""
+        if config is not None:
+            old = self.config
+            self.config = config
+            sync_remotes(self.conn, config)
+            if (old.rclone_binary, old.rclone_config, old.rclone_extra_args) != (
+                    config.rclone_binary, config.rclone_config, config.rclone_extra_args):
+                self.rclone = self._make_rclone(config)
+            self.forget_rclone()
+            return config
+        path = Path(self.config_path).expanduser() if self.config_path else DEFAULT_CONFIG_PATH
+        if path.exists():
+            fresh = load_config(path)
+            for f in dataclasses.fields(Config):
+                setattr(self.config, f.name, getattr(fresh, f.name))
+        sync_remotes(self.conn, self.config)
+        self.rclone = self._make_rclone(self.config)
         self.forget_rclone()
+        return self.config
 
     # ---------------------------------------------------------------- read
+
+    def data_age(self, remote: str) -> dict:
+        """When `remote` was last listed completely: {remote, finished_at, age_seconds} (None when never)."""
+        row = self.conn.execute(
+            "SELECT MAX(s.finished_at) FROM scans s JOIN remotes r ON r.id = s.remote_id "
+            "WHERE r.name = ? AND s.status = 'complete'", (remote,)).fetchone()
+        finished = row[0] if row else None
+        age = None
+        if finished:
+            try:
+                then = datetime.fromisoformat(finished.replace("Z", "+00:00"))
+                if then.tzinfo is None:
+                    then = then.replace(tzinfo=timezone.utc)
+                age = max(0.0, (datetime.now(timezone.utc) - then).total_seconds())
+            except ValueError:
+                pass
+        return {"remote": remote, "finished_at": finished, "age_seconds": age}
+
+    def data_ages(self) -> dict[str, dict]:
+        return {r.name: self.data_age(r.name) for r in self.config.remotes}
+
+    def release_report(self, remote: str, path_prefix: str | None = None, keep_on: list[str] | None = None) -> dict:
+        """How much of `remote` provably exists on the other clouds (release.py). Read-only."""
+        from . import release
+        return release.release_report(self.conn, remote, path_prefix=path_prefix or None, keep_on=keep_on or None)
 
     def stats(self) -> dict:
         return search.stats(self.conn)
@@ -209,7 +254,7 @@ class Service:
         built = self.conn.execute("SELECT value FROM meta WHERE key = 'identity_built_at'").fetchone()
         scanned = bool(remotes) and all(r["name"] in complete for r in remotes)
         return {
-            "config_path": self.config_path,
+            "config_path": str(self.config_path) if self.config_path else None,
             "rclone": {"found": info is not None, "version": info["version"] if info else None,
                        "ok": bool(info and info["ok"]), "binary": self.config.rclone_binary},
             "remotes": remotes,
@@ -229,6 +274,18 @@ class Service:
         self.refresh_dir_stats([remote])
         return res
 
+    def sync(self, remotes: list[str] | None = None, progress=None) -> dict:
+        """List the remotes (default all) in parallel, then rebuild identity and folder stats once (syncall.py).
+        Uses its own catalog connections; this service's connection sees the result afterwards."""
+        from . import syncall
+        res = syncall.sync_all(self.config, remotes=remotes, progress=progress)
+        if res.get("identity") is not None:
+            with db.transaction(self.conn):     # lets the setup screen tell that this followed the last scan
+                self.conn.execute("INSERT INTO meta(key, value) VALUES ('identity_built_at', ?) "
+                                  "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (db.utcnow(),))
+        res["data_age"] = {n: self.data_age(n) for n in res["remotes"]}
+        return res
+
     def rebuild_identity(self) -> dict:
         res = _plain(identity.rebuild_groups(self.conn))
         with db.transaction(self.conn):         # lets the setup screen tell that this followed the last scan
@@ -246,20 +303,26 @@ class Service:
         found = identity.bridge_candidates(self.conn, max_bytes=max_bytes, limit=limit)
         return {"count": len(found), "bytes": sum(c.size for c in found)}
 
-    def bridge(self, *, max_bytes: int | None = None, limit: int = 100, progress=None, started=None) -> dict:
+    def bridge(self, *, max_bytes: int | None = None, limit: int = 100, progress=None, started=None,
+               entry_ids: list[int] | None = None) -> dict:
         """Download each candidate once (read remote only), hash it, record the bridge, regroup.
-        `progress(done, failed)` runs after each file; `started(total)` once, with the number of candidates."""
+        `progress(done, failed)` runs after each file; `started(total)` once, with the number of candidates.
+        With `entry_ids`, exactly those entries are downloaded (each once; `max_bytes` and `limit` do not apply)
+        instead of the automatic candidates; one that is not a live file is reported in `failed`."""
         done, failed = [], []
         with tempfile.TemporaryDirectory(prefix="drivemerge-bridge-") as tmp:
-            candidates = identity.bridge_candidates(self.conn, max_bytes=max_bytes, limit=limit)
+            if entry_ids is not None:
+                ids = list(dict.fromkeys(int(i) for i in entry_ids))
+            else:
+                ids = [c.entry_id for c in identity.bridge_candidates(self.conn, max_bytes=max_bytes, limit=limit)]
             if started:
-                started(len(candidates))
-            for cand in candidates:
+                started(len(ids))
+            for entry_id in ids:
                 try:
-                    identity.bridge_entry(self.conn, self.rclone, cand.entry_id, tmp)
-                    done.append(cand.entry_id)
+                    identity.bridge_entry(self.conn, self.rclone, entry_id, tmp)
+                    done.append(entry_id)
                 except Exception as e:  # one bad file must not stop the batch
-                    failed.append({"entry_id": cand.entry_id, "error": str(e)})
+                    failed.append({"entry_id": entry_id, "error": str(e)})
                 if progress:
                     progress(len(done), len(failed))
         stats = identity.rebuild_groups(self.conn) if done else None
@@ -289,6 +352,9 @@ class Service:
         elif kind == "reorganize":
             result = builders.build_reorganize(self.conn, ruleset=self.ruleset(rules_text),
                                                **{**quarantine, **params})
+        elif kind == "release":
+            from . import release
+            result = release.build_release(self.conn, **{**quarantine, **params})
         else:
             result = builders.build_manual(self.conn, params.get("ops", []))
         return result, params, rules_text
@@ -476,6 +542,73 @@ class Service:
             return {"draft_applied": True}
         except Exception as e:  # WorkspaceError (not open any more), sqlite errors, ...
             return {"draft_applied": False, "draft_error": str(e) or type(e).__name__}
+
+    # Connections. Human-only like approve: a sign-in uses the person's tokens and enabling writes widens what a
+    # plan may change. The REST API token and MCP must never reach these; ui_api exposes them on the human
+    # (session-cookie) channel only. Tokens never pass through here: connections.py returns names and quota only.
+
+    def setup_status(self) -> dict:
+        from . import connections
+        return {"first_run": not self.config.remotes, "config_path": str(self.config_path or DEFAULT_CONFIG_PATH),
+                "rclone": connections.rclone_status(self.config),
+                "connections": connections.list_connections(self.config),
+                "providers": [{"key": k, "label": p.label, "needs_client": p.needs_client}
+                              for k, p in connections.PROVIDER_SPECS.items()]}
+
+    def list_connections(self) -> list[dict]:
+        from . import connections
+        return connections.list_connections(self.config)
+
+    @staticmethod
+    def _flow(flow) -> dict:
+        return {"flow_id": flow.id, "provider": flow.provider, "purpose": flow.purpose, "status": flow.status,
+                "auth_url": flow.auth_url, "error": flow.error}
+
+    def start_connect(self, provider: str, *, purpose: str = "read", client_id: str | None = None,
+                      client_secret: str | None = None) -> dict:
+        from . import connections
+        return self._flow(connections.start_flow(self.config, provider, purpose=purpose,
+                                                 client_id=client_id, client_secret=client_secret))
+
+    def connect_flow(self, flow_id: str) -> dict:
+        from . import connections
+        return self._flow(connections.get_flow(flow_id))
+
+    def finish_connect(self, flow_id: str, *, name: str | None = None) -> dict:
+        """Complete a finished sign-in: a `read` flow creates the connection (`name` optional), a `write` flow
+        enables changes on connection `name` (required). The config is reloaded so it is usable at once."""
+        from . import connections
+        flow = connections.get_flow(flow_id)
+        if flow.purpose == "write":
+            if not name:
+                raise ServiceError("name is required to enable changes on a connection")
+            res = connections.finish_enable_writes(self.config, flow_id, name)
+        else:
+            res = connections.finish_connect(self.config, flow_id, name=name)
+        self.reload_config()
+        return res
+
+    def cancel_connect(self, flow_id: str) -> None:
+        from . import connections
+        connections.cancel_flow(flow_id)
+
+    def test_connection(self, name: str) -> dict:
+        from . import connections
+        return connections.test_connection(self.config, name)
+
+    def disconnect(self, name: str) -> None:
+        from . import connections
+        connections.disconnect(self.config, name)
+        self.reload_config()
+
+    def enable_writes(self, name: str, *, client_id: str | None = None, client_secret: str | None = None) -> dict:
+        """Start the second, write-scope sign-in for connection `name`; finish it with finish_connect(flow, name=name)."""
+        from . import connections
+        provider = next((c["provider"] for c in connections.list_connections(self.config) if c["name"] == name), None)
+        if provider is None:
+            raise ServiceError(f"unknown connection {name!r}")
+        return self._flow(connections.start_flow(self.config, provider, purpose="write",
+                                                 client_id=client_id, client_secret=client_secret))
 
     def restore(self, plan_id: int) -> dict:
         return _plain(executor.restore_plan(self.conn, self.rclone, self.config, plan_id))

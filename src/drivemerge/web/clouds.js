@@ -3,6 +3,8 @@
 // surface), assigned by configuration order, so a cloud keeps its colour in every view and after a reload.
 import { html } from './vendor/htm-preact-standalone.mjs';
 import { t } from './i18n.js';
+import { Icon } from './icons.js';
+import { ago, fmtDateTime, isStaleAge } from './util.js';
 
 export const CLOUD_COLORS = 8;
 
@@ -42,4 +44,13 @@ export function PresenceCells({ remotes, counts, verified = true }) {
 export function PresenceHeads({ remotes }) {
   return remotes.map((r) => html`<span key=${r.name} class="presence-head" role="columnheader" title=${t('cloud.column', { cloud: r.name })} style=${{ '--c': cloudColor(remotes, r.name) }}>
     <${CloudDot} remotes=${remotes} name=${r.name} size=${7} /><span>${r.name.slice(0, 3)}</span></span>`);
+}
+
+/** "Synced 3 min ago" / "Never synced": the data age of a cloud, in a warning tone after 24 hours or when never synced. */
+export function AgeChip({ iso, testid }) {
+  const stale = isStaleAge(iso);
+  const text = iso ? t('age.synced', { when: ago(iso) }) : t('age.never');
+  return html`<span class=${'age-chip' + (stale ? ' stale' : '')} data-testid=${testid} data-stale=${stale ? 'true' : 'false'}
+    title=${iso ? t('age.exact', { when: fmtDateTime(iso) }) : t('age.neverTip')}>
+    <${Icon} name=${stale ? 'alert' : 'check'} size=${11} />${text}</span>`;
 }

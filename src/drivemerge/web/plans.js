@@ -9,13 +9,13 @@ import * as api from './api.js';
 import { Icon } from './icons.js';
 import { AppCtx } from './ctx.js';
 import { CloudDot, CloudName } from './clouds.js';
-import { ViewHeader } from './ui.js';
-import { parseSize, plansHash } from './query.js';
+import { Modal, ViewHeader } from './ui.js';
+import { freeHash, parseSize, plansHash } from './query.js';
 import {
   ApprovalFields, Card, CliBox, CloudTable, ExecNote, ProgressBox, Problems, SimStatus, useRunner,
 } from './report.js';
 import {
-  ago, baseName, buildText, errorText, fmtBytes, fmtDateTime, fmtNum, parentOf, rootCauses,
+  ago, baseName, buildText, errorText, fmtBytes, fmtDateTime, fmtNum, parentOf, rootCauses, sleep,
 } from './util.js';
 
 const WAITING = ['draft', 'simulated'];
@@ -64,6 +64,9 @@ export function planSummary(p) {
       target: `${q.target}:${cleanPath(q.target_root)}`, from,
     });
   }
+  if (p.kind === 'release' && q.remote) {
+    return t('plans.sum.release', { cloud: q.remote, scope: q.path_prefix ? ` · ${t('plans.scope.path', { path: q.path_prefix })}` : '' });
+  }
   if (p.kind === 'workspace') return t('plans.sum.workspace');
   return p.title || t(`kind.${p.kind}`, null, p.kind);
 }
@@ -95,6 +98,88 @@ function SkippedList({ skipped }) {
       ${s.dest && html`<span class="mono muted">→ ${s.dest}</span>`}</li>`)}</ul></details>`;
 }
 
+// ------------------------------------------------------------------ after a release plan: purge the quarantine
+
+/**
+ * A finished release plan only moved its files into the quarantine folder of the same cloud, and that still counts
+ * against the quota. Space comes back when the quarantine is purged: now (typed confirmation) or after the default
+ * retention (30 days).
+ */
+function PurgeBox({ plan, planId, sim }) {
+  const ctx = useContext(AppCtx);
+  const rows = (sim.remotes || []).filter((r) => r.files_quarantined > 0 || r.bytes_quarantined > 0);
+  const cloud = (plan.params && plan.params.remote) || (rows[0] && rows[0].remote) || '';
+  const bytes = rows.filter((r) => !cloud || r.remote === cloud).reduce((a, r) => a + (r.bytes_quarantined || 0), 0);
+  const [phase, setPhase] = useState('idle');   // idle | dialog | running | done | later
+  const [typed, setTyped] = useState('');
+  const [error, setError] = useState('');
+  const [result, setResult] = useState(null);
+  const alive = useRef(true);
+  useEffect(() => () => { alive.current = false; }, []);
+
+  async function purge() {
+    setError('');
+    setPhase('running');
+    try {
+      const { job_id: id } = await api.purge(planId, { confirm: 'purge', older_than_days: 0 });
+      for (let fails = 0; alive.current;) {
+        try {
+          const j = await api.job(id);
+          if (j.status === 'done') { setResult(j.result || {}); break; }
+          if (j.status === 'failed') throw Object.assign(new Error(j.error || t('purge.failed')), { plain: true });
+          fails = 0;
+        } catch (e) {
+          if (e.plain) throw e;
+          fails += 1;
+          if (fails > 10) throw e;
+        }
+        await sleep(700);
+      }
+      if (!alive.current) return;
+      setPhase('done');
+      ctx.markOutdated(cloud ? [cloud] : undefined);
+      ctx.toast('success', t('purge.toast', { cloud }));
+    } catch (e) {
+      if (!alive.current) return;
+      setError(e.plain ? e.message : errorText(e));
+      setPhase('dialog');
+    }
+  }
+
+  const matches = typed.trim() === 'purge';
+  return html`<section class=${'purge-box phase-' + phase} data-testid="purge-box" data-phase=${phase}>
+    <${Icon} name=${phase === 'done' ? 'check' : 'trash'} size=${18} />
+    <div class="purge-main">
+      ${phase === 'done' ? html`<strong data-testid="purge-done">${t('purge.done', { cloud })}</strong>
+        ${result && result.done !== undefined && html`<p class="muted">${t('purge.doneCount', { n: fmtNum(result.done) })}</p>`}`
+    : phase === 'later' ? html`<strong data-testid="purge-later-note">${t('purge.laterNote', { cloud })}</strong>`
+      : html`<strong data-testid="purge-text">${t('purge.text', { bytes: fmtBytes(bytes), cloud })}</strong>
+        <p class="muted">${t('purge.help')}</p>`}
+    </div>
+    ${(phase === 'idle' || phase === 'dialog' || phase === 'running') && html`<div class="purge-actions">
+      <button class="btn btn-danger" data-testid="purge-now" disabled=${phase === 'running'} onClick=${() => { setTyped(''); setPhase('dialog'); }}>
+        ${phase === 'running' ? html`<span class="spinner" aria-hidden="true"></span>` : null} ${t('purge.now')}</button>
+      <button class="btn" data-testid="purge-later" disabled=${phase === 'running'} onClick=${() => setPhase('later')}>${t('purge.later')}</button></div>`}
+    ${phase === 'later' && html`<button class="btn btn-small" data-testid="purge-undo-later" onClick=${() => setPhase('idle')}>${t('purge.reconsider')}</button>`}
+    ${(phase === 'dialog' || (phase === 'running' && typed)) && html`<${Modal} label=${t('purge.title')} onClose=${() => setPhase('idle')} testid="purge-dialog"
+      dismissable=${phase !== 'running'} initialFocus="input">
+      <form class="dialog" onSubmit=${(e) => { e.preventDefault(); if (matches && phase === 'dialog') purge(); }}>
+        <h2 class="dialog-title">${t('purge.title')}</h2>
+        <p class="dialog-message">${t('purge.dialogText', { bytes: fmtBytes(bytes), cloud })}</p>
+        <label class="field"><span>${t('purge.typeLabel')}</span>
+          <input type="text" data-testid="purge-input" value=${typed} autocomplete="off" spellcheck="false" placeholder="purge"
+            disabled=${phase === 'running'} onInput=${(e) => setTyped(e.target.value)} /></label>
+        ${error && html`<p class="note error" role="alert" data-testid="purge-error">${error}</p>`}
+        <div class="dialog-actions">
+          <button type="button" class="btn" data-testid="purge-cancel" disabled=${phase === 'running'} onClick=${() => setPhase('idle')}>${t('common.cancel')}</button>
+          <button type="submit" class="btn btn-danger" data-testid="purge-confirm" disabled=${!matches || phase === 'running'}>
+            ${phase === 'running' ? html`<span class="spinner" aria-hidden="true"></span>` : null} ${t('purge.confirm')}</button>
+        </div>
+      </form>
+    <//>`}
+  </section>`;
+}
+
 // ------------------------------------------------------------------ the list
 
 function PlanRow({ plan, onOpen }) {
@@ -115,6 +200,8 @@ function PlanRow({ plan, onOpen }) {
 function PlanList({ route }) {
   const ctx = useContext(AppCtx);
   const { list, loaded, error } = ctx.plans;
+  const cloudList = ctx.config.remotes || [];
+  const freeTarget = (cloudList.find((r) => r.writable !== false) || cloudList[0] || { name: '' }).name;
   useEffect(() => { ctx.refreshPlans(); }, []);
   const tab = TABS.includes(route.params.get('tab')) ? route.params.get('tab') : '';
   const waiting = list.filter(isWaiting);
@@ -133,6 +220,8 @@ function PlanList({ route }) {
         onClick=${(e) => { e.preventDefault(); ctx.nav(plansHash('/new/dedupe')); }}><${Icon} name="copy" size=${14} /> ${t('plans.newDedupe')}</a>
       <a class="btn btn-small" href=${plansHash('/new/consolidate')} data-testid="plans-new-consolidate"
         onClick=${(e) => { e.preventDefault(); ctx.nav(plansHash('/new/consolidate')); }}><${Icon} name="merge" size=${14} /> ${t('plans.newConsolidate')}</a>
+      <a class="btn btn-small" href=${freeHash(freeTarget)} data-testid="plans-new-free"
+        onClick=${(e) => { e.preventDefault(); ctx.nav(freeHash(freeTarget)); }}><${Icon} name="cloud" size=${14} /> ${t('plans.newFree')}</a>
     <//>
     <div class="view-body">
       ${error && !loaded && html`<p class="view-error" role="alert" data-testid="plans-error">${errorText(error)}</p>`}
@@ -363,6 +452,8 @@ function PlanReview({ id }) {
         ${config.approvals_enabled && html`<button class="btn btn-small" data-testid="outdated-rescan" onClick=${run.rescan}>
           <${Icon} name="refresh" size=${14} /> ${t('catalog.rescan')}</button>`}</div>`}
       ${afterRun && html`<${ProgressBox} phase=${phase} job=${run.job} prog=${run.prog} planId=${id} error=${run.error} />`}
+      ${plan && plan.kind === 'release' && (phase === 'done' || phase === 'rescanned' || (phase === 'closed' && plan.status === 'done'))
+        && html`<${PurgeBox} key=${id} plan=${plan} planId=${id} sim=${sim} />`}
       ${plan && sim && Object.keys(sim).length > 0 && html`
         <section class="cards" data-testid="plan-summary">
           <${Card} id="ops" label=${t('plans.card.ops')} value=${fmtNum(opsTotal)} />

@@ -5,7 +5,7 @@ Two kinds of caller reach this app, and they are not equal:
 * normal routes (catalog, drafts, trees, suggestions, previews) accept the API
   bearer token or the UI session cookie, so scripts and Claude can stage and
   preview changes alongside the person using the browser;
-* the human channel (approve, execute, rescan, bridge) accepts only the session cookie
+* the human channel (approve, execute, sync, bridge, purge, connect, disconnect, install rclone) accepts only the session cookie
   plus a CSRF header, a same-origin check, and a server that was started from an
   interactive terminal. A bearer token never reaches it: whatever an LLM can do
   here ends in a proposal that a person still has to approve.
@@ -39,8 +39,10 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from . import __version__, plans
-from .api import LOOPBACK_HOSTS, bearer_ok, build_router, install_error_handlers, scrub_secrets
+from . import __version__, connections, plans
+from .api import (
+    LOOPBACK_HOSTS, QuotaCache, bearer_ok, build_router, install_error_handlers, scrub_secrets,
+)
 from .config import (
     Config, ConfigError, RemoteConfig, add_remote_block, load_config, provider_of, set_remote_write,
 )
@@ -98,7 +100,7 @@ class ApproveBody(_Body):
     code: str
 
 
-class RescanBody(_Body):
+class SyncBody(_Body):
     remotes: list[str] | None = None
 
 
@@ -126,9 +128,30 @@ class EnableWriteBody(_Body):
     client_secret: str | None = Field(default=None, max_length=512)
 
 
+RescanBody = SyncBody  # the old name of the sync body (POST /v1/ui/rescan is an alias of /v1/ui/sync)
+
+
 class BridgeBody(_Body):
     max_bytes: int | None = Field(default=None, ge=0)
     limit: int = Field(default=100, ge=1, le=100000)
+    entry_ids: list[int] | None = Field(default=None, max_length=5000)  # verify exactly these files
+
+
+class ConnectStartBody(_Body):
+    provider: str | None = None
+    purpose: str = "read"
+    name: str | None = None          # purpose 'write': the connection to enable changes on
+    client_id: str | None = None
+    client_secret: str | None = None
+
+
+class ConnectFinishBody(_Body):
+    name: str | None = None
+
+
+class PurgeBody(_Body):
+    confirm: str = ""
+    older_than_days: int = Field(default=0, ge=0, le=36500)
 
 
 def _refusal(status: int, payload: dict, headers: dict[str, str] | None = None) -> JSONResponse:
@@ -456,9 +479,16 @@ def _disabled_message(request: Request) -> str:
         return ("connecting, adopting and enabling clouds from the browser is off: `drivemerge ui` must be started "
                 "from an interactive terminal, outside an AI agent. In your own terminal run `rclone config`, add a "
                 "[[remotes]] entry to config.toml, then run `drivemerge scan --all`")
+    elif path.endswith("/purge"):
+        cli = f"`drivemerge plan purge {plan_id}`"
+    elif "/connect" in path or "/connections" in path:
+        cli = "`drivemerge connect` / `drivemerge disconnect` / `drivemerge connections`"
+    elif "/rclone/" in path:
+        cli = "`drivemerge connect` (it tells you how to install rclone)"
     else:
         cli = "`drivemerge scan --all`"
-    return ("approving, executing, rescanning and bridging from the browser is off: `drivemerge ui` must be started from "
+    return ("approving, executing, syncing, bridging, purging and connecting clouds from the browser is off: "
+            "`drivemerge ui` must be started from "
             "an interactive terminal, outside an AI agent. In your own terminal run "
             f"{cli} (plans are approved with `drivemerge plan approve ID` and run with `drivemerge plan execute ID`)")
 
@@ -530,6 +560,13 @@ def create_ui_app(service: Service, *, config: Config, api_token: str, ui_token:
     web = _web_root()
     if config_path is not None and not service.config_path:
         service.config_path = str(config_path)
+
+    quotas = QuotaCache()
+
+    def job_service() -> Service:
+        """A service for a job thread: its own catalog connection and rclone, the same config object and file,
+        so reload_config in a job reads the right file and clouds connected meanwhile are seen."""
+        return Service(service.config, config_path=service.config_path)
 
     app = FastAPI(title="drive-merge workspace", version=__version__,
                   docs_url=None, redoc_url=None, openapi_url=None)
@@ -628,11 +665,14 @@ def create_ui_app(service: Service, *, config: Config, api_token: str, ui_token:
             rows = service.conn.execute(
                 "SELECT id, name, provider, write_remote, case_insensitive FROM remotes ORDER BY id").fetchall()
             outdated = _outdated_remotes(service.conn)
+            live = {r.name for r in service.config.remotes}
         return {
             "approvals_enabled": approvals_enabled,
-            "execution_enabled": config.safety.execution_enabled,
+            "execution_enabled": service.config.safety.execution_enabled,
             "remotes": [{"id": r[0], "name": r[1], "provider": r[2], "writable": r[3] is not None,
-                         "case_insensitive": bool(r[4])} for r in rows],
+                         "case_insensitive": bool(r[4]),
+                         # False for a cloud that was disconnected: the catalog keeps its files as last seen.
+                         "connected": r[1] in live} for r in rows],
             "version": __version__,
             # Lets a reloaded page recover its CSRF token without the one-time URL token; only a session gets it.
             "csrf": auth.session.csrf if auth.session else None,
@@ -856,7 +896,7 @@ def create_ui_app(service: Service, *, config: Config, api_token: str, ui_token:
         if busy is not None:
             raise UiError(409, "JOB_BUSY", f"a {busy.kind} job ({busy.id}) is still running; wait for it to finish",
                           job=busy.id, kind=busy.kind)
-        if not config.safety.execution_enabled:
+        if not service.config.safety.execution_enabled:
             raise UiError(403, "EXECUTION_DISABLED", "execution is disabled: set `execution_enabled = true` under "
                                                      "[safety] in config.toml, then restart `drivemerge ui`")
         with lock:
@@ -871,7 +911,7 @@ def create_ui_app(service: Service, *, config: Config, api_token: str, ui_token:
                               plan=plan_id)
 
         def work(job: _Job) -> tuple[Any, str | None]:
-            svc = Service(config)  # own connection and rclone: this thread never touches the request connection
+            svc = job_service()  # own connection and rclone: this thread never touches the request connection
             try:
                 result = svc.execute(plan_id, progress=_reports(jobs, job))  # also closes a finished draft
                 failed = result.get("status") == "failed" or result.get("error")
@@ -886,10 +926,10 @@ def create_ui_app(service: Service, *, config: Config, api_token: str, ui_token:
         """Download and hash the files that settle the most doubt about duplicates (reads clouds, writes the
         catalog). Progress is {bridged, failed, total}; the result is Service.bridge's."""
         def work(job: _Job) -> tuple[Any, str | None]:
-            svc = Service(config)
+            svc = job_service()
             try:
                 result = svc.bridge(
-                    max_bytes=body.max_bytes, limit=body.limit,
+                    max_bytes=body.max_bytes, limit=body.limit, entry_ids=body.entry_ids,
                     started=lambda total: jobs.update(job, total=total),
                     progress=lambda done, failed: jobs.update(job, bridged=done, failed=failed))
                 return result, None
@@ -1099,38 +1139,151 @@ def create_ui_app(service: Service, *, config: Config, api_token: str, ui_token:
         return {"job_id": start_connect(name=rw, provider="drive", options=options, remote_auth=False,
                                         mode="write", base=remote.name)}
 
-    @human.post("/v1/ui/rescan", status_code=202)
-    def rescan(body: RescanBody = RescanBody()) -> dict:
-        names = list(dict.fromkeys(body.remotes or [r.name for r in config.remotes]))
+    def start_sync(body: SyncBody) -> dict:
+        known = [r.name for r in service.config.remotes]
+        names = list(dict.fromkeys(body.remotes or known))
         if not names:
-            raise ValueError("no remotes configured")
+            raise UiError(400, "BAD_REQUEST", "no clouds are connected yet; connect one first")
         for name in names:
-            config.remote(name)  # KeyError -> 404 before any job starts
+            service.config.remote(name)  # KeyError -> 404 before any job starts
 
         def work(job: _Job) -> tuple[Any, str | None]:
-            svc = Service(config)
+            state = {n: {"state": "queued", "files": 0, "dirs": 0, "bytes": 0} for n in names}
+            guard = threading.Lock()
+
+            def progress(name: str, st: str, files: int, dirs: int, size: int) -> None:
+                with guard:  # replace, never mutate: the job view serialises the previous dict concurrently
+                    state[name] = {"state": st, "files": files, "dirs": dirs, "bytes": size}
+                    snapshot = dict(state)
+                jobs.update(job, remotes=snapshot, remote=name,   # remote/remote_index: what the Setup page's bar reads
+                            remote_index=min(len(names), sum(1 for v in snapshot.values()
+                                                             if v["state"] in ("done", "failed")) + 1),
+                            remotes_done=sum(1 for v in snapshot.values() if v["state"] in ("done", "failed")),
+                            files=sum(v["files"] for v in snapshot.values()),
+                            bytes=sum(v["bytes"] for v in snapshot.values()))
+
+            svc = job_service()
             try:
-                scans = []
-                for i, name in enumerate(names, start=1):
-                    jobs.update(job, remote=name, remote_index=i, files=0, dirs=0, bytes=0)
-                    try:
-                        res = svc.scan(name, progress=lambda files, dirs, size: jobs.update(
-                            job, files=files, dirs=dirs, bytes=size))
-                    except Exception as e:  # keep going: the other clouds still deserve a fresh catalog
-                        res = {"status": "failed", "error": _describe(e)}
-                    res.setdefault("remote", name)
-                    scans.append(res)
-                jobs.update(job, stage="identity")
-                identity = svc.rebuild_identity()  # also refreshes the folder statistics
-                bad = [s["remote"] for s in scans if s.get("status") != "complete" or s.get("error")]
-                return ({"scans": scans, "identity": identity},
-                        f"scan did not complete for: {', '.join(bad)}" if bad else None)
+                result = svc.sync(names, progress=progress)
+                result["scans"] = [      # one entry per cloud, as the Setup page reads them
+                    {"remote": n, **(r.get("scan") or {"status": r["status"], "error": r.get("error")})}
+                    for n, r in result["remotes"].items()]
+                bad = [n for n, r in result["remotes"].items() if r["status"] != "complete"]
+                return result, f"sync did not complete for: {', '.join(bad)}" if bad else None
             finally:
                 svc.conn.close()
 
-        return {"job_id": jobs.start("rescan", work, remotes=names, remotes_total=len(names)).id}
+        initial = {n: {"state": "queued", "files": 0, "dirs": 0, "bytes": 0} for n in names}
+        return {"job_id": jobs.start("sync", work, remotes=initial, remotes_total=len(names), remotes_done=0,
+                                     files=0, bytes=0).id}
 
-    app.include_router(build_router(service, lock, dependencies=normal,
+    @human.post("/v1/ui/sync", status_code=202)
+    def sync(body: SyncBody = SyncBody()) -> dict:
+        """List the clouds (default all) in parallel into the catalog. Progress is per remote:
+        {remotes: {name: {state, files, dirs, bytes}}, remotes_total, remotes_done, files, bytes}."""
+        return start_sync(body)
+
+    @human.post("/v1/ui/rescan", status_code=202)
+    def rescan(body: SyncBody = SyncBody()) -> dict:
+        return start_sync(body)
+
+    @human.post("/v1/ui/plans/{plan_id}/purge", status_code=202)
+    def purge(plan_id: int, body: PurgeBody) -> dict:
+        """Permanently delete this plan's quarantined files (each re-proven against its witness first)."""
+        if body.confirm != "purge":
+            raise UiError(400, "BAD_REQUEST", 'type "purge" to confirm deleting the quarantined files for good')
+        if not service.config.safety.execution_enabled:
+            raise UiError(403, "EXECUTION_DISABLED", "execution is disabled: set `execution_enabled = true` under "
+                                                     "[safety] in config.toml, then restart `drivemerge ui`")
+        with lock:
+            plan = plans.get_plan(service.conn, plan_id, with_ops=False)
+            if plan.status not in ("done", "failed"):
+                raise UiError(409, "CONFLICT", f"plan {plan_id} is {plan.status}; only a plan that has run "
+                                                    "has anything in quarantine", plan=plan_id, plan_status=plan.status)
+
+        def work(job: _Job) -> tuple[Any, str | None]:
+            svc = job_service()
+            try:
+                result = svc.purge(plan_id, older_than_days=body.older_than_days)
+                return result, (str(result.get("error")) if result.get("failed") else None)
+            finally:
+                svc.conn.close()
+
+        return {"job_id": jobs.start("purge", work, plan_id=plan_id).id}
+
+    # ---- connections (human channel; slow rclone calls run outside the catalog lock)
+
+    @human.post("/v1/ui/connect/start")
+    def connect_start(body: ConnectStartBody) -> dict:
+        provider = body.provider
+        if body.purpose == "write":
+            found = next((c for c in connections.list_connections(service.config) if c["name"] == body.name), None)
+            if found is None:
+                raise connections.ConnectError("NOT_FOUND", f"no connection named {body.name!r}")
+            provider = found["provider"]
+        if not provider:
+            raise UiError(400, "BAD_REQUEST", "provider is required")
+        if body.purpose == "read":
+            connections.check_name(service.config, provider, None)  # a free default name exists
+        flow = connections.start_flow(service.config, provider, purpose=body.purpose, name=body.name,
+                                      client_id=body.client_id or None, client_secret=body.client_secret or None)
+        return {"flow_id": flow.id, "auth_url": flow.auth_url}
+
+    def flow_view(flow: connections.AuthFlow) -> dict:
+        return {"flow_id": flow.id, "provider": flow.provider, "purpose": flow.purpose, "status": flow.status,
+                "auth_url": flow.auth_url, "error": flow.error}
+
+    @human.get("/v1/ui/connect/flows/{flow_id}")
+    def connect_flow(flow_id: str) -> dict:
+        return flow_view(connections.get_flow(flow_id))
+
+    @human.post("/v1/ui/connect/flows/{flow_id}/finish")
+    def connect_finish(flow_id: str, body: ConnectFinishBody = ConnectFinishBody()) -> dict:
+        flow = connections.get_flow(flow_id)
+        if flow.purpose == "write":
+            if not body.name:
+                raise UiError(400, "BAD_NAME", "name is required to enable changes on a connection")
+            result = connections.finish_enable_writes(service.config, flow_id, body.name)
+        else:
+            result = connections.finish_connect(service.config, flow_id, name=body.name or None)
+        quotas.drop(result["name"])
+        with lock:
+            service.reload_config()  # the running server sees the new cloud at once
+        return result
+
+    @human.post("/v1/ui/connect/flows/{flow_id}/cancel")
+    def connect_cancel(flow_id: str) -> dict:
+        connections.cancel_flow(flow_id)
+        return {"ok": True}
+
+    @human.post("/v1/ui/connections/{name}/test")
+    def connection_test(name: str) -> dict:
+        result = connections.test_connection(service.config, name)
+        quotas.put(name, result)
+        return result
+
+    @human.delete("/v1/ui/connections/{name}")
+    def connection_delete(name: str) -> dict:
+        connections.disconnect(service.config, name)
+        quotas.drop(name)
+        with lock:
+            service.reload_config()
+        return {"ok": True}
+
+    @human.post("/v1/ui/rclone/install", status_code=202)
+    def rclone_install() -> dict:
+        def work(job: _Job) -> tuple[Any, str | None]:
+            def progress(phase: str, done: int, total: int | None) -> None:
+                jobs.update(job, phase=phase, done=done, total=total)
+
+            path = connections.install_rclone(connections.managed_bin_dir(), progress=progress)
+            with lock:
+                service.reload_config()  # rebuild Rclone around the new binary
+            return {"path": str(path), "rclone": connections.rclone_status(service.config)}, None
+
+        return {"job_id": jobs.start("rclone_install", work, phase="starting", done=0, total=None).id}
+
+    app.include_router(build_router(service, lock, dependencies=normal, quotas=quotas,
                                     created_by=lambda request: "ui" if session_of(request) is not None else "api"))
     app.include_router(router)
     app.include_router(human)
@@ -1193,8 +1346,9 @@ def run_ui(config: Config, *, host: str | None = None, port: int | None = None, 
         raise ValueError(f"refusing to bind {host!r}: the workspace is loopback-only")
     approvals, why_not = approvals_allowed()
     ui_token = secrets.token_urlsafe(24)
-    app = create_ui_app(Service(config, config_path=config_path), config=config, api_token=config.api.token,
-                        ui_token=ui_token, approvals_enabled=approvals, config_path=config_path)
+    app = create_ui_app(Service(config, config_path=config_path or config.config_path), config=config,
+                        api_token=config.api.token, ui_token=ui_token, approvals_enabled=approvals,
+                        config_path=config_path or config.config_path)
     netloc = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
     url = f"http://{netloc}/ui/#token={ui_token}"
     print(f"drive-merge workspace: {url}", flush=True)

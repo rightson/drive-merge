@@ -262,3 +262,12 @@ export function ago(iso, now = Date.now()) {
   if (min < 2880) return t('ago.hour', { n: Math.round(min / 60) });
   return t('ago.day', { n: Math.round(min / 1440) });
 }
+
+/** A cloud's data is "old" after this many hours without a complete sync (docs/ONBOARDING.md section 5). */
+export const STALE_HOURS = 24;
+/** True when `iso` (the end of the last complete sync) is missing or older than STALE_HOURS. */
+export function isStaleAge(iso, now = Date.now()) {
+  if (!iso) return true;
+  const then = Date.parse(String(iso).endsWith('Z') || /[+-]\d\d:?\d\d$/.test(String(iso)) ? iso : `${iso}Z`);
+  return Number.isNaN(then) || now - then > STALE_HOURS * 3600 * 1000;
+}

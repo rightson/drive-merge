@@ -197,7 +197,8 @@ def test_init_writes_private_config_with_token_and_catalog(tmp_path, monkeypatch
     assert len(token) >= 32
     assert config_mod.load_config(path).api.token == token
     assert token not in out                       # never echoed
-    assert "rclone config" in out and "[[remotes]]" in out
+    assert "drivemerge ui" in out and "drivemerge connect" in out
+    assert config_mod.load_config(path).remotes == []               # no example remotes any more
     assert (home / ".local/share/drive-merge/catalog.db").exists()
 
 
@@ -225,6 +226,28 @@ def test_init_json_reports_paths_not_the_token(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert json.loads(out)["config"] == str(path)
     assert tomllib.loads(path.read_text())["api"]["token"] not in out
+
+
+def test_ui_without_a_config_runs_init_first(tmp_path, monkeypatch, capsys):
+    from drivemerge import ui_api
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    path = tmp_path / "fresh" / "config.toml"
+    started = {}
+    monkeypatch.setattr(ui_api, "run_ui", lambda cfg, **kw: started.update(cfg=cfg, **kw))
+    assert cli.main(["--config", str(path), "ui", "--no-browser"]) == 0
+    assert path.exists() and stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert started["cfg"].remotes == [] and started["open_browser"] is False
+    assert len(tomllib.loads(path.read_text())["api"]["token"]) >= 32
+    assert "wrote" in capsys.readouterr().err.lower()
+    first = path.read_text()                       # a second start keeps the config (and its token)
+    assert cli.main(["--config", str(path), "ui", "--no-browser"]) == 0
+    assert path.read_text() == first
+
+
+def test_packaged_template_and_example_config_are_identical():
+    here = Path(__file__).resolve().parent.parent
+    assert (here / "examples" / "config.toml").read_text() == (
+        here / "src" / "drivemerge" / "config_template.toml").read_text()
 
 
 # ------------------------------------------------------------------------------- sizes
@@ -1030,3 +1053,92 @@ def test_mcp_without_the_sdk_is_a_friendly_error(run, monkeypatch):
     monkeypatch.setitem(sys.modules, "drivemerge.mcp_server", None)
     rc, out, err = run("mcp")
     assert rc == 1 and "drive-merge[mcp]" in err
+
+
+# ------------------------------------------------------------------------ connect / disconnect
+
+FAKE_RCLONE = str(Path(__file__).parent / "fakes" / "rclone")
+
+
+@pytest.fixture
+def cenv(env, monkeypatch):
+    """A config whose rclone is the fake one; a sign-in completes at once (the ANY trigger exists)."""
+    auth = env.tmp / "auth"
+    auth.mkdir()
+    monkeypatch.setenv("FAKE_RCLONE_AUTH_DIR", str(auth))
+    monkeypatch.setenv("FAKE_RCLONE_ROOT_BASE", str(env.tmp / "clouds"))
+    (env.tmp / "clouds" / "dropbox").mkdir(parents=True)
+    (env.tmp / "clouds" / "dropbox" / "f.txt").write_text("x")
+    (env.tmp / "clouds" / "gdrive").mkdir(parents=True)
+    (auth / "ANY").write_text(json.dumps({"account": "me@example.com"}))
+    cfg = env.tmp / "conf" / "config.toml"
+    cfg.parent.mkdir()
+    cfg.write_text(f'[rclone]\nbinary = "{FAKE_RCLONE}"\n[api]\ntoken = "tok"\n')
+    return cfg
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="posix fake rclone")
+def test_connect_lists_and_disconnects_from_the_terminal(cenv, trun, run, jrun):
+    rc, out, err = trun("connect", "dropbox", config=cenv)
+    assert rc == 0, err
+    assert "Connected dropbox (me@example.com): read-only" in out
+    assert "state=" in err                                     # the link is shown for the person to open
+
+    rc, out, _ = run("connections", config=cenv)
+    assert rc == 0 and "dropbox" in out and "me@example.com" in out and "read-only" in out
+    rc, rows = jrun("connections", "--test", config=cenv)
+    assert rc == 0 and rows[0]["writable"] is False and rows[0]["test"]["ok"] is True
+    secret_text = (cenv.parent / "rclone.conf").read_text()
+    token = json.loads(re.search(r"token = (\{.*\})", secret_text).group(1))["access_token"]
+    assert token not in json.dumps(rows)
+    assert stat.S_IMODE((cenv.parent / "rclone.conf").stat().st_mode) == 0o600
+    assert stat.S_IMODE((cenv.parent / "connections.toml").stat().st_mode) == 0o600
+
+    rc, out, _ = run("remotes", config=cenv)
+    assert rc == 0 and "dropbox-ro:" in out                    # merged into the config
+
+    rc, out, err = trun("connect", "dropbox", "--name", "dropbox", config=cenv)
+    assert rc == 1 and "already in use" in err and "state=" not in err      # refused before any sign-in
+    (cenv.parent.parent / "clouds" / "work").mkdir()
+
+    rc, out, err = trun("connect", "dropbox", "--name", "work", config=cenv)
+    assert rc == 0, err
+
+    rc, out, err = trun("disconnect", "work", config=cenv)
+    assert rc == 0, err
+    rc, rows = jrun("connections", config=cenv)
+    assert [r["name"] for r in rows] == ["dropbox"]
+    rc, out, err = trun("disconnect", "work", config=cenv)
+    assert rc == 1 and "no connection named" in err
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="posix fake rclone")
+def test_connect_enable_writes_and_drive_needs_a_client(cenv, trun, jrun):
+    rc, out, err = trun("connect", "drive", config=cenv)
+    assert rc == 1 and "client id" in err
+    rc, out, err = trun("connect", "drive", "--client-id", "cid", "--client-secret", "sec", config=cenv)
+    assert rc == 0, err
+    rc, conn = jrun("connections", config=cenv)
+    assert conn[0]["name"] == "gdrive" and conn[0]["writable"] is False
+    rc, out, err = trun("connect", "--enable-writes", "gdrive", config=cenv)
+    assert rc == 0 and "changes allowed" in out, err
+    rc, conn = jrun("connections", config=cenv)
+    assert conn[0]["writable"] is True and conn[0]["write"] == "gdrive-rw:"
+    rc, out, err = trun("connect", "--enable-writes", "nope", config=cenv)
+    assert rc == 1 and "no connection named" in err
+    rc, out, err = trun("connect", config=cenv)
+    assert rc == 1 and "say which cloud" in err
+
+
+@pytest.mark.parametrize("argv", [["connect", "dropbox"], ["connect", "--enable-writes", "x"], ["disconnect", "x"]])
+def test_connecting_is_a_human_only_command(argv, run, trun, monkeypatch, no_input):
+    rc, _, err = run(*argv)                                       # no terminal
+    assert rc == 2 and "interactive terminal" in err
+    monkeypatch.setenv("CLAUDECODE", "1")
+    rc, _, err = trun(*argv)
+    assert rc == 2 and "AI agent" in err
+
+
+def test_connections_without_any(run):
+    rc, out, _ = run("connections")
+    assert rc == 0 and "No connections yet" in out

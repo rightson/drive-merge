@@ -7,15 +7,15 @@ import { t } from './i18n.js';
 import * as api from './api.js';
 import { Icon } from './icons.js';
 import { AppCtx } from './ctx.js';
-import { CloudDot, CloudName, cloudColor } from './clouds.js';
+import { AgeChip, CloudDot, CloudName, cloudColor } from './clouds.js';
 import { Modal, ViewHeader } from './ui.js';
-import { compareHash, exploreHash, parseSize, plansHash } from './query.js';
+import { compareHash, exploreHash, freeHash, parseSize, plansHash } from './query.js';
 import { errorText, fmtBytes, fmtDateTime, fmtLoc, fmtNum, sleep, suggestionText } from './util.js';
 
 const CATEGORIES = ['photo', 'video', 'audio', 'document', 'pdf', 'spreadsheet', 'presentation', 'archive', 'code', 'design', 'other'];
 const MAX_BARS = 24;
 
-function CloudCard({ remote, remotes, category, onOpen, onBridge, onConsolidate }) {
+function CloudCard({ remote, remotes, category, onOpen, onBridge, onConsolidate, onFree }) {
   const only = remote.only_here || { contents: 0, bytes: 0 };
   const unverified = remote.unverified_files || 0;
   const scan = remote.last_scan;
@@ -26,7 +26,8 @@ function CloudCard({ remote, remotes, category, onOpen, onBridge, onConsolidate 
       ${remote.writable === false && html`<span class="badge badge-readonly" title=${t('ov.readOnlyTip')}>${t('ov.readOnly')}</span>`}
     </header>
     <p class="cloud-total"><strong data-testid="cloud-files">${fmtNum(remote.files)}</strong> ${t('ov.files')} · ${fmtBytes(remote.bytes)}</p>
-    <p class="cloud-scan">${scan && scan.finished_at ? t('ov.scanned', { when: fmtDateTime(scan.finished_at) }) : t('ov.neverScanned')}</p>
+    <p class="cloud-scan">${scan && scan.finished_at ? t('ov.scanned', { when: fmtDateTime(scan.finished_at) }) : t('ov.neverScanned')}
+      <${AgeChip} iso=${scan && scan.finished_at} testid=${'cloud-age-' + remote.name} /></p>
     <button class=${'cloud-only' + (only.contents > 0 ? ' risk' : '')} data-testid=${'cloud-only-' + remote.name}
       disabled=${only.contents === 0} title=${t('ov.onlyHereTip')}
       onClick=${() => onOpen(`only:${remote.name}` + (category ? ` cat:${category}` : ''))}>
@@ -35,6 +36,8 @@ function CloudCard({ remote, remotes, category, onOpen, onBridge, onConsolidate 
     </button>
     ${onConsolidate && only.contents > 0 && html`<button class="link cloud-gather" data-testid=${'cloud-consolidate-' + remote.name}
       title=${t('ov.gatherTip')} onClick=${() => onConsolidate(remote.name)}>${t('ov.gather')}</button>`}
+    ${onFree && html`<button class="link cloud-gather" data-testid=${'cloud-free-' + remote.name} title=${t('ov.freeTip')}
+      onClick=${() => onFree(remote.name)}>${t('ov.free')}</button>`}
     <p class=${'cloud-unverified' + (unverified > 0 ? ' warn' : '')} data-testid=${'cloud-unverified-' + remote.name}>
       ${t('ov.noHash')}: <strong>${fmtNum(unverified)}</strong></p>
     ${unverified > 0 && html`<p class="cloud-undercount" data-testid=${'cloud-undercount-' + remote.name}>
@@ -283,7 +286,7 @@ export function Overview() {
       (data) => { if (mine === seq.current) setCov({ loading: false, data, error: '' }); },
       (e) => { if (mine === seq.current) setCov({ loading: false, data: null, error: e }); },
     );
-  }, [category, reload]);
+  }, [category, reload, ctx.syncEpoch]);
 
   useEffect(() => {
     let alive = true;
@@ -312,6 +315,7 @@ export function Overview() {
       ${data && html`<div class="cloud-cards" data-testid="cloud-cards">
         ${(data.remotes || []).map((r) => html`<${CloudCard} key=${r.name} remote=${r} remotes=${remotes} category=${category} onOpen=${openExplore}
           onBridge=${ctx.config.approvals_enabled ? () => setBridge(true) : undefined}
+          onFree=${(name) => ctx.nav(freeHash(name))}
           onConsolidate=${(remotes.some((o) => o.name !== r.name && o.writable !== false) ? (name) => openConsolidate(name) : undefined)} />`)}
       </div>`}
       ${data && html`<section class="ov-panel" aria-labelledby="ov-chart-h">

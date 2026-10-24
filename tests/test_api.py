@@ -501,3 +501,43 @@ def test_serve_refuses_empty_token_before_opening_the_catalog(monkeypatch):
     monkeypatch.setattr(api.uvicorn, "run", _no_run)
     with pytest.raises(ValueError, match="drivemerge init"):
         api.serve(Config(db_path=":memory:", api=ApiConfig(token="")))
+
+
+# ----------------------------------------------------------------- setup and free space (bearer API)
+
+def test_setup_is_readable_with_the_token_and_has_no_connection_routes(client, service):
+    body = client.get("/v1/setup", headers=AUTH).json()
+    assert set(body) == {"first_run", "config_path", "rclone", "connections", "providers"}
+    assert body["connections"] == [] and {p["key"] for p in body["providers"]} == {"drive", "onedrive", "dropbox"}
+    paths = {r.path for r in _route_paths(client.app.routes)}
+    assert not [p for p in paths if "connect" in p or "sync" in p or "rclone" in p]     # human channel only
+
+
+def test_release_report_passes_its_parameters_and_adds_a_null_quota(client, service, monkeypatch):
+    calls = _record(monkeypatch, service, "release_report", returns={"proven": {"files": 1, "bytes": 5}})
+    r = client.get("/v1/release/gdrive?path=Docs&keep_on=dropbox,onedrive", headers=AUTH)
+    assert r.status_code == 200
+    assert r.json() == {"proven": {"files": 1, "bytes": 5}, "quota": None}      # gdrive is not a connection here
+    assert calls == [(("gdrive",), {"path_prefix": "Docs", "keep_on": ["dropbox", "onedrive"]})]
+    client.get("/v1/release/gdrive", headers=AUTH)
+    assert calls[-1] == (("gdrive",), {"path_prefix": None, "keep_on": None})
+
+
+def test_release_errors_carry_code_and_params(client, service, monkeypatch):
+    err = builders.BuildError("gdrive has no write remote", "READ_ONLY", remote="gdrive")
+    _record(monkeypatch, service, "release_report", raises=err)
+    r = client.get("/v1/release/gdrive", headers=AUTH)
+    assert r.status_code == 400 and r.json()["code"] == "READ_ONLY" and r.json()["params"] == {"remote": "gdrive"}
+
+
+def test_connect_errors_are_always_coded(client, service, monkeypatch):
+    from drivemerge import connections
+    _record(monkeypatch, service, "setup_status", raises=connections.ConnectError("NO_RCLONE", "rclone is missing"))
+    r = client.get("/v1/setup", headers=AUTH)
+    assert r.status_code == 409 and r.json() == {"error": "rclone is missing", "code": "NO_RCLONE"}
+
+
+def test_a_release_plan_can_be_proposed_over_the_api(client, service, monkeypatch):
+    calls = _record(monkeypatch, service, "propose_plan", returns={"plan_id": 3, "ops": 2})
+    r = client.post("/v1/plans", headers=AUTH, json={"kind": "release", "params": {"remote": "dropbox"}})
+    assert r.status_code == 201 and calls[0][0] == ("release", {"remote": "dropbox"})
