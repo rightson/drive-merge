@@ -21,6 +21,7 @@ DEFAULT_CONFIG_PATH = Path(os.environ.get("DRIVEMERGE_CONFIG", "~/.config/drive-
 DEFAULT_DB_PATH = "~/.local/share/drive-merge/catalog.db"
 RCLONE_CONF_NAME = "rclone.conf"            # drive-merge's own rclone config, next to the main config
 CONNECTIONS_NAME = "connections.toml"       # [[remotes]] written by `drivemerge connect` / the page
+RULES_NAME = "rules.toml"                   # the active layout rules, written only by `rulestore.activate`
 
 
 @dataclass
@@ -83,6 +84,22 @@ class Config:
     @property
     def connections_path(self) -> Path:
         return self.config_dir / CONNECTIONS_NAME
+
+    @property
+    def rules_file(self) -> Path | None:
+        """The file the active layout rules live in: `[rules] path` when set, else `rules.toml` next to the config
+        file, which drive-merge owns the way it owns connections.toml. None for a config built in memory (tests):
+        it never reads a file in the person's home."""
+        if self.rules_path:
+            return Path(self.rules_path).expanduser()
+        if self.config_path:
+            return self.config_path.parent / RULES_NAME
+        return None
+
+    @property
+    def rules_owned(self) -> bool:
+        """drive-merge owns the rules file when the person did not name one with `[rules] path`."""
+        return not self.rules_path
 
     @property
     def own_rclone_conf(self) -> Path:

@@ -242,3 +242,24 @@ CREATE TABLE IF NOT EXISTS dir_stats (
     mtime_max TEXT,
     PRIMARY KEY (remote_id, path)
 ) WITHOUT ROWID;
+
+-- Layout rules (rulestore.py): every text that was ever active, the person's drafts and proposals from Claude or any
+-- API client. The active rules themselves are a file (config.rules_file); a row is `active` while its sha256 is the
+-- file's. A version is immutable once it is not a draft.
+CREATE TABLE IF NOT EXISTS rule_versions (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,   -- never reused: a stale tab holding a deleted draft must not hit a new one
+    status       TEXT NOT NULL CHECK (status IN ('draft', 'proposed', 'active', 'retired', 'dismissed')),
+    text         TEXT NOT NULL,
+    sha256       TEXT NOT NULL,                 -- of the UTF-8 text, exactly as stored
+    ok           INTEGER NOT NULL,              -- the text passed check_rules when saved
+    created_by   TEXT NOT NULL,                 -- 'ui' | 'mcp' | 'api' | 'cli' | 'file' | 'default'
+    title        TEXT,
+    note         TEXT,                          -- why: Claude's rationale, the person's note
+    base_id      INTEGER REFERENCES rule_versions(id),  -- the version it was edited from
+    revision     INTEGER NOT NULL DEFAULT 0,    -- drafts: bumps on every save
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL,
+    activated_at TEXT,
+    activated_by TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS rule_versions_active ON rule_versions(status) WHERE status = 'active';

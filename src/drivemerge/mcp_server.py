@@ -32,10 +32,12 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp_types import ToolAnnotations
 
 from .builders import BuildError
+from .classify import RuleError
 from .compare import CompareError
 from .config import load_config
 from .plans import PlanError
 from .quarantine import QuarantineError
+from .rulestore import RulesError
 from .service import Service
 from .workspace import WorkspaceError
 
@@ -53,6 +55,11 @@ WORKSPACE_STEPS = (
     "proposed by Claude. They take effect only after the human previews, approves and executes them there, or "
     "approves and executes the previewed plan with `drivemerge plan approve <id>` and `drivemerge plan execute <id>` "
     "in their own terminal."
+)
+
+RULES_STEPS = (
+    "Nothing is active. The human reviews proposal v{id} in the browser's Rules view and activates it there or with "
+    "`drivemerge rules activate {id}` in their own terminal. Plans use the active rules unless you pass rules_version."
 )
 
 PREVIEW_STEPS = (
@@ -85,8 +92,16 @@ To free space on one cloud: free_space_report, then propose_plan kind "release";
 human purges the quarantine. There are no tools to connect clouds or to sync.
 
 Typical flow: catalog_stats, then find_duplicates or folder_profiles; for a new layout write TOML rules, check them \
-with validate_rules and preview_layout; then propose_plan (dedupe, consolidate, reorganize; manual only for small \
+with validate_rules and preview_layout, then offer them with propose_rules; then propose_plan (dedupe, consolidate, reorganize; manual only for small \
 fixes), read the simulation, and ask the human to review and approve it with the CLI.
+
+Layout rules:
+- Rules decide where consolidate and reorganize plans put files. Propose a change with propose_rules; never write \
+the rules file yourself and never edit config.toml. A proposal is not active: the human reviews it in the \
+browser's Rules view and activates it there or with `drivemerge rules activate <id>` in their own terminal. Never \
+claim that proposed rules are active. get_rules shows the rules in force and the proposals waiting.
+- Plans use the active rules unless you pass rules_version (a proposal's id) to preview_layout or propose_plan; \
+the plan's review then shows that it was built with rules that are not the active ones.
 
 Workspace drafts (the user's drag-and-drop browser workspace):
 - stage_moves puts proposed moves into a draft. They show up in the user's browser at once, marked "proposed by \
@@ -121,6 +136,7 @@ MAX_QUARANTINE_PLANS = 100
 MAX_QUARANTINE_ITEMS = 200
 MAX_MANUAL_OPS = 200
 MAX_TITLE = 200
+MAX_RULES_NOTE = 2000
 MAX_MESSAGE = 1000
 MAX_DRAFTS = 50
 MAX_DRAFT_ACTIONS = 100
@@ -145,7 +161,7 @@ _HIDDEN_KEYS = ("digest", "approval_code", "snapshot")
 _DRAFT_CODES = ("NOT_FOUND", "NOT_OPEN")
 
 # Errors the model can act on; anything else is reported by the SDK as a generic failure.
-_USER_ERRORS = (ValueError, KeyError, PlanError, sqlite3.Error)
+_USER_ERRORS = (ValueError, KeyError, PlanError, RulesError, sqlite3.Error)
 
 
 def _clamp(value: int, lo: int, hi: int) -> int:
@@ -165,7 +181,7 @@ def _pick(row: dict, keys: tuple[str, ...]) -> dict:
 
 
 def _error_message(exc: Exception) -> str:
-    if isinstance(exc, (WorkspaceError, CompareError, BuildError, QuarantineError)):
+    if isinstance(exc, (WorkspaceError, CompareError, BuildError, QuarantineError, RulesError, RuleError)):
         text = f"{exc.code}: {exc}"
     elif isinstance(exc, sqlite3.Error):
         text = f"catalog database error (try again if a scan or execution is running): {exc}"
@@ -516,8 +532,11 @@ def build_server(service: Service) -> MCPServer:
 
     @tool()
     def validate_rules(rules_toml: str) -> dict:
-        """Check layout rules written in TOML without touching the catalog. Returns {"ok": true, "rules": [names]}
-        or {"ok": false, "error": "..."} where the error says how to fix the rules.
+        """Check layout rules written in TOML without touching the catalog. Returns {"ok": true, "rules": [names],
+        "warnings": [...]} or {"ok": false, "error": "...", "code", "params", "errors": [...], "warnings": [...]}
+        where `error` says how to fix the rules; `errors` lists every problem, each with a code, a message and
+        params that include its `line` and rule. Warnings (a rule that can never match, a fallback that loses the
+        folder structure, a remote that is not a cloud here) do not make rules invalid.
 
         Format: optional [layout] (unit_markers, bundle_patterns, fallback) and [[rule]] tables, first match wins:
         name, target (path template such as "Photos/{year}/{year}-{month}/{name}"), and optional match keys
@@ -528,11 +547,12 @@ def build_server(service: Service) -> MCPServer:
 
     @tool()
     def preview_layout(rules_toml: str | None = None, remotes: list[str] | None = None, target_root: str = "",
-                       path_prefix: str | None = None, limit: int = 50) -> dict:
+                       path_prefix: str | None = None, limit: int = 50, rules_version: int | None = None) -> dict:
         """Dry-run the layout rules over the catalog: where each file WOULD go. Changes nothing.
 
         Args:
-            rules_toml: rules as in validate_rules; default is the user's configured rules.
+            rules_toml: rules as in validate_rules; default is the user's active rules.
+            rules_version: instead of rules_toml, the id of a stored version (such as your own proposal).
             remotes: only files on these remotes; default all.
             target_root: folder every target path is placed under.
             path_prefix: only files at or below this folder.
@@ -540,7 +560,45 @@ def build_server(service: Service) -> MCPServer:
         Returns total placements, counts per rule name (fallback = no rule matched) and a sample.
         """
         return _wrap(service.preview_layout(rules_text=rules_toml, remotes=remotes or None, target_root=target_root,
-                                            path_prefix=path_prefix or None, limit=_clamp(limit, 1, MAX_PREVIEW)))
+                                            path_prefix=path_prefix or None, limit=_clamp(limit, 1, MAX_PREVIEW),
+                                            rules_version=rules_version))
+
+    @tool()
+    def get_rules() -> dict:
+        """The layout rules in force and the proposals waiting for the human. Read-only.
+
+        Returns `source` ("file" or "default": the packaged rules), `path` (the rules file or null), `version` (its id
+        in the history or null), `sha256`, `text` (the rules, comments included), `error` (set when the file is
+        missing or does not parse) and `proposals`: [{id, title, created_by, created_at}] not yet decided.
+        Rules you want changed go through propose_rules; you cannot activate, edit or dismiss anything.
+        """
+        return _wrap(service.rules_overview())
+
+    @tool(writes=True)
+    def propose_rules(rules_toml: str, title: str, note: str | None = None) -> dict:
+        """Propose new layout rules for the human to review. Nothing becomes active.
+
+        The whole rules file goes in rules_toml (same format as validate_rules; start from get_rules so comments and
+        unchanged rules stay). The rules are checked first: invalid rules are NOT stored and come back as
+        {"ok": false, "error", "code", "params", "errors", "warnings"} for you to fix. Valid rules are stored as a
+        proposal and come back as {"version_id", "rule_changes": [{name, change}], "warnings"}. title is at most 200
+        characters, note (why) at most 2000.
+
+        The human reviews the proposal's diff and preview in the browser's Rules view and activates it there, or with
+        `drivemerge rules activate <id>` in their own terminal. You cannot activate, edit or dismiss rules, and a
+        proposal is never active by itself: never say it is. Plans use the active rules unless you pass
+        rules_version to propose_plan.
+        """
+        if len(title) > MAX_TITLE:
+            raise ValueError(f"title is at most {MAX_TITLE} characters")
+        if note is not None and len(note) > MAX_RULES_NOTE:
+            raise ValueError(f"note is at most {MAX_RULES_NOTE} characters")
+        checked = service.validate_rules(rules_toml)
+        if not checked["ok"]:
+            return _wrap({**checked, "stored": False})
+        row = service.save_rule_version(rules_toml, created_by="mcp", title=title, note=note)
+        return _wrap({"version_id": row["id"], "rule_changes": row["changes"], "warnings": checked.get("warnings", [])},
+                     reminder=RULES_STEPS.format(id=row["id"]))
 
     @tool(writes=True)
     def propose_plan(kind: Literal["dedupe", "consolidate", "reorganize", "manual", "release"], params: dict[str, Any],
@@ -559,9 +617,11 @@ def build_server(service: Service) -> MCPServer:
         - consolidate: gather everything onto one remote in the rule-based layout. params: target (remote name),
           target_root (folder on the target), sources (remotes to take from), delete_sources (default false:
           copy only), reorganize_target (also move files already on the target into the layout), path_prefix,
-          rules (TOML text, see validate_rules; default the user's configured rules).
+          rules (TOML text, see validate_rules) or rules_version (the id of a stored version, such as your own
+          proposal from propose_rules; not both); default the user's ACTIVE rules. The plan records the exact rules
+          it was built with, and its review tells the human when they are not the active ones.
         - reorganize: move files inside one remote into the layout. params: remote, target_root, path_prefix,
-          rules.
+          rules or rules_version (as for consolidate).
         - release: free space on one cloud by deleting (into quarantine) the files that provably exist on other
           clouds; see free_space_report first. params: remote (the cloud to free), path_prefix (only this folder),
           keep_on (clouds whose copies to rely on, in order of preference). Space returns only when the human

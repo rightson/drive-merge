@@ -174,3 +174,28 @@ export const quarantineCheck = (planId, body) => call('POST', `/v1/quarantine/pl
 export const restore = (planId, body) => call('POST', `/v1/ui/plans/${planId}/restore`, { body });
 /** `body`: {confirm: 'purge', remote?}: purge, plan after plan, every item past its retention. */
 export const purgeDue = (body) => call('POST', '/v1/ui/quarantine/purge', { body });
+
+// Layout rules (docs/RULES.md section E). All of these but `activateRules` are normal-channel routes; activation is the
+// one human-channel route (session cookie + CSRF header, approvals enabled).
+export const rules = () => call('GET', '/v1/rules');
+export const rulesDefault = () => call('GET', '/v1/rules/default');
+/** Pure validation of a rules text: errors, warnings, outline and the diff against the active rules (never reads the catalog). */
+export const checkRules = (text, against) => call('POST', '/v1/rules/check', { body: against ? { text, against } : { text } });
+/** `op`: {op: 'move', index, to} | {op: 'remove', index} | {op: 'insert', after, rule}; answers {text, check}. */
+export const transformRules = (text, op) => call('POST', '/v1/rules/transform', { body: { text, op } });
+/** `query`: {status, limit}. */
+export const ruleVersions = (query) => call('GET', '/v1/rules/versions', { query });
+export const ruleVersion = (id) => call('GET', `/v1/rules/versions/${id}`);
+/** `body`: {text, title?, note?, base_id?}; a draft for the browser session. */
+export const createRuleVersion = (body) => call('POST', '/v1/rules/versions', { body });
+/** `body`: {text, revision, title?, note?}. */
+export const updateRuleDraft = (id, body) => call('PUT', `/v1/rules/versions/${id}`, { body });
+export const discardRuleVersion = (id) => call('DELETE', `/v1/rules/versions/${id}`);
+/** `body`: {text | version_id, remotes?, target_root?, path_prefix?, mode?, filter?, limit?}. */
+export const previewRules = (body) => call('POST', '/v1/rules/preview', { body });
+/** One page of a preview's files; `query`: {filter, q, offset, limit}. */
+export const previewFiles = (id, query) => call('GET', `/v1/rules/previews/${encodeURIComponent(id)}/files`, { query });
+/** `body`: {text | version_id, remote, path, target_root?}; answers {edited, active}. */
+export const explainRules = (body) => call('POST', '/v1/rules/explain', { body });
+/** `body`: {base_sha256}: the SHA-256 of the active file that the person reviewed against. */
+export const activateRules = (id, body) => call('POST', `/v1/ui/rules/versions/${id}/activate`, { body });

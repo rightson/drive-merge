@@ -109,6 +109,8 @@ rclone 負責所有雲端 I/O；drive-merge 負責目錄、身分判定、規劃
 
 **LLM 的角色：提出「規則」，不是逐檔操作。** LLM 看到的是 **folder profiles**（每個資料夾的檔案數、大小、類別分布、前 5 副檔名、日期範圍、5 個樣本檔名、是否為 unit、重複比例），而不是百萬筆檔名。它提出規則 → 服務以決定性方式套用 → 產生 Plan → 模擬 → 你審閱。好處：可擴展、可重現、可審計，且 LLM 看不到也碰不到雲端。
 
+**編輯規則。** 生效中的規則是一個檔案（`config.toml` 旁的 `rules.toml`，或 `[rules] path` 指定的檔案）；在有檔案之前使用內建預設值。你可以在瀏覽器的「規則」檢視（即時驗證、對照目錄的前後預覽、歷史與復原）或任何文字編輯器中編輯。Claude 只能*提議*規則變更（`propose_rules`）；讓規則生效是人的行為，只能在瀏覽器的人類通道或你自己的終端機進行，而且每份計畫都會記錄它所使用的確切規則。設計請見 [RULES.md](RULES.zh-TW.md)。
+
 ## 7. 安全模型：Plan → Simulate → Approve → Execute
 
 **任何寫入雲端的動作都只能來自已核准的 Plan。** 沒有例外路徑。
@@ -165,9 +167,9 @@ LLM（Claude Code、其他聊天介面）能做的：搜尋、看統計與 folde
 
 ## 9. 介面
 
-- **CLI** `drivemerge`：`init`、`remotes`、`scan`、`identity rebuild`、`bridge`、`search`、`stats`、`duplicates`、`profiles`、`rules check/preview`、`plan dedupe|consolidate|reorganize|show|simulate|approve|execute|restore|purge`、`changes`、`serve`、`mcp`、`rclone-combine`。
-- **REST API**（只綁 127.0.0.1，Bearer token）：`/v1/stats`、`/v1/search`、`/v1/entries/{id}`、`/v1/entries/{id}/locations`、`/v1/duplicates`、`/v1/profiles`、`/v1/changes`、`/v1/plans`（建立/列出/模擬/報告）。核准與執行**不經 API**（只能在 CLI/TTY）。沒有任何計畫路由（列出、顯示、建立、模擬，或工作區伺服器的進度 journal）會回傳 digest、確認碼或快照；建立計畫時也會拒絕參數 `draft_id` 與 `draft_version`，它們只有工作區預覽才會設定：只有當計畫就是某份草稿自己的預覽時，執行該計畫才會結束那份工作區草稿。
-- **MCP（給 Claude Code）**：`search_files`、`catalog_stats`、`find_duplicates`、`file_locations`、`folder_profiles`、`validate_rules`、`preview_layout`、`propose_plan`、`simulate_plan`、`get_plan`。
+- **CLI** `drivemerge`：`init`、`remotes`、`scan`、`identity rebuild`、`bridge`、`search`、`stats`、`duplicates`、`profiles`、`rules check|preview|show|history|activate`、`plan dedupe|consolidate|reorganize|show|simulate|approve|execute|restore|purge`、`changes`、`serve`、`mcp`、`rclone-combine`。
+- **REST API**（只綁 127.0.0.1，Bearer token）：`/v1/stats`、`/v1/search`、`/v1/entries/{id}`、`/v1/entries/{id}/locations`、`/v1/duplicates`、`/v1/profiles`、`/v1/changes`、`/v1/plans`（建立/列出/模擬/報告）、`/v1/rules/*`（檢查、版本、預覽；只有提議與草稿）。核准與執行**不經 API**（只能在 CLI/TTY）。沒有任何計畫路由（列出、顯示、建立、模擬，或工作區伺服器的進度 journal）會回傳 digest、確認碼或快照；建立計畫時也會拒絕參數 `draft_id` 與 `draft_version`，它們只有工作區預覽才會設定：只有當計畫就是某份草稿自己的預覽時，執行該計畫才會結束那份工作區草稿。
+- **MCP（給 Claude Code）**：`search_files`、`catalog_stats`、`find_duplicates`、`file_locations`、`folder_profiles`、`validate_rules`、`preview_layout`、`propose_plan`、`simulate_plan`、`get_plan`、`get_rules`、`propose_rules`。讓規則生效不是 API 或 MCP 的動作：只能在瀏覽器的人類通道，或你自己的終端機執行 `rules activate`（[RULES.md](RULES.zh-TW.md)）。
 
 ## 10. 同步到外部資料庫
 

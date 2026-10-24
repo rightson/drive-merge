@@ -15,6 +15,7 @@ import {
   Rail, ViewHost, currentView, navigate, parseHash, useRoute, useShortcuts,
 } from './shell.js';
 import { compareHash, plansHash } from './query.js';
+import { rulesHash } from './rules.js';
 import { isWaiting } from './plans.js';
 import { SyncControl, useSyncJob } from './sync.js';
 import {
@@ -69,6 +70,9 @@ function App() {
   // the "proposed by Claude" toast. `seen` holds the ids the page already knows, so only a new plan raises the toast.
   const [plansState, setPlansState] = useState({ list: [], loaded: false, error: null });
   const seenPlans = useRef(null);
+  // The rule changes waiting for review (docs/RULES.md section 6): polled with the plans, for the rail badge and the toast.
+  const [rulesState, setRulesState] = useState({ proposals: [], loaded: false });
+  const seenRules = useRef(null);
   const [frac, setFrac] = useState(() => {
     const v = parseFloat(safeStorage('get', SPLIT_KEY));
     return v >= 0.25 && v <= 0.75 ? v : 0.5;
@@ -510,6 +514,29 @@ function App() {
       return null;
     }
   }
+  async function refreshRules() {
+    try {
+      const r = await api.ruleVersions({ status: 'proposed', limit: 50 });
+      const list = (Array.isArray(r) ? r : (r && r.versions) || []).filter((v) => !v.status || v.status === 'proposed');
+      setRulesState({ proposals: list, loaded: true });
+      if (seenRules.current === null) {
+        seenRules.current = new Set(list.map((v) => v.id));
+        return list;
+      }
+      list.filter((v) => !seenRules.current.has(v.id)).forEach((v) => {
+        seenRules.current.add(v.id);
+        if (v.created_by === 'mcp') {
+          toast('claude', t('rules.fromClaudeToast', { id: v.id, title: v.title || '' }),
+            { label: t('rules.review'), run: () => navigate(rulesHash(`/v/${v.id}`)) });
+        }
+      });
+      return list;
+    } catch (e) {
+      return null;  // an older server has no rules routes; the next poll tries again
+    }
+  }
+  const refreshRulesRef = useRef(refreshRules);
+  refreshRulesRef.current = refreshRules;
   const refreshPlansRef = useRef(refreshPlans);
   refreshPlansRef.current = refreshPlans;
   const ready = !!config && !!draft;
@@ -517,7 +544,8 @@ function App() {
   useEffect(() => {
     if (!ready) return undefined;
     refreshPlansRef.current();
-    const tick = () => { if (!document.hidden) refreshPlansRef.current(); };
+    refreshRulesRef.current();
+    const tick = () => { if (!document.hidden) { refreshPlansRef.current(); refreshRulesRef.current(); } };
     const timer = setInterval(tick, PLANS_POLL_MS);
     document.addEventListener('visibilitychange', tick);
     return () => { clearInterval(timer); document.removeEventListener('visibilitychange', tick); };
@@ -560,6 +588,7 @@ function App() {
     outdated, markOutdated, catalogRefreshed,
     setup, refreshSetup, sync, syncEpoch,
     plans: plansState, refreshPlans, openWorkspacePreview,
+    rules: rulesState, refreshRules,
     nav: navigate, lang, switchLang, revealInWorkspace, openWorkspace: () => navigate('#/workspace'),
     compare: (a, b) => navigate(compareHash({ remote: a.remote, path: a.path }, { remote: b.remote, path: b.path })),
     compareWith: (a) => navigate(compareHash({ remote: a.remote, path: a.path }, null)),
@@ -569,7 +598,7 @@ function App() {
 
   return html`<${AppCtx.Provider} value=${ctx}>
     <div class="app" data-lang=${lang} data-drawer=${onWorkspace ? drawer || undefined : undefined} data-view=${route.view}>
-      <${Rail} route=${route} waiting=${plansState.list.filter(isWaiting).length} />
+      <${Rail} route=${route} waiting=${plansState.list.filter(isWaiting).length} proposals=${rulesState.proposals.length} />
       <div class="shell-main">
       ${config.approvals_enabled === false && html`<div class="banner banner-info" role="note" data-testid="approvals-banner">
         <${Icon} name="info" size=${17} />

@@ -261,3 +261,103 @@ def test_workspace_module_is_the_one_the_facade_calls(conn, catalog):
     svc = Service(cfg, conn=conn)
     assert svc.create_draft("x")["status"] == "open"
     assert workspace.list_drafts(conn)[0]["title"] == "x"
+
+
+# --------------------------------------------------------------------------- the rules a plan was built with (docs/RULES.md D)
+
+from drivemerge import classify, rulestore  # noqa: E402
+from drivemerge import service as service_mod  # noqa: E402
+
+_RULES = '[[rule]]\nname = "docs"\ncategory = ["pdf"]\ntarget = "Docs/{name}"\n'
+
+
+def _rules_service(conn, catalog, tmp_path, *, rules_text=None):
+    from drivemerge.config import Config, RemoteConfig
+    cfg_dir = tmp_path / "cfg"
+    cfg_dir.mkdir()
+    (cfg_dir / "config.toml").write_text("")
+    if rules_text is not None:
+        (cfg_dir / "rules.toml").write_text(rules_text)
+    gd = catalog.remote("gd", "drive")
+    db_ = catalog.remote("db", "dropbox")
+    catalog.file(gd, "Scans/a.pdf", size=10, md5="aa")
+    catalog.file(db_, "Misc/b.pdf", size=20, md5="bb")
+    cfg = Config(config_path=cfg_dir / "config.toml", remotes=[RemoteConfig("gd", "drive", "gd:", "gd:"),
+                                                              RemoteConfig("db", "dropbox", "db:", "db:")])
+    return Service(cfg, conn=conn), cfg_dir
+
+
+@pytest.mark.parametrize("kind, params", [("consolidate", {"target": "gd"}), ("reorganize", {"remote": "gd"})])
+def test_rules_ref_is_reserved_like_a_draft_id(conn, catalog, tmp_path, kind, params):
+    svc, _ = _rules_service(conn, catalog, tmp_path)
+    assert "rules_ref" in service_mod.RESERVED_PARAMS
+    with pytest.raises(ServiceError, match="rules_ref"):
+        svc.propose_plan(kind, {**params, "rules_ref": {"source": "file"}}, created_by="api")
+    with pytest.raises(ServiceError, match="rules_ref"):
+        svc.estimate_plan(kind, {**params, "rules_ref": {}})
+    assert plans.list_plans(conn) == []
+
+
+def test_only_consolidate_and_reorganize_plans_record_rules(conn, catalog, tmp_path):
+    svc, _ = _rules_service(conn, catalog, tmp_path, rules_text=_RULES)
+    for kind, params in (("consolidate", {"target": "gd"}), ("reorganize", {"remote": "gd"})):
+        res = svc.propose_plan(kind, params, created_by="t")
+        assert res["plan_id"] is not None, (kind, res)
+        p = plans.get_plan(conn, res["plan_id"]).params
+        assert p["rules"] == _RULES
+        assert p["rules_ref"] == {"source": "file", "version": rulestore.active(conn, svc.config).version_id,
+                                  "sha256": rulestore.sha256_of(_RULES), "path": str(tmp_path / "cfg" / "rules.toml")}
+    assert svc.propose_plan("dedupe", {}, created_by="t")["code"] == "NOTHING_TO_DO"
+    manual = svc.propose_plan("manual", {"ops": [{"op": "copy", "src": "gd:Scans/a.pdf", "dst": "gd:Copy/a.pdf",
+                                                 "reason": "x"}]}, created_by="t")
+    assert not {"rules", "rules_ref"} & set(plans.get_plan(conn, manual["plan_id"]).params)
+
+
+def test_the_builder_gets_the_resolved_rules_and_an_edit_is_observed_before_the_build(conn, catalog, tmp_path, monkeypatch):
+    svc, cfg_dir = _rules_service(conn, catalog, tmp_path, rules_text=_RULES)
+    seen = {}
+
+    def spy(conn_, **kw):
+        seen["rules"] = [r.name for r in kw["ruleset"].rules]
+        seen["observed"] = conn_.execute("SELECT COUNT(*) FROM rule_versions WHERE created_by = 'file'").fetchone()[0]
+        return builders.BuildResult(ops=[], skipped=[], stats={})
+
+    monkeypatch.setattr(builders, "build_reorganize", spy)
+    assert svc.propose_plan("reorganize", {"remote": "gd"}, created_by="t")["code"] == "NOTHING_TO_DO"
+    assert seen == {"rules": ["docs"], "observed": 1}                         # the outside file was in the history first
+    v = svc.save_rule_version(_RULES + '[[rule]]\nname = "more"\next = ["txt"]\ntarget = "T/{name}"\n', created_by="mcp")
+    svc.propose_plan("reorganize", {"remote": "gd", "rules_version": v["id"]}, created_by="t")
+    assert seen["rules"] == ["docs", "more"]
+    svc.propose_plan("reorganize", {"remote": "gd", "rules": '[[rule]]\nname = "x"\ntarget = "X"\n'}, created_by="t")
+    assert seen["rules"] == ["x"]
+
+
+def test_estimate_plan_writes_nothing_and_does_not_observe(conn, catalog, tmp_path):
+    svc, _ = _rules_service(conn, catalog, tmp_path, rules_text=_RULES)
+    before = conn.total_changes
+    est = svc.estimate_plan("consolidate", {"target": "gd"})
+    assert conn.total_changes == before and est["rules_ref"]["source"] == "file" and est["rules_ref"]["version"] is None
+    assert conn.execute("SELECT COUNT(*) FROM rule_versions").fetchone()[0] == 0
+
+
+def test_plan_summaries_carry_rules_ref_but_not_the_rules_text(conn, catalog, tmp_path):
+    svc, _ = _rules_service(conn, catalog, tmp_path, rules_text=_RULES)
+    pid = svc.propose_plan("reorganize", {"remote": "gd"}, created_by="t")["plan_id"]
+    (row,) = [r for r in svc.plan_summaries() if r["id"] == pid]
+    assert "rules" not in row["params"] and row["params"]["rules_ref"]["source"] == "file"
+    assert plans.get_plan(conn, pid).params["rules"] == _RULES               # the full plan still has the text
+    assert svc.plan(pid)["params"]["rules"] == _RULES
+
+
+def test_a_missing_configured_file_stops_rule_plans_but_not_the_others(conn, catalog, tmp_path):
+    svc, _ = _rules_service(conn, catalog, tmp_path)
+    svc.config.rules_path = str(tmp_path / "nowhere.toml")
+    for kind, params in (("consolidate", {"target": "gd"}), ("reorganize", {"remote": "gd"})):
+        with pytest.raises(rulestore.RulesError) as exc:
+            svc.propose_plan(kind, params, created_by="t")
+        assert exc.value.code == "RULES_FILE_MISSING"
+    assert svc.propose_plan("dedupe", {}, created_by="t")["code"] == "NOTHING_TO_DO"
+    assert svc.validate_rules(_RULES)["ok"] is True
+    with pytest.raises(rulestore.RulesError):
+        svc.profiles()
+    assert classify.default_rules().rules                                       # the packaged rules are still there to ask for

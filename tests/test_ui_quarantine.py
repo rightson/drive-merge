@@ -382,7 +382,7 @@ def finish(ui: Ui) -> None:
 def test_quarantine_is_a_rail_item_after_plans_with_alt_6_and_a_badge_for_plans_with_due_items(make_q):
     ui = start(make_q())
     order = ui.page.eval_on_selector_all('[data-testid="rail"] a', "els => els.map(e => e.dataset.testid)")
-    assert order == ["rail-clouds", "rail-overview", "rail-explore", "rail-compare", "rail-plans", "rail-quarantine", "rail-workspace"]
+    assert order == ["rail-clouds", "rail-overview", "rail-explore", "rail-compare", "rail-plans", "rail-quarantine", "rail-rules", "rail-workspace"]
     expect(ui.tid("rail-quarantine-badge")).to_have_attribute("data-count", "2")     # #21 and #17 have items past retention
     expect(ui.tid("rail-quarantine")).to_have_attribute("title", re.compile(r"\(Alt\+6\)"))
     assert len(ui.mock.calls_to("GET", "/v1/quarantine")) == 1                       # read at start, no timed polling

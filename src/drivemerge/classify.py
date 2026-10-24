@@ -25,7 +25,7 @@ import string
 import tomllib
 import unicodedata
 from collections import Counter
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
 from datetime import date
 from functools import lru_cache
@@ -63,8 +63,50 @@ _RULE_KEYS = ("name", "target", "category", "ext", "path_glob", "name_regex",
 _CATEGORY_NAMES = frozenset(CATEGORIES) | {"other"}
 
 
+# Every code a RuleError can carry; the page words each one in both languages from its params.
+RULE_CODES: tuple[str, ...] = (
+    "TOML_SYNTAX", "UNKNOWN_TOP_KEY", "LAYOUT_NOT_TABLE", "UNKNOWN_LAYOUT_KEY", "MARKER_HAS_SLASH",
+    "RULES_NOT_ARRAY", "RULE_NOT_TABLE", "UNKNOWN_RULE_KEY", "NAME_REQUIRED", "NAME_RESERVED", "NAME_DUPLICATE",
+    "TARGET_REQUIRED", "BAD_UNIT_FLAG", "TEMPLATE_EMPTY", "TEMPLATE_SYNTAX", "TEMPLATE_FORMAT_SPEC",
+    "UNKNOWN_VARIABLE", "TEMPLATE_DOT_SEGMENT", "UNIT_NEEDS_RELPATH", "UNIT_VAR_NOT_UNIT", "BAD_STRING_LIST",
+    "UNKNOWN_CATEGORY", "BAD_EXT", "BAD_GLOB", "BAD_REGEX", "BAD_SIZE", "SIZE_RANGE_EMPTY", "RULES_TOO_LARGE",
+    "RULES_CANNOT_EDIT", "TARGET_ROOT_DOT",
+)
+# Codes of the warnings check_rules (and Service.check_rules) can add.
+RULE_WARN_CODES: tuple[str, ...] = ("RULE_SHADOWED", "FALLBACK_LOSES_STRUCTURE", "RULE_REMOTE_UNKNOWN")
+MAX_RULES_BYTES = 256 * 1024
+MAX_ERRORS = 50
+_ECHO_CAP = 200
+
+
+def _cap(value: object) -> str:
+    """Text of the person's that an error echoes: a string, at most 200 characters."""
+    text = value if isinstance(value, str) else repr(value)
+    return text if len(text) <= _ECHO_CAP else text[:_ECHO_CAP - 1] + "…"
+
+
 class RuleError(ValueError):
-    """A rules file is invalid. The message is written for an LLM to read and fix the rules."""
+    """A rules file is invalid. The message is written for an LLM to read and fix the rules.
+
+    `code` and `params` let the page word the problem itself: `params` always holds `line` (1-based or None),
+    `rule_index` (1-based or None), `rule` (the rule's name or None) and `key` (or None), plus the code's own.
+    """
+
+    def __init__(self, code: str, message: str, **params: object):
+        super().__init__(message)
+        self.code = code
+        self.params: dict[str, object] = {"line": None, "rule_index": None, "rule": None, "key": None, **params}
+
+    def locate(self, **where: object) -> RuleError:
+        """Fill in the position parts (line, rule_index, rule, key) that are still unknown."""
+        for k, v in where.items():
+            if self.params.get(k) is None:
+                self.params[k] = v
+        return self
+
+
+class LayoutCancelled(Exception):
+    """plan_layout was stopped by its `cancel` callback."""
 
 
 @dataclass
@@ -94,94 +136,170 @@ def _suggest(word: str, options) -> str:
     return f" (did you mean {close[0]!r}?)" if close else ""
 
 
-def _check_template(template: object, where: str) -> frozenset[str]:
-    """Validate a path template and return the variables it uses."""
+def _suggestion(word: str, options) -> str | None:
+    close = difflib.get_close_matches(word, list(options), n=1)
+    return close[0] if close else None
+
+
+def _check_template(template: object, where: str, kind: str = "target") -> frozenset[str]:
+    """Validate a path template and return the variables it uses. `where` words the English message;
+    `kind` ('target' or 'fallback') is the `where` param of the coded error and its `key`."""
     if not isinstance(template, str) or not template.strip("/"):
-        raise RuleError(f"{where}: must be a non-empty path template such as \"Photos/{{year}}/{{name}}\"; got {template!r}")
+        raise RuleError("TEMPLATE_EMPTY", f"{where}: must be a non-empty path template such as \"Photos/{{year}}/{{name}}\"; got {template!r}",
+                        where=kind, key=kind)
     try:
         parsed = list(string.Formatter().parse(template))
     except ValueError as exc:
-        raise RuleError(f"{where}: bad template {template!r} ({exc}); write a literal brace as {{{{ or }}}}") from exc
+        raise RuleError("TEMPLATE_SYNTAX", f"{where}: bad template {template!r} ({exc}); write a literal brace as {{{{ or }}}}",
+                        where=kind, key=kind) from exc
     used: set[str] = set()
     for _literal, fname, spec, conv in parsed:
         if fname is None:
             continue
         if spec or conv:
-            raise RuleError(f"{where}: in {template!r}, {{{fname}}} must be a bare variable "
-                            "(format specs like :>5 and conversions like !r are not supported)")
+            raise RuleError("TEMPLATE_FORMAT_SPEC", f"{where}: in {template!r}, {{{fname}}} must be a bare variable "
+                            "(format specs like :>5 and conversions like !r are not supported)",
+                            where=kind, key=kind, variable=_cap(fname))
         if fname not in VARIABLES:
-            raise RuleError(f"{where}: unknown template variable {{{fname}}} in {template!r}"
-                            f"{_suggest(fname, VARIABLES)}; valid variables: {', '.join(VARIABLES)}")
+            raise RuleError("UNKNOWN_VARIABLE", f"{where}: unknown template variable {{{fname}}} in {template!r}"
+                            f"{_suggest(fname, VARIABLES)}; valid variables: {', '.join(VARIABLES)}",
+                            where=kind, key=kind, variable=_cap(fname), suggestion=_suggestion(fname, VARIABLES))
         used.add(fname)
     if any(seg in (".", "..") for seg in template.split("/")):
-        raise RuleError(f"{where}: template {template!r} contains a '.' or '..' path segment; targets must stay inside the destination")
+        raise RuleError("TEMPLATE_DOT_SEGMENT", f"{where}: template {template!r} contains a '.' or '..' path segment; targets must stay inside the destination",
+                        where=kind, key=kind)
     return frozenset(used)
 
 
 def _str_list(value: object, where: str, key: str) -> tuple[str, ...]:
     if not isinstance(value, list) or not all(isinstance(v, str) and v for v in value):
-        raise RuleError(f"{where}: {key} must be a list of non-empty strings, e.g. {key} = [\"a\", \"b\"]; got {value!r}")
+        raise RuleError("BAD_STRING_LIST", f"{where}: {key} must be a list of non-empty strings, e.g. {key} = [\"a\", \"b\"]; got {value!r}", key=key)
     return tuple(value)
 
 
 def _size(value: object, where: str, key: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise RuleError(f"{where}: {key} must be a non-negative integer number of bytes; got {value!r}")
+        raise RuleError("BAD_SIZE", f"{where}: {key} must be a non-negative integer number of bytes; got {value!r}",
+                        key=key, value=_cap(value))
     return value
 
 
 def _parse_rule(index: int, raw: object, seen: set[str]) -> Rule:
+    try:
+        return _parse_rule_inner(index, raw, seen)
+    except RuleError as exc:
+        name = raw.get("name") if isinstance(raw, dict) else None
+        raise exc.locate(rule_index=index, rule=_cap(name) if isinstance(name, str) else None) from None
+
+
+def _parse_rule_inner(index: int, raw: object, seen: set[str]) -> Rule:
     if not isinstance(raw, dict):
-        raise RuleError(f"rule #{index}: each rule must be a [[rule]] table")
+        raise RuleError("RULE_NOT_TABLE", f"rule #{index}: each rule must be a [[rule]] table")
     label = f"rule #{index}" + (f" ({raw['name']!r})" if isinstance(raw.get("name"), str) else "")
     for key in raw:
         if key not in _RULE_KEYS:
-            raise RuleError(f"{label}: unknown key {key!r}{_suggest(key, _RULE_KEYS)}; valid keys: {', '.join(_RULE_KEYS)}")
+            raise RuleError("UNKNOWN_RULE_KEY", f"{label}: unknown key {key!r}{_suggest(key, _RULE_KEYS)}; valid keys: {', '.join(_RULE_KEYS)}",
+                            key=_cap(key), suggestion=_suggestion(key, _RULE_KEYS))
     name = raw.get("name")
     if not isinstance(name, str) or not name.strip():
-        raise RuleError(f"{label}: 'name' is required and must be a non-empty string")
+        raise RuleError("NAME_REQUIRED", f"{label}: 'name' is required and must be a non-empty string", key="name")
     if name == "fallback":
-        raise RuleError(f"{label}: the name 'fallback' is reserved for files no rule matched")
+        raise RuleError("NAME_RESERVED", f"{label}: the name 'fallback' is reserved for files no rule matched", key="name")
     if name in seen:
-        raise RuleError(f"{label}: duplicate rule name {name!r}; names must be unique")
+        raise RuleError("NAME_DUPLICATE", f"{label}: duplicate rule name {name!r}; names must be unique", key="name", name=_cap(name))
     seen.add(name)
     if "target" not in raw:
-        raise RuleError(f"{label}: 'target' is required, e.g. target = \"Photos/{{year}}/{{name}}\"")
+        raise RuleError("TARGET_REQUIRED", f"{label}: 'target' is required, e.g. target = \"Photos/{{year}}/{{name}}\"", key="target")
     unit = raw.get("unit", False)
     if not isinstance(unit, bool):
-        raise RuleError(f"{label}: unit must be true or false; got {unit!r}")
-    used = _check_template(raw["target"], label)
+        raise RuleError("BAD_UNIT_FLAG", f"{label}: unit must be true or false; got {unit!r}", key="unit")
+    used = _check_template(raw["target"], label, "target")
     if unit and "relpath" not in used:
-        raise RuleError(f"{label}: a unit rule's target must contain {{relpath}} so the files inside the unit "
-                        f"keep their internal structure (e.g. \"Projects/{{unit}}/{{relpath}}\"); got {raw['target']!r}")
+        raise RuleError("UNIT_NEEDS_RELPATH", f"{label}: a unit rule's target must contain {{relpath}} so the files inside the unit "
+                        f"keep their internal structure (e.g. \"Projects/{{unit}}/{{relpath}}\"); got {raw['target']!r}", key="target")
     if not unit and "unit" in used:
-        raise RuleError(f"{label}: {{unit}} only exists for unit rules; add unit = true or drop it from the target")
+        raise RuleError("UNIT_VAR_NOT_UNIT", f"{label}: {{unit}} only exists for unit rules; add unit = true or drop it from the target", key="target")
 
     categories = _str_list(raw.get("category", []), label, "category")
     for c in categories:
         if c not in _CATEGORY_NAMES:
-            raise RuleError(f"{label}: unknown category {c!r}{_suggest(c, _CATEGORY_NAMES)}; valid: {', '.join(sorted(_CATEGORY_NAMES))}")
+            raise RuleError("UNKNOWN_CATEGORY", f"{label}: unknown category {c!r}{_suggest(c, _CATEGORY_NAMES)}; valid: {', '.join(sorted(_CATEGORY_NAMES))}",
+                            key="category", value=_cap(c), suggestion=_suggestion(c, _CATEGORY_NAMES))
     exts = tuple(e.lower().lstrip(".") for e in _str_list(raw.get("ext", []), label, "ext"))
     if not all(exts):
-        raise RuleError(f"{label}: ext entries must be extensions such as \"jpg\" (lowercase, no dot)")
+        raise RuleError("BAD_EXT", f"{label}: ext entries must be extensions such as \"jpg\" (lowercase, no dot)", key="ext")
     glob = raw.get("path_glob")
     if glob is not None and (not isinstance(glob, str) or not glob):
-        raise RuleError(f"{label}: path_glob must be a non-empty string such as \"*/Screenshots/*\"")
+        raise RuleError("BAD_GLOB", f"{label}: path_glob must be a non-empty string such as \"*/Screenshots/*\"", key="path_glob")
     regex = raw.get("name_regex")
     if regex is not None:
         if not isinstance(regex, str) or not regex:
-            raise RuleError(f"{label}: name_regex must be a non-empty string")
+            raise RuleError("BAD_REGEX", f"{label}: name_regex must be a non-empty string", key="name_regex", value=_cap(regex))
         try:
             re.compile(regex)
         except re.error as exc:
-            raise RuleError(f"{label}: name_regex {regex!r} is not a valid regular expression: {exc}") from exc
+            raise RuleError("BAD_REGEX", f"{label}: name_regex {regex!r} is not a valid regular expression: {exc}",
+                            key="name_regex", value=_cap(regex)) from exc
     lo = _size(raw["min_size"], label, "min_size") if "min_size" in raw else None
     hi = _size(raw["max_size"], label, "max_size") if "max_size" in raw else None
     if lo is not None and hi is not None and lo > hi:
-        raise RuleError(f"{label}: min_size ({lo}) is larger than max_size ({hi}); nothing can match")
+        raise RuleError("SIZE_RANGE_EMPTY", f"{label}: min_size ({lo}) is larger than max_size ({hi}); nothing can match",
+                        key="min_size", min=lo, max=hi)
     return Rule(name=name, target=raw["target"], category=categories, ext=exts, path_glob=glob,
                 name_regex=regex, min_size=lo, max_size=hi,
                 remote=_str_list(raw.get("remote", []), label, "remote"), unit=unit)
+
+
+def _toml_syntax_error(exc: tomllib.TOMLDecodeError) -> RuleError:
+    line = getattr(exc, "lineno", None)
+    column = getattr(exc, "colno", None)
+    if line is None:
+        m = re.search(r"\(at line (\d+), column (\d+)\)", str(exc))
+        if m:
+            line, column = int(m.group(1)), int(m.group(2))
+    return RuleError("TOML_SYNTAX", f"invalid TOML: {exc}", line=line, column=column)
+
+
+def _layout_errors(data: dict) -> tuple[list[RuleError], tuple[str, ...], tuple[str, ...], str]:
+    """Every problem of the [layout] table (and unknown top-level keys), plus the values it resolves to."""
+    errors: list[RuleError] = []
+    for key in data:
+        if key not in _TOP_KEYS:
+            errors.append(RuleError("UNKNOWN_TOP_KEY", f"unknown top-level key {key!r}{_suggest(key, _TOP_KEYS)}; "
+                                    "use [layout] for layout settings and one [[rule]] table per rule",
+                                    key=_cap(key), suggestion=_suggestion(key, _TOP_KEYS)))
+    markers, bundles, fallback = DEFAULT_UNIT_MARKERS, DEFAULT_BUNDLE_PATTERNS, DEFAULT_FALLBACK
+    layout = data.get("layout", {})
+    if not isinstance(layout, dict):
+        errors.append(RuleError("LAYOUT_NOT_TABLE", "'layout' must be a table: write [layout]", key="layout"))
+        return errors, markers, bundles, fallback
+    for key in layout:
+        if key not in _LAYOUT_KEYS:
+            errors.append(RuleError("UNKNOWN_LAYOUT_KEY", f"[layout]: unknown key {key!r}{_suggest(key, _LAYOUT_KEYS)}; valid keys: {', '.join(_LAYOUT_KEYS)}",
+                                    key=_cap(key), suggestion=_suggestion(key, _LAYOUT_KEYS)))
+    if "unit_markers" in layout:
+        try:
+            markers = _str_list(layout["unit_markers"], "[layout]", "unit_markers")
+            bad = next((m for m in markers if "/" in m), None)
+            if bad is not None:
+                raise RuleError("MARKER_HAS_SLASH", "[layout]: unit_markers match a child's name, so they cannot contain '/'",
+                                key="unit_markers", value=_cap(bad))
+        except RuleError as exc:
+            errors.append(exc)
+            markers = DEFAULT_UNIT_MARKERS
+    if "bundle_patterns" in layout:
+        try:
+            bundles = _str_list(layout["bundle_patterns"], "[layout]", "bundle_patterns")
+        except RuleError as exc:
+            errors.append(exc)
+    if "fallback" in layout:
+        fallback = layout["fallback"]
+        try:
+            _check_template(fallback, "[layout] fallback", "fallback")
+        except RuleError as exc:
+            errors.append(exc)
+            fallback = DEFAULT_FALLBACK
+    return errors, tuple(markers), tuple(bundles), fallback
 
 
 def load_rules(text: str) -> RuleSet:
@@ -189,36 +307,31 @@ def load_rules(text: str) -> RuleSet:
     try:
         data = tomllib.loads(text)
     except tomllib.TOMLDecodeError as exc:
-        raise RuleError(f"invalid TOML: {exc}") from exc
+        raise _toml_syntax_error(exc) from exc
     for key in data:
         if key not in _TOP_KEYS:
-            raise RuleError(f"unknown top-level key {key!r}{_suggest(key, _TOP_KEYS)}; "
-                            "use [layout] for layout settings and one [[rule]] table per rule")
-    layout = data.get("layout", {})
-    if not isinstance(layout, dict):
-        raise RuleError("'layout' must be a table: write [layout]")
-    for key in layout:
-        if key not in _LAYOUT_KEYS:
-            raise RuleError(f"[layout]: unknown key {key!r}{_suggest(key, _LAYOUT_KEYS)}; valid keys: {', '.join(_LAYOUT_KEYS)}")
-    markers = _str_list(layout["unit_markers"], "[layout]", "unit_markers") if "unit_markers" in layout else DEFAULT_UNIT_MARKERS
-    if any("/" in m for m in markers):
-        raise RuleError("[layout]: unit_markers match a child's name, so they cannot contain '/'")
-    bundles = _str_list(layout["bundle_patterns"], "[layout]", "bundle_patterns") if "bundle_patterns" in layout else DEFAULT_BUNDLE_PATTERNS
-    fallback = layout.get("fallback", DEFAULT_FALLBACK)
-    _check_template(fallback, "[layout] fallback")
-
+            raise RuleError("UNKNOWN_TOP_KEY", f"unknown top-level key {key!r}{_suggest(key, _TOP_KEYS)}; "
+                            "use [layout] for layout settings and one [[rule]] table per rule",
+                            key=_cap(key), suggestion=_suggestion(key, _TOP_KEYS))
+    layout_errors, markers, bundles, fallback = _layout_errors(data)
+    if layout_errors:
+        raise layout_errors[0]
     raw_rules = data.get("rule", [])
     if not isinstance(raw_rules, list):
-        raise RuleError("'rule' must be an array of tables: write [[rule]] once per rule")
+        raise RuleError("RULES_NOT_ARRAY", "'rule' must be an array of tables: write [[rule]] once per rule", key="rule")
     seen: set[str] = set()
     rules = [_parse_rule(i, raw, seen) for i, raw in enumerate(raw_rules, start=1)]
     return RuleSet(rules=rules, unit_markers=tuple(markers), bundle_patterns=tuple(bundles), fallback=fallback)
 
 
+def default_rules_text() -> str:
+    """The packaged default rules file, comments and all."""
+    return resources.files("drivemerge").joinpath("default_rules.toml").read_text(encoding="utf-8")
+
+
 def default_rules() -> RuleSet:
     """The packaged default rules (a sensible layout for a personal archive)."""
-    text = resources.files("drivemerge").joinpath("default_rules.toml").read_text(encoding="utf-8")
-    return load_rules(text)
+    return load_rules(default_rules_text())
 
 
 # --------------------------------------------------------------------------- dates and rendering
@@ -271,10 +384,11 @@ def _parse_segment(segment: str) -> tuple[tuple[str, str | None], ...]:
     try:
         parsed = list(string.Formatter().parse(segment))
     except ValueError as exc:
-        raise RuleError(f"bad template segment {segment!r}: {exc}") from exc
+        raise RuleError("TEMPLATE_SYNTAX", f"bad template segment {segment!r}: {exc}", where="target", key="target") from exc
     for _literal, fname, spec, conv in parsed:
         if fname is not None and (spec or conv):
-            raise RuleError(f"template variable {{{fname}}} must be bare (no format spec or conversion)")
+            raise RuleError("TEMPLATE_FORMAT_SPEC", f"template variable {{{fname}}} must be bare (no format spec or conversion)",
+                            where="target", key="target", variable=_cap(fname))
     return tuple((literal, fname) for literal, fname, _spec, _conv in parsed)
 
 
@@ -296,12 +410,14 @@ def render(template: str, variables: dict[str, str]) -> str:
             pieces.append(literal)
             if fname is not None:
                 if fname not in variables:
-                    raise RuleError(f"unknown template variable {{{fname}}} in {template!r}; valid variables: {', '.join(VARIABLES)}")
+                    raise RuleError("UNKNOWN_VARIABLE", f"unknown template variable {{{fname}}} in {template!r}; valid variables: {', '.join(VARIABLES)}",
+                                    where="target", key="target", variable=_cap(fname), suggestion=_suggestion(fname, VARIABLES))
                 pieces.append(str(variables[fname]))
         parts = [p for p in "".join(pieces).split("/") if p] or ["_"]
         for part in parts:
             if part in (".", ".."):
-                raise RuleError(f"template {template!r} rendered a {part!r} path segment, which is not allowed")
+                raise RuleError("TEMPLATE_DOT_SEGMENT", f"template {template!r} rendered a {part!r} path segment, which is not allowed",
+                                where="target", key="target")
         out.extend(parts)
     return "/".join(out) or "_"
 
@@ -601,7 +717,8 @@ def _compile(ruleset: RuleSet) -> tuple[list[_Compiled], list[_Compiled]]:
         try:
             regex = re.compile(r.name_regex) if r.name_regex else None
         except re.error as exc:
-            raise RuleError(f"rule {r.name!r}: name_regex {r.name_regex!r} is not a valid regular expression: {exc}") from exc
+            raise RuleError("BAD_REGEX", f"rule {r.name!r}: name_regex {r.name_regex!r} is not a valid regular expression: {exc}",
+                            key="name_regex", rule=_cap(r.name), value=_cap(r.name_regex)) from exc
         c = _Compiled(
             rule=r, categories=frozenset(r.category), exts=frozenset(e.lower().lstrip(".") for e in r.ext),
             remotes=frozenset(r.remote),
@@ -686,7 +803,7 @@ def _unit_ctx(conn: sqlite3.Connection, rname: str, unit: Unit, unit_rules: list
 def _clean_root(target_root: str) -> str:
     parts = [p for p in target_root.split("/") if p]
     if any(p in (".", "..") for p in parts):
-        raise RuleError(f"target_root {target_root!r} contains a '.' or '..' path segment")
+        raise RuleError("TARGET_ROOT_DOT", f"target_root {target_root!r} contains a '.' or '..' path segment", key="target_root")
     return "/".join(parts)
 
 
@@ -759,8 +876,15 @@ def _echoes(template: str, fields: frozenset[str], variables: dict[str, str], ba
     return False
 
 
+SAMPLE_MULTIPLIER = 2654435761      # the hash a layout sample keeps rows by: ((id * M) % 2**32) < threshold
+SAMPLE_MODULUS = 4294967296
+CANCEL_EVERY = 1000
+
+
 def plan_layout(conn: sqlite3.Connection, ruleset: RuleSet, *, remote_ids: list[int] | None = None, target_root: str = "",
-                path_prefix: str | None = None, root_remote_ids: Collection[int] | None = None) -> list[Placement]:
+                path_prefix: str | None = None, root_remote_ids: Collection[int] | None = None,
+                sample_threshold: int | None = None, units: Mapping[int, list[Unit]] | None = None,
+                cancel: Callable[[], bool] | None = None) -> list[Placement]:
     """One Placement per live file (native docs included), ordered by (remote, path).
 
     * A file inside a unit goes with its unit. The first `unit = true` rule that
@@ -795,6 +919,11 @@ def plan_layout(conn: sqlite3.Connection, ruleset: RuleSet, *, remote_ids: list[
 
     `path_prefix` limits the output to files at or under that folder in every
     selected remote; units are still detected on the whole remote.
+
+    For previews: `sample_threshold` keeps only the rows whose hash ((id * 2654435761) % 2**32) is below it,
+    the same rows every time; `units` ({remote id: units}) stands in for detect_units, whose result depends only
+    on the rules' unit_markers and bundle_patterns and the catalog; `cancel` is asked every 1,000 rows and a
+    true answer raises LayoutCancelled. Without them the output is exactly what it always was.
     """
     root = _clean_root(target_root)
     root_parts = root.split("/") if root else []
@@ -802,14 +931,18 @@ def plan_layout(conn: sqlite3.Connection, ruleset: RuleSet, *, remote_ids: list[
     fallback_fields = _template_fields(ruleset.fallback)
     prefix = path_prefix.strip("/") if path_prefix else ""
     where, args = _under(prefix, include_self=True)
+    if sample_threshold is not None:
+        where += f" AND ((id * {SAMPLE_MULTIPLIER}) % {SAMPLE_MODULUS}) < {int(sample_threshold)}"
     rooted = None if root_remote_ids is None else set(root_remote_ids)
     insensitive = {rid for rid, ci in conn.execute("SELECT id, case_insensitive FROM remotes") if ci}
     remote_names = [name for _rid, name in _remotes(conn, None)]
     out: list[Placement] = []
+    seen_rows = 0
     for rid, rname in _remotes(conn, remote_ids):
         fold = _norm if rid in insensitive else _exact
         inside = [fold(p) for p in root_parts] if root_parts and (rooted is None or rid in rooted) else []
-        units = {u.path: u for u in detect_units(conn, ruleset, remote_ids=[rid])}
+        found = units[rid] if units is not None and rid in units else detect_units(conn, ruleset, remote_ids=[rid])
+        unit_at = {u.path: u for u in found}
         ctxs: dict[str, _UnitCtx] = {}
         rows = conn.execute(
             "SELECT id, path, parent, name, ext, category, size, mtime FROM entries "
@@ -817,14 +950,17 @@ def plan_layout(conn: sqlite3.Connection, ruleset: RuleSet, *, remote_ids: list[
             (rid, *args),
         )
         for eid, path, parent, name, ext, cat, size, mtime in rows:
+            seen_rows += 1
+            if cancel is not None and seen_rows % CANCEL_EVERY == 0 and cancel():
+                raise LayoutCancelled()
             here = path                      # the path the rules see: inside the root, relative to it
             if inside:
                 here = _below(path, inside, fold) or path
             unit = None
-            if units:
+            if unit_at:
                 p = parent
                 while p:
-                    unit = units.get(p)
+                    unit = unit_at.get(p)
                     if unit is not None:
                         break
                     p = p.rpartition("/")[0]
@@ -865,3 +1001,502 @@ def plan_layout(conn: sqlite3.Connection, ruleset: RuleSet, *, remote_ids: list[
             out.append(Placement(eid, rid, path, f"{root}/{target}" if root else target, rule_name,
                                  unit.path if unit else None))
     return out
+
+
+# --------------------------------------------------------------------------- checking and editing rules as text
+
+@dataclass(frozen=True)
+class Span:
+    """A table of a rules file by line (1-based): `comment_line` is the first of the comment lines directly above
+    the header, `end_line` the line before the next span's `comment_line` (or the last line)."""
+    kind: str                # "layout" | "rule"
+    index: int               # 1-based position among the rules; 0 for the layout
+    comment_line: int
+    header_line: int
+    end_line: int
+
+
+_RULE_HEADER = re.compile(r"^\s*\[\[\s*rule\s*\]\]\s*(?:#.*)?$")
+_LAYOUT_HEADER = re.compile(r"^\s*\[\s*layout\s*\]\s*(?:#.*)?$")
+_COMMENT_LINE = re.compile(r"^\s*#")
+_TOKEN = re.compile(r'"""|\'\'\'|#[^\n]*|"(?:[^"\\\n]|\\.)*"|\'[^\'\n]*\'|\n')
+_ML_BASIC_STEP = re.compile(r'\\.|"""', re.S)
+
+
+def _lines_inside_strings(text: str) -> list[bool]:
+    """For each line (0-based): does it start inside a multi-line string? Headers there are text, not tables."""
+    inside = [False]
+    pos, state = 0, None
+    while True:
+        if state is None:
+            m = _TOKEN.search(text, pos)
+            if m is None:
+                return inside
+            pos, tok = m.end(), m.group()
+            if tok == "\n":
+                inside.append(False)
+            elif tok in ('"""', "'''"):
+                state = tok
+        else:
+            if state == "'''":
+                end = text.find("'''", pos)
+                stop = len(text) if end < 0 else end + 3
+            else:
+                stop = len(text)
+                for m in _ML_BASIC_STEP.finditer(text, pos):
+                    if m.group() == '"""':
+                        stop = m.end()
+                        break
+            inside.extend([True] * text.count("\n", pos, stop))
+            pos, state = stop, None
+
+
+class _Source:
+    """The lines of a parsed rules text and its spans (empty when they cannot be trusted)."""
+
+    def __init__(self, text: str, data: dict):
+        lines = text.split("\n")
+        if text.endswith("\n"):
+            lines.pop()
+        self.lines = lines
+        self.inside = _lines_inside_strings(text)
+        self.spans = self._spans(data)
+
+    def _is_inside(self, i: int) -> bool:
+        return i < len(self.inside) and self.inside[i]
+
+    def _spans(self, data: dict) -> list[Span]:
+        headers: list[tuple[int, str]] = []
+        for i, line in enumerate(self.lines):
+            if self._is_inside(i):
+                continue
+            if _RULE_HEADER.match(line):
+                headers.append((i + 1, "rule"))
+            elif _LAYOUT_HEADER.match(line):
+                headers.append((i + 1, "layout"))
+        rules = data.get("rule", [])
+        if (sum(1 for _l, k in headers if k == "rule") != (len(rules) if isinstance(rules, list) else -1)
+                or sum(1 for _l, k in headers if k == "layout") != (1 if isinstance(data.get("layout"), dict) else 0)):
+            return []
+        starts: list[tuple[int, int, str]] = []
+        previous = 0
+        for header, kind in headers:
+            first = header
+            while first - 1 > previous and _COMMENT_LINE.match(self.lines[first - 2]) and not self._is_inside(first - 2):
+                first -= 1
+            starts.append((first, header, kind))
+            previous = header
+        out: list[Span] = []
+        counter = 0
+        for n, (first, header, kind) in enumerate(starts):
+            end = starts[n + 1][0] - 1 if n + 1 < len(starts) else len(self.lines)
+            if kind == "rule":
+                counter += 1
+            out.append(Span(kind, counter if kind == "rule" else 0, first, header, end))
+        return out
+
+    def rule_span(self, index: int) -> Span | None:
+        return next((s for s in self.spans if s.kind == "rule" and s.index == index), None)
+
+    def layout_span(self) -> Span | None:
+        return next((s for s in self.spans if s.kind == "layout"), None)
+
+    def key_line(self, span: Span | None, key: str | None) -> int | None:
+        """The line of `key =` inside the span, else the span's header line (None without a span)."""
+        if span is None:
+            return None
+        if key:
+            rx = re.compile(r"^\s*[\"']?" + re.escape(key) + r"[\"']?\s*=")
+            for n in range(span.header_line + 1, span.end_line + 1):
+                if not self._is_inside(n - 1) and rx.match(self.lines[n - 1]):
+                    return n
+        return span.header_line
+
+    def top_key_line(self, key: str) -> int | None:
+        rx = re.compile(r"^\s*(?:\[\[?\s*" + re.escape(key) + r"\s*\]\]?|[\"']?" + re.escape(key) + r"[\"']?\s*=)")
+        for n, line in enumerate(self.lines, start=1):
+            if not self._is_inside(n - 1) and rx.match(line):
+                return n
+        return None
+
+
+def rule_spans(text: str) -> list[Span]:
+    """The `[layout]` and `[[rule]]` tables of `text` by line, or [] when the text does not parse or the number
+    of `[[rule]]` headers differs from the number of parsed rules (inline arrays, headers inside strings)."""
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        return []
+    return _Source(text, data).spans
+
+
+_MATCH_KEYS = ("category", "ext", "path_glob", "name_regex", "min_size", "max_size", "remote")
+
+
+@dataclass
+class RulesCheck:
+    ok: bool
+    errors: list[RuleError]
+    warnings: list[dict]
+    outline: list[dict]
+    layout: dict
+    ruleset: RuleSet | None
+
+
+def error_dict(exc: RuleError) -> dict:
+    """The JSON form of a RuleError: its code, English message and params."""
+    return {"code": exc.code, "message": str(exc), "params": dict(exc.params)}
+
+
+def _warning(code: str, message: str, *, line=None, rule_index=None, rule=None, key=None, **params) -> dict:
+    return {"code": code, "message": message,
+            "params": {"line": line, "rule_index": rule_index, "rule": rule, "key": key, **params}}
+
+
+def _list_of(value: object) -> list:
+    return list(value) if isinstance(value, list) else []
+
+
+def _outline(raw_rules: list, src: _Source) -> list[dict]:
+    items = []
+    for i, raw in enumerate(raw_rules, start=1):
+        raw = raw if isinstance(raw, dict) else {}
+        span = src.rule_span(i)
+
+        def num(key: str):
+            v = raw.get(key)
+            return v if isinstance(v, int) and not isinstance(v, bool) else None
+
+        def text(key: str):
+            v = raw.get(key)
+            return v if isinstance(v, str) else None
+
+        items.append({
+            "index": i, "name": text("name"), "unit": raw.get("unit") is True,
+            "line": span.header_line if span else None, "end_line": span.end_line if span else None,
+            "match": {"category": [c for c in _list_of(raw.get("category")) if isinstance(c, str)],
+                      "ext": [c for c in _list_of(raw.get("ext")) if isinstance(c, str)],
+                      "path_glob": text("path_glob"), "name_regex": text("name_regex"),
+                      "min_size": num("min_size"), "max_size": num("max_size"),
+                      "remote": [c for c in _list_of(raw.get("remote")) if isinstance(c, str)]},
+            "target": text("target"),
+        })
+    return items
+
+
+def _catch_all(raw: dict) -> bool:
+    return not any(raw.get(k) not in (None, [], "") for k in _MATCH_KEYS)
+
+
+def _shadow_warnings(raw_rules: list, src: _Source) -> list[dict]:
+    warnings = []
+    first: dict[bool, str] = {}
+    for i, raw in enumerate(raw_rules, start=1):
+        if not isinstance(raw, dict) or not isinstance(raw.get("name"), str):
+            continue
+        unit = raw.get("unit") is True
+        if unit in first:
+            span = src.rule_span(i)
+            warnings.append(_warning(
+                "RULE_SHADOWED",
+                f"rule #{i} ({raw['name']!r}) never matches: the earlier {'unit' if unit else 'loose-file'} rule "
+                f"{first[unit]!r} has no match key, so it takes everything first",
+                line=span.header_line if span else None, rule_index=i, rule=_cap(raw["name"]), by=_cap(first[unit])))
+        elif _catch_all(raw):
+            first[unit] = raw["name"]
+    return warnings
+
+
+def check_rules(text: str) -> RulesCheck:
+    """Validate a rules text completely: every rule's first error and every layout error (each rule is parsed on
+    its own, so one bad rule does not hide the others), warnings, the outline of the rules and the resolved layout.
+    Reads no catalog. `load_rules` is the strict version that raises the first error."""
+    empty_layout = {"unit_markers": list(DEFAULT_UNIT_MARKERS), "bundle_patterns": list(DEFAULT_BUNDLE_PATTERNS),
+                    "fallback": DEFAULT_FALLBACK, "defaulted": list(_LAYOUT_KEYS)}
+    if len(text.encode("utf-8")) > MAX_RULES_BYTES:
+        err = RuleError("RULES_TOO_LARGE", f"the rules text is larger than {MAX_RULES_BYTES // 1024} KB", limit=MAX_RULES_BYTES)
+        return RulesCheck(False, [err], [], [], empty_layout, None)
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        return RulesCheck(False, [_toml_syntax_error(exc)], [], [], empty_layout, None)
+    src = _Source(text, data)
+    errors: list[RuleError] = []
+    layout_span = src.layout_span()
+    layout_errors, markers, bundles, fallback = _layout_errors(data)
+    for e in layout_errors:
+        key = e.params.get("key")
+        if e.code == "UNKNOWN_TOP_KEY":
+            e.locate(line=src.top_key_line(str(key)))
+        elif e.code == "LAYOUT_NOT_TABLE":
+            e.locate(line=src.top_key_line("layout"))
+        else:
+            e.locate(line=src.key_line(layout_span, key if isinstance(key, str) else None))
+        errors.append(e)
+
+    raw_rules = data.get("rule", [])
+    rules: list[Rule] = []
+    if not isinstance(raw_rules, list):
+        errors.append(RuleError("RULES_NOT_ARRAY", "'rule' must be an array of tables: write [[rule]] once per rule",
+                                key="rule", line=src.top_key_line("rule")))
+        raw_rules = []
+    seen: set[str] = set()
+    for i, raw in enumerate(raw_rules, start=1):
+        try:
+            rules.append(_parse_rule(i, raw, seen))
+        except RuleError as e:
+            key = e.params.get("key")
+            e.locate(line=src.key_line(src.rule_span(i), key if isinstance(key, str) else None))
+            errors.append(e)
+    errors.sort(key=lambda e: (e.params["line"] is None, e.params["line"] or 0))
+    errors = errors[:MAX_ERRORS]
+
+    warnings = _shadow_warnings(raw_rules, src)
+    given = data.get("layout") if isinstance(data.get("layout"), dict) else {}
+    fallback_bad = any(e.params.get("key") == "fallback" for e in layout_errors)
+    if "fallback" in given and not fallback_bad and not _template_fields(fallback) & {"path", "relpath"}:
+        warnings.append(_warning(
+            "FALLBACK_LOSES_STRUCTURE",
+            f"[layout] fallback {fallback!r} uses neither {{path}} nor {{relpath}}, so unmatched files "
+            "(and the files of units no unit rule claims) lose their folder structure",
+            line=src.key_line(layout_span, "fallback"), key="fallback"))
+    warnings.sort(key=lambda w: (w["params"]["line"] is None, w["params"]["line"] or 0))
+
+    layout = {"unit_markers": list(markers), "bundle_patterns": list(bundles), "fallback": fallback,
+              "defaulted": [k for k in _LAYOUT_KEYS if k not in given]}
+    ok = not errors
+    ruleset = RuleSet(rules=rules, unit_markers=markers, bundle_patterns=bundles, fallback=fallback) if ok else None
+    return RulesCheck(ok, errors, warnings, _outline(raw_rules, src), layout, ruleset)
+
+
+# ---- transform_rules
+
+def _toml_basic(value: str) -> str:
+    out = []
+    for ch in value:
+        if ch == "\\":
+            out.append("\\\\")
+        elif ch == '"':
+            out.append('\\"')
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\t":
+            out.append("\\t")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ord(ch) < 0x20 or ord(ch) == 0x7F:
+            out.append(f"\\u{ord(ch):04x}")
+        else:
+            out.append(ch)
+    return '"' + "".join(out) + '"'
+
+
+def _toml_text(value: str, *, literal_ok: bool = False) -> str:
+    if literal_ok and "'" not in value and not any(ord(c) < 0x20 or ord(c) == 0x7F for c in value):
+        return "'" + value + "'"
+    return _toml_basic(value)
+
+
+def _render_rule(rule: dict) -> list[str]:
+    lines = ["[[rule]]", f"name = {_toml_basic(rule['name'])}"]
+    if rule.get("unit"):
+        lines.append("unit = true")
+    for key in ("category", "ext", "remote"):
+        if rule.get(key):
+            lines.append(f"{key} = [" + ", ".join(_toml_basic(v) for v in rule[key]) + "]")
+    for key in ("path_glob", "name_regex"):
+        if rule.get(key):
+            lines.append(f"{key} = {_toml_text(rule[key], literal_ok=True)}")
+    for key in ("min_size", "max_size"):
+        if rule.get(key) is not None:
+            lines.append(f"{key} = {rule[key]}")
+    lines.append(f"target = {_toml_basic(rule['target'])}")
+    return lines
+
+
+def _clean_insert(rule: object) -> dict:
+    """The keys of an inserted rule that say something (None, empty lists and unit = false are left out)."""
+    if not isinstance(rule, dict):
+        raise RuleError("RULE_NOT_TABLE", "the rule to insert must be an object")
+    out: dict = {}
+    for key, value in rule.items():
+        if value is None or value == [] or (value is False and key == "unit"):
+            continue
+        out[key] = value
+    return out
+
+
+def transform_rules(text: str, op: dict) -> str:
+    """Move, remove or insert a whole `[[rule]]` block, keeping every other byte (comments, blank lines) as it is.
+
+    `op` is {"op": "move", "index", "to"}, {"op": "remove", "index"} or {"op": "insert", "after": index | 0, "rule": {...}}
+    (indexes are 1-based). The comment lines directly above a rule travel with it. The result is parsed again and
+    must hold exactly the expected rules, else RuleError RULES_CANNOT_EDIT (`reason`: unparsed, not_found, mismatch).
+    An inserted rule is validated like any rule.
+    """
+    def refuse(reason: str, message: str) -> RuleError:
+        return RuleError("RULES_CANNOT_EDIT", message, reason=reason)
+
+    if len(text.encode("utf-8")) > MAX_RULES_BYTES:
+        raise RuleError("RULES_TOO_LARGE", f"the rules text is larger than {MAX_RULES_BYTES // 1024} KB", limit=MAX_RULES_BYTES)
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        raise refuse("unparsed", f"the text does not parse as TOML, so it cannot be edited by rule: {exc}") from exc
+    raw = data.get("rule", [])
+    if not isinstance(raw, list):
+        raise refuse("unparsed", "'rule' is not an array of [[rule]] tables")
+    src = _Source(text, data)
+    spans = [s for s in src.spans if s.kind == "rule"]
+    if len(spans) != len(raw):
+        raise refuse("unparsed", "the [[rule]] tables cannot be located in the text (inline arrays or headers inside strings)")
+    n = len(raw)
+    kind = op.get("op") if isinstance(op, dict) else None
+    lines = text.split("\n")                    # a trailing "" element stands for the final newline
+
+    def index_of(key: str) -> int:
+        v = op.get(key)
+        if isinstance(v, bool) or not isinstance(v, int) or not 1 <= v <= n:
+            raise refuse("not_found", f"{key} {v!r} is not a rule of this text (it has {n})")
+        return v
+
+    if kind == "move":
+        i, to = index_of("index"), index_of("to")
+        bodies, gaps = [], []                   # each rule's lines without its trailing blank lines, and those
+        for s in spans:
+            seg = lines[s.comment_line - 1:s.end_line]
+            keep = len(seg)
+            while keep and not seg[keep - 1].strip():
+                keep -= 1
+            bodies.append(seg[:keep])
+            gaps.append(seg[keep:])
+        bodies.insert(to - 1, bodies.pop(i - 1))     # the blank lines stay where they were: only the bodies move
+        new_lines = lines[:min(s.comment_line for s in src.spans) - 1]
+        taken = 0
+        for s in src.spans:
+            if s.kind == "layout":
+                new_lines.extend(lines[s.comment_line - 1:s.end_line])
+            else:
+                new_lines.extend(bodies[taken] + gaps[taken])
+                taken += 1
+        new_lines.extend(lines[len(src.lines):])
+        expected = list(raw)
+        expected.insert(to - 1, expected.pop(i - 1))
+    elif kind == "remove":
+        i = index_of("index")
+        s = spans[i - 1]
+        new_lines = lines[:s.comment_line - 1] + lines[s.end_line:]
+        expected = raw[:i - 1] + raw[i:]
+    elif kind == "insert":
+        after = op.get("after", 0)
+        if isinstance(after, bool) or not isinstance(after, int) or not 0 <= after <= n:
+            raise refuse("not_found", f"after {after!r} is not a position among the {n} rules")
+        rule = _clean_insert(op.get("rule"))
+        _parse_rule(after + 1, rule, {r.get("name") for r in raw if isinstance(r, dict)})
+        block = _render_rule(rule)
+        if n == 0:
+            pos = len(src.lines)
+        elif after == 0:
+            pos = spans[0].comment_line - 1
+        else:
+            pos = spans[after - 1].end_line
+        head, tail = lines[:pos], lines[pos:]
+        if head and head[-1].strip():
+            block = [""] + block
+        new_lines = head + block + [""] + tail
+        expected = raw[:after] + [rule] + raw[after:]
+    else:
+        raise refuse("not_found", f"unknown edit {kind!r}; use move, remove or insert")
+
+    result = "\n".join(new_lines)
+    try:
+        check = tomllib.loads(result)
+    except tomllib.TOMLDecodeError as exc:
+        raise refuse("mismatch", f"the edited text does not parse: {exc}") from exc
+    if check.get("rule", []) != expected or check.get("layout") != data.get("layout"):
+        raise refuse("mismatch", "the edited text does not hold exactly the rules the edit should produce")
+    return result
+
+
+# ---- explain
+
+def _why_not(c: _Compiled, remote: str, category: str, ext: str, name: str, path: str,
+             size: int | None) -> tuple[str, object, object] | None:
+    """The first match key of `c` that fails for this file as (key, wanted, got), None when every key matches.
+    Same order as _first_match."""
+    if c.categories and category not in c.categories:
+        return "category", list(c.rule.category), category
+    if c.exts and ext not in c.exts:
+        return "ext", list(c.rule.ext), ext
+    if c.remotes and remote not in c.remotes:
+        return "remote", list(c.rule.remote), remote
+    if c.glob is not None and not c.glob.match(_norm(path)):
+        return "path_glob", c.rule.path_glob, path
+    if c.regex is not None and not c.regex.search(unicodedata.normalize("NFC", name)):
+        return "name_regex", c.rule.name_regex, name
+    if c.sized:
+        if size is None:
+            key = "min_size" if c.rule.min_size is not None else "max_size"
+            return key, c.rule.min_size if key == "min_size" else c.rule.max_size, None
+        if c.rule.min_size is not None and size < c.rule.min_size:
+            return "min_size", c.rule.min_size, size
+        if c.rule.max_size is not None and size > c.rule.max_size:
+            return "max_size", c.rule.max_size, size
+    return None
+
+
+def explain(conn: sqlite3.Connection, ruleset: RuleSet, remote_id: int, path: str, *, target_root: str = "",
+            units: Mapping[int, list[Unit]] | None = None) -> dict:
+    """Why a live file lands where it does under `ruleset`: each rule in order with `match`, `skip` (the first key
+    that failed, with what the rule wants and what the file has) or `not_tried`; the unit the file belongs to; and
+    the destination. A file inside a unit is judged by the unit rules against its unit folder, a loose file by the
+    loose rules. KeyError (NOT_FOUND) for a path that is not a live file."""
+    row = conn.execute(
+        "SELECT e.name, e.ext, e.category, e.size, r.name, r.case_insensitive FROM entries e "
+        "JOIN remotes r ON r.id = e.remote_id "
+        "WHERE e.remote_id = ? AND e.path = ? AND e.is_dir = 0 AND e.present = 1", (remote_id, path)).fetchone()
+    if row is None:
+        raise KeyError(f"NOT_FOUND: no live file {path!r} on remote {remote_id}")
+    name, ext, cat, size, rname, ci = row
+    placed = plan_layout(conn, ruleset, remote_ids=[remote_id], target_root=target_root, path_prefix=path, units=units)
+    placement = next((p for p in placed if p.src_path == path), None)
+    found = units[remote_id] if units is not None and remote_id in units else detect_units(conn, ruleset, remote_ids=[remote_id])
+    unit = next((u for u in found if path.startswith(u.path + "/")), None)
+    loose_rules, unit_rules = _compile(ruleset)
+    root = _clean_root(target_root)
+    fold = _norm if ci else _exact
+    inside = [fold(p) for p in root.split("/")] if root else []
+
+    def view(p: str) -> str:
+        return (_below(p, inside, fold) or p) if inside else p
+
+    tried: dict[str, tuple] = {}
+    matched: str | None = None
+    if unit is not None:
+        uname = posixpath.basename(unit.path)
+        uext = _name_ext(uname)
+        total = conn.execute(
+            "SELECT COALESCE(SUM(size), 0) FROM entries WHERE remote_id = ? AND is_dir = 0 AND present = 1 "
+            "AND path >= ? AND path < ?", (remote_id, unit.path + "/", unit.path + "0")).fetchone()[0]
+        candidates = [(c, (rname, category_of(uext), uext, uname, view(unit.path), total)) for c in unit_rules]
+    else:
+        candidates = [(c, (rname, cat, ext, name, view(path), size)) for c in loose_rules]
+    for c, args in candidates:
+        why = _why_not(c, *args)
+        if why is None:
+            matched = c.rule.name
+            tried[c.rule.name] = ("match", None, None, None)
+            break
+        tried[c.rule.name] = ("skip", *why)
+    steps = []
+    for r in ruleset.rules:
+        result = tried.get(r.name)
+        if result is None:
+            steps.append({"rule": r.name, "unit": r.unit, "result": "not_tried", "failed_key": None, "wanted": None, "got": None})
+        else:
+            steps.append({"rule": r.name, "unit": r.unit, "result": result[0], "failed_key": result[1],
+                          "wanted": result[2], "got": result[3]})
+    target = placement.target_path if placement else None
+    return {"remote": rname, "path": path, "unit": unit.path if unit else None,
+            "unit_rule": matched if unit is not None else None, "steps": steps,
+            "rule": placement.rule if placement else "fallback", "target": target, "in_place": target == path}

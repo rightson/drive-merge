@@ -3688,7 +3688,7 @@ def _query(ui: Ui) -> dict:
 def test_plans_sits_between_compare_and_the_workspace_and_alt_5_opens_it(make_ui):
     ui = make_ui(locale="en-US").open()
     order = ui.page.eval_on_selector_all('[data-testid="rail"] a', "els => els.map(e => e.dataset.testid)")
-    assert order == ["rail-clouds", "rail-overview", "rail-explore", "rail-compare", "rail-plans", "rail-quarantine", "rail-workspace"]
+    assert order == ["rail-clouds", "rail-overview", "rail-explore", "rail-compare", "rail-plans", "rail-quarantine", "rail-rules", "rail-workspace"]
     ui.page.keyboard.press("Alt+5")
     expect(ui.tid("rail-plans")).to_have_attribute("aria-current", "page")
     expect(ui.tid("view-plans")).to_be_visible()
