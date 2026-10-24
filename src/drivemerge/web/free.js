@@ -74,7 +74,14 @@ export function Free({ remote, params }) {
     const next = { path, keep: keepParam, ...patch };
     ctx.nav(freeHash(remote, { path: next.path, keep: next.keep }), opts);
   };
-  useEffect(() => { setPathText(path); }, [path]);
+  // Only a change of address rewrites the box: on mount it already holds `path`, and preact runs effects a frame late, so
+  // an unconditional sync here would wipe out whatever was typed in that first frame.
+  const shownPath = useRef(path);
+  useEffect(() => {
+    if (shownPath.current === path) return;
+    shownPath.current = path;
+    setPathText(path);
+  }, [path]);
   useEffect(() => {
     if (cleanPath(pathText) === path) return undefined;
     const timer = setTimeout(() => go({ path: cleanPath(pathText) }, { replace: true }), PATH_MS);
