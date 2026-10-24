@@ -303,6 +303,52 @@ def test_the_plan_codes_the_server_sends_have_sentences():
     assert len(sites) == 2 and all({"plan", "plan_status"} <= s for s in sites)
 
 
+# --------------------------------------------------------------------------- the Setup screen (docs/SETUP.md)
+
+SETUP_CODES = {"BAD_NAME", "REMOTE_EXISTS", "REMOTE_NOT_FOUND", "CONFIG_LAYOUT", "CONFIG_WRITE", "RCLONE_MISSING",
+               "NOT_WAITING", "NO_CONFIG_PATH", "MISSING_FIELD", "SIGNIN_TIMEOUT", "CANCELLED", "RCLONE_ERROR",
+               "AUTH_EXPIRED", "NOT_FOUND", "NETWORK"}
+
+
+def setup_code_sites() -> dict[str, list[set[str]]]:
+    """{code: [parameter names of each site]} for everything the Setup routes and the connect job can answer with:
+    a UiError(status, code, ...), a ConfigError(code, ...) raised while editing the config file, a CodedError(code,
+    ...) that fails a job, and the codes `classify_failure` gives a failed test."""
+    sites: dict[str, list[set[str]]] = {}
+    for path, name, at in (("ui_api.py", "UiError", 1), ("config.py", "ConfigError", 0), ("ui_api.py", "ConfigError", 0),
+                           ("ui_api.py", "CodedError", 0)):
+        for call in calls(path, name):
+            code = const(call.args[at]) if len(call.args) > at else None
+            if isinstance(code, str):                          # a dynamic code (exc.code) is one of the others
+                sites.setdefault(code, []).append(keyword_names(call) - {"headers"})
+    fn = next(n for n in ast.walk(ast.parse((SRC / "rclone.py").read_text(encoding="utf-8")))
+              if isinstance(n, ast.FunctionDef) and n.name == "classify_failure")
+    for node in ast.walk(fn):
+        if isinstance(const(node), str) and re.fullmatch(r"[A-Z_]+", const(node)):
+            sites.setdefault(const(node), []).append({"detail"} if const(node) == "RCLONE_ERROR" else set())
+    return sites
+
+
+def test_every_setup_code_has_a_sentence_in_both_languages_that_uses_only_what_every_site_sends():
+    sites = setup_code_sites()
+    assert SETUP_CODES <= set(sites), sorted(SETUP_CODES - set(sites))
+    for code in sorted(SETUP_CODES):
+        need(f"err.{code}")
+        usable = set.intersection(*sites[code])
+        for lang, d in DICTS.items():
+            assert placeholders(d[f"err.{code}"]) <= usable, (
+                f"{lang} err.{code}: {placeholders(d[f'err.{code}']) - usable} is not sent by every site")
+
+
+def test_the_setup_job_failures_send_the_name_so_the_page_can_say_which_cloud():
+    sites = setup_code_sites()
+    for code in ("SIGNIN_TIMEOUT", "CANCELLED", "CONFIG_WRITE", "CONFIG_LAYOUT", "REMOTE_EXISTS"):
+        assert all("name" in s for s in sites[code]), code
+    assert sites["RCLONE_ERROR"] and all("detail" in s for s in sites["RCLONE_ERROR"])      # a failed test sends only this
+    assert {"binary"} <= set.intersection(*sites["RCLONE_MISSING"])
+    assert {"field"} <= set.intersection(*sites["MISSING_FIELD"])
+
+
 # --------------------------------------------------------------------------- suggestions
 
 def test_every_suggestion_code_has_a_title_and_a_reason():

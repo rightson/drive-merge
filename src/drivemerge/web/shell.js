@@ -33,7 +33,8 @@ function plansPage(sub) {
 }
 
 export function parseHash(hash) {
-  const h = String(hash || '').replace(/^#/, '');
+  // The Setup screen is gone (docs/ONBOARDING.md section G): an old #/setup bookmark means the Clouds view.
+  const h = String(hash || '').replace(/^#/, '').replace(/^\/setup(?=$|\?)/, '/clouds');
   const m = ROUTE.exec(h);
   if (m) return { view: m[1], params: new URLSearchParams(m[2] || ''), hash: `#${h}`, explicit: true };
   const f = FREE_ROUTE.exec(h);
@@ -70,7 +71,10 @@ export function navigate(to, { replace = false } = {}) {
 export function useRoute() {
   const [hash, setHash] = useState(window.location.hash);
   useEffect(() => {
-    const on = () => setHash(window.location.hash);
+    // The Setup screen is gone: an old #/setup address is rewritten to #/clouds, also when it is typed while the page is open.
+    const old = () => /^#\/setup(?:\?|$)/.test(window.location.hash);
+    const on = () => { if (old()) navigate('#/clouds', { replace: true }); else setHash(window.location.hash); };
+    if (old()) navigate('#/clouds', { replace: true });
     listeners.add(on);
     window.addEventListener('hashchange', on);
     return () => { listeners.delete(on); window.removeEventListener('hashchange', on); };

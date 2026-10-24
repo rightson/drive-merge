@@ -58,6 +58,8 @@ export function wordParams(ns, params) {
   for (const k of KIND_PARAMS) {
     if (typeof out[k] === 'string') out[k] = t(`${ns}.${k}.${out[k]}`, out, out[k]);
   }
+  // The form field a refusal is about (MISSING_FIELD: the Apple ID or its password).
+  if (out.field === 'apple_id' || out.field === 'password') out.field = t(`conn.field.${out.field}`);
   // Which side of a comparison a refusal is about ("left" | "right").
   if (out.side === 'left' || out.side === 'right') out.side = t(`cmp.side.${out.side}`);
   // The state a plan is in ('done', 'cancelled'), as a word of the page's language.

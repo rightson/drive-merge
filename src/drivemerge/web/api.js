@@ -126,12 +126,19 @@ export const startBridge = ({ maxBytes, limit, entryIds } = {}) => call('POST', 
   body: entryIds ? { entry_ids: entryIds } : { max_bytes: maxBytes, limit },
 });
 
-// Connections (docs/ONBOARDING.md section D). All of these but `setup` are human-channel routes.
+// Connections (docs/ONBOARDING.md sections D and G4.5). All of these but `setup` and `importable` are human-channel routes.
+// `connectStart`, `connectFinish`, `connectAnswer` and `connectImport` answer with the connection, or with a question result
+// ({flow_id, status: 'question', question, retry}) when rclone asks something.
 export const setup = () => call('GET', '/v1/setup');
 export const connectStart = (body) => call('POST', '/v1/ui/connect/start', { body });
 export const connectFlow = (id) => call('GET', `/v1/ui/connect/flows/${encodeURIComponent(id)}`);
 export const connectFinish = (id, name) => call('POST', `/v1/ui/connect/flows/${encodeURIComponent(id)}/finish`, { body: name ? { name } : {} });
+export const connectAnswer = (id, result) => call('POST', `/v1/ui/connect/flows/${encodeURIComponent(id)}/answer`, { body: { result } });
 export const connectCancel = (id) => call('POST', `/v1/ui/connect/flows/${encodeURIComponent(id)}/cancel`, { body: {} });
+/** A token pasted from another computer (docs/ONBOARDING.md G4.5): returns a flow that is already succeeded; finish it as usual. */
+export const connectPaste = (body) => call('POST', '/v1/ui/connect/paste', { body });
+export const importable = () => call('GET', '/v1/ui/connect/importable');
+export const connectImport = (body) => call('POST', '/v1/ui/connect/import', { body });
 export const testConnection = (name) => call('POST', `/v1/ui/connections/${encodeURIComponent(name)}/test`, { body: {} });
 export const disconnect = (name) => call('DELETE', `/v1/ui/connections/${encodeURIComponent(name)}`);
 export const installRclone = () => call('POST', '/v1/ui/rclone/install', { body: {} });

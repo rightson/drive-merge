@@ -12,7 +12,7 @@ import { CatalogBanner, StagedDrawer, SuggestionsDrawer } from './panels.js';
 import { PreviewModal } from './preview.js';
 import { DialogHost, Toasts } from './ui.js';
 import {
-  Rail, ViewHost, currentView, navigate, useRoute, useShortcuts,
+  Rail, ViewHost, currentView, navigate, parseHash, useRoute, useShortcuts,
 } from './shell.js';
 import { compareHash, plansHash } from './query.js';
 import { isWaiting } from './plans.js';
@@ -433,12 +433,13 @@ function App() {
         setConfig(cfg);
         // A run that changed a cloud since its last scan: say so again after a reload, as the page did right after the run.
         if (cfg.outdated && cfg.outdated.length) setOutdated({ remotes: cfg.outdated });
-        // The connections decide where the page opens (no route, nothing connected: the Welcome screen). A server that
-        // does not know the route (older, or a test double) leaves the page as it was.
+        // The connections decide where the page opens: no route and nothing to work on yet (no cloud configured, or a
+        // cloud without a complete scan) is the Clouds view. A route in the address, or a server that does not answer
+        // or does not say `needed` (older, or a test double), leaves the page as it was.
         try {
           const data = await api.setup();
           setSetup({ loaded: true, data, error: null });
-          if (!window.location.hash && (data.first_run || (!(data.connections || []).length && !(cfg.remotes || []).length))) navigate('#/clouds', { replace: true });
+          if (!parseHash(window.location.hash).explicit && data.needed === true) navigate('#/clouds', { replace: true });
         } catch (e) { setSetup({ loaded: true, data: null, error: e }); }
         const list = await api.listDrafts();
         setDrafts(list);

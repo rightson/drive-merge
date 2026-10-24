@@ -16,14 +16,11 @@ import contextlib
 import dataclasses
 import datetime
 import getpass
-import importlib.resources
 import json
 import os
 import re
-import secrets
 import sqlite3
 import sys
-import tempfile
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -422,14 +419,8 @@ def _init_config(path: Path, *, force: bool = False) -> tuple[config_mod.Config,
     """Write a new config (fresh API token, no remotes) and create the catalog; returns (config, database path)."""
     if path.exists() and not force:
         raise ValueError(f"{path} already exists; use --force to overwrite it (this also replaces the API token)")
-    template = importlib.resources.files("drivemerge").joinpath("config_template.toml").read_text(encoding="utf-8")
-    token = secrets.token_urlsafe(32)
-    text, count = re.subn(r'(?m)^token\s*=\s*"".*$', f'token = "{token}"', template, count=1)
-    if count != 1:
-        raise ValueError("config template has no empty [api] token line")
-    _write_private(path, text)
-    cfg = _load_config(path)  # make sure what we wrote parses
-    db.connect(cfg.db_path).close()
+    config_mod.write_new_config(path)                 # also creates the catalog
+    cfg = _load_config(path)
     return cfg, str(Path(cfg.db_path).expanduser())
 
 
@@ -1022,8 +1013,9 @@ def cmd_serve(ctx: Ctx) -> int:
 
 
 def cmd_ui(ctx: Ctx) -> int:
-    if not ctx.config_path.exists():
-        _init_config(ctx.config_path)
+    if config_mod.ensure_config(ctx.config_path):
+        print(f"Created {ctx.config_path} (mode 600, new API token): no clouds yet, so the page opens on Setup",
+              flush=True)
         print(f"No config found: wrote {ctx.config_path} and created the catalog. "
               "Connect your clouds on the page that opens.", file=sys.stderr)
     cfg = ctx.config
@@ -1031,7 +1023,8 @@ def cmd_ui(ctx: Ctx) -> int:
         from . import ui_api
     except ImportError as e:
         raise ValueError(f"the web UI needs its optional dependencies: pip install 'drive-merge[api]' ({e})") from None
-    ui_api.run_ui(cfg, host=ctx.args.host, port=ctx.args.port, open_browser=not ctx.args.no_browser)
+    ui_api.run_ui(cfg, host=ctx.args.host, port=ctx.args.port, open_browser=not ctx.args.no_browser,
+                  config_path=ctx.config_path)
     return EXIT_OK
 
 

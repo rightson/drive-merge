@@ -32,10 +32,25 @@ def _iso(delta: timedelta = timedelta(0)) -> str:
     return (datetime.now(timezone.utc) - delta).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-PROVIDERS = [{"key": "drive", "label": "Google Drive", "needs_client": True},
-             {"key": "onedrive", "label": "OneDrive", "needs_client": False},
-             {"key": "dropbox", "label": "Dropbox", "needs_client": False}]
-DEFAULT_NAME = {"drive": "gdrive", "onedrive": "onedrive", "dropbox": "dropbox"}
+HELPER = "http://127.0.0.1:53682/auth?state="                 # rclone's own sign-in helper: the only link the page opens
+PROVIDERS = [
+    {"key": "drive", "label": "Google Drive", "needs_client": True, "kind": "authorize", "fields": [],
+     "authorize": {"read": ["rclone", "authorize", "drive", "--drive-scope=drive.readonly"],
+                   "write": ["rclone", "authorize", "drive", "--drive-scope=drive"]}},
+    {"key": "onedrive", "label": "OneDrive", "needs_client": False, "kind": "authorize", "fields": [],
+     "authorize": {"read": ["rclone", "authorize", "onedrive", "--onedrive-access-scopes=Files.Read Files.Read.All offline_access"],
+                   "write": ["rclone", "authorize", "onedrive"]}},
+    {"key": "dropbox", "label": "Dropbox", "needs_client": False, "kind": "authorize", "fields": [],
+     "authorize": {"read": ["rclone", "authorize", "dropbox"], "write": ["rclone", "authorize", "dropbox"]}},
+    {"key": "iclouddrive", "label": "iCloud Drive", "needs_client": False, "kind": "config", "fields": ["apple_id", "password"],
+     "authorize": {"read": [], "write": []}},
+]
+DEFAULT_NAME = {"drive": "gdrive", "onedrive": "onedrive", "dropbox": "dropbox", "iclouddrive": "icloud"}
+TWO_FACTOR = {"name": "config_2fa", "help": "2FA code\nEnter the code Apple sent to your devices", "default": "", "examples": [],
+              "password": False, "required": True, "exclusive": False, "type": "string"}
+DRIVE_CHOICE = {"name": "config_driveid", "help": "Select a drive.\nSecond line", "default": "", "required": True, "exclusive": True,
+                "password": False, "type": "string",
+                "examples": [{"value": "b!personal", "help": "OneDrive (personal)"}, {"value": "b!library", "help": "Documents (team site)"}]}
 GOOD_ID = "1234567890-abcdefghijklmnop.apps.googleusercontent.com"
 GOOD_SECRET = "GOCSPX-abcdefghijklmnopqrstuv"
 
@@ -64,6 +79,15 @@ class OnbMock(MockApi):
         self.remotes = []                 # first run: nothing is configured yet
         self.conns: list[dict] = []
         self.first_run = True
+        self.manual: list[dict] = []      # remotes written by hand in config.toml (GET /v1/setup `manual_remotes`)
+        self.needed: bool | None = None   # None: derived (nothing connected); a bool forces GET /v1/setup `needed`
+        self.omit_needed = False          # an older server: the answer has no `needed` key
+        self.importable_info: dict = {"config_path": "/home/u/.config/rclone/rclone.conf", "encrypted": False, "remotes": []}
+        self.questions: list[dict] = []   # question results the next finish / answer / import returns, one each
+        self.auth_override: str | None = None        # what connect/start puts in `auth_url` instead of rclone's helper
+        self.error_params: dict = {}                 # `params` of start_error / finish_error / answer_error / paste_error
+        self.answer_error: tuple[int, str, str] | None = None
+        self.paste_error: tuple[int, str, str] | None = None
         self.rclone: dict = {"found": True, "path": "/usr/bin/rclone", "version": "1.75.0", "ok": True, "managed": False}
         self.rclone_after_install: dict = dict(self.rclone)
         self.flow_script = ["waiting", "succeeded"]     # the status each poll of a flow returns, the last one repeats
@@ -86,12 +110,12 @@ class OnbMock(MockApi):
         """These clouds are connected (and configured) from the start."""
         self.first_run = False
         for i, n in enumerate(names):
-            provider = {"gdrive": "drive", "dropbox": "dropbox", "onedrive": "onedrive"}.get(n, "dropbox")
+            provider = {"gdrive": "drive", "dropbox": "dropbox", "onedrive": "onedrive", "icloud": "iclouddrive"}.get(n, "dropbox")
             self._add_conn(n, provider, n in writable, id_=i + 1)
 
-    def _add_conn(self, name: str, provider: str, writable: bool, id_: int | None = None) -> dict:
+    def _add_conn(self, name: str, provider: str, writable: bool, id_: int | None = None, **extra: Any) -> dict:
         conn = {"name": name, "provider": provider, "account": f"me@{name}.example", "read": True, "write": writable,
-                "writable": writable, "created_at": "2025-01-01T00:00:00Z"}
+                "writable": writable, "created_at": "2025-01-01T00:00:00Z", **extra}
         self.conns.append(conn)
         self.remotes.append({"id": id_ or len(self.remotes) + 1, "name": name, "provider": provider, "writable": writable,
                              "case_insensitive": False})
@@ -118,34 +142,84 @@ class OnbMock(MockApi):
     def onboarding(self, method: str, path: str, q: dict, body: Any) -> tuple[int, Any] | None:
         body = body or {}
         if (method, path) == ("GET", "/v1/setup"):
-            return 200, {"first_run": self.first_run and not self.conns, "config_path": "/home/u/.config/drive-merge/config.toml",
-                         "rclone": self.rclone, "connections": copy.deepcopy(self.conns), "providers": PROVIDERS}
+            out = {"first_run": self.first_run and not self.conns, "config_path": "/home/u/.config/drive-merge/config.toml",
+                   "rclone": self.rclone, "connections": copy.deepcopy(self.conns), "manual_remotes": copy.deepcopy(self.manual),
+                   "providers": PROVIDERS}
+            if not self.omit_needed:
+                out["needed"] = (not self.conns and not self.manual) if self.needed is None else self.needed
+            return 200, out
+        if (method, path) == ("GET", "/v1/ui/connect/importable"):
+            return 200, copy.deepcopy(self.importable_info)
+        if (method, path) == ("POST", "/v1/ui/connect/paste"):
+            if self.paste_error:
+                status, code, message = self.paste_error
+                return status, {"error": message, "code": code, "params": self.error_params}
+            fid = f"flow-{self.next_flow}"
+            self.next_flow += 1
+            self.flows[fid] = {"provider": body.get("provider"), "purpose": body.get("purpose", "read"), "polls": 0, "cancelled": False,
+                               "name": body.get("name"), "pasted": True}
+            return 200, {"flow_id": fid, "status": "succeeded"}
+        if (method, path) == ("POST", "/v1/ui/connect/import"):
+            if self.start_error:
+                status, code, message = self.start_error
+                return status, {"error": message, "code": code, "params": self.error_params}
+            source = body.get("source")
+            if self.questions:
+                fid = f"flow-{self.next_flow}"
+                self.next_flow += 1
+                self.flows[fid] = {"provider": "import", "purpose": "read", "polls": 0, "cancelled": False, "name": source}
+                return 202, {"flow_id": fid, "status": "question", "retry": False, "question": self.questions.pop(0)}
+            row = next(r for r in self.importable_info["remotes"] if r["name"] == source)
+            row["imported"] = True
+            return 200, self._add_conn(body.get("name") or source, row["provider"], False, scoped=False, imported_from=source)
         if (method, path) == ("POST", "/v1/ui/connect/start"):
             if self.start_error:
                 status, code, message = self.start_error
-                return status, {"error": message, "code": code}
+                return status, {"error": message, "code": code, "params": self.error_params}
             fid = f"flow-{self.next_flow}"
             self.next_flow += 1
             self.flows[fid] = {"provider": body.get("provider"), "purpose": body.get("purpose", "read"), "polls": 0,
                                "cancelled": False, "name": body.get("name")}
-            return 200, {"flow_id": fid, "auth_url": f"https://auth.example/{fid}"}
-        m = re.fullmatch(r"/v1/ui/connect/flows/(flow-\d+)(/finish|/cancel)?", path)
+            if body.get("provider") == "iclouddrive":
+                return 202, {"flow_id": fid, "status": "question", "auth_url": None, "retry": False, "question": TWO_FACTOR}
+            if body.get("purpose") == "write" and next((c for c in self.conns if c["name"] == body.get("name") and c.get("scoped") is False), None):
+                return 200, {"flow_id": fid, "status": "succeeded", "auth_url": None}
+            return 200, {"flow_id": fid, "status": "waiting", "auth_url": self.auth_override or f"{HELPER}{fid}"}
+        m = re.fullmatch(r"/v1/ui/connect/flows/(flow-\d+)(/finish|/cancel|/answer)?", path)
         if m:
             fid, tail = m.group(1), m.group(2)
             flow = self.flows[fid]
             if tail == "/cancel":
                 flow["cancelled"] = True
                 return 200, {"ok": True}
+            if tail == "/answer":
+                flow.setdefault("answers", []).append(body.get("result"))
+                if self.answer_error:
+                    status, code, message = self.answer_error
+                    return status, {"error": message, "code": code, "params": self.error_params}
+                if flow["provider"] == "iclouddrive":
+                    if body.get("result") != "123456":
+                        return 202, {"flow_id": fid, "status": "question", "retry": True, "question": TWO_FACTOR}
+                    return 200, self._add_conn(flow["name"] or "icloud", "iclouddrive", False, scoped=False)
+                if self.questions:
+                    return 202, {"flow_id": fid, "status": "question", "retry": False, "question": self.questions.pop(0)}
+                if flow["provider"] == "import":
+                    row = next(r for r in self.importable_info["remotes"] if r["name"] == flow["name"])
+                    row["imported"] = True
+                    return 200, self._add_conn(flow["name"], row["provider"], False, scoped=False, imported_from=flow["name"])
+                return 200, self._add_conn(flow["name"] or DEFAULT_NAME[flow["provider"]], flow["provider"], False)
             if tail == "/finish":
                 if self.finish_error:
                     status, code, message = self.finish_error
                     self.finish_error = None if code in ("NAME_TAKEN", "BAD_NAME") else self.finish_error
-                    return status, {"error": message, "code": code}
+                    return status, {"error": message, "code": code, "params": self.error_params}
                 if flow["purpose"] == "write":
                     conn = next(c for c in self.conns if c["name"] == body.get("name"))
                     conn.update(write=True, writable=True)
                     next(r for r in self.remotes if r["name"] == conn["name"])["writable"] = True
                     return 200, conn
+                if self.questions:
+                    return 202, {"flow_id": fid, "status": "question", "retry": False, "question": self.questions.pop(0)}
                 name = body.get("name") or DEFAULT_NAME[flow["provider"]]
                 return 200, self._add_conn(name, flow["provider"], False)
             flow["polls"] += 1
@@ -154,7 +228,7 @@ class OnbMock(MockApi):
             else:
                 status = self.flow_script[min(flow["polls"], len(self.flow_script)) - 1]
             return 200, {"flow_id": fid, "provider": flow["provider"], "purpose": flow["purpose"], "status": status,
-                         "auth_url": f"https://auth.example/{fid}", "error": self.flow_error if status == "failed" else None}
+                         "auth_url": self.auth_override or f"{HELPER}{fid}", "error": self.flow_error if status == "failed" else None}
         m = re.fullmatch(r"/v1/ui/connections/([a-z0-9-]+)(/test)?", path)
         if m:
             name = m.group(1)
@@ -260,7 +334,7 @@ def make_onb(browser, site):
     def factory(*, locale: str = "en-US", color_scheme: str = "light", width: int = 1440, height: int = 900, **kw: Any) -> Ui:
         ctx = browser.new_context(viewport={"width": width, "height": height}, locale=locale, color_scheme=color_scheme)
         contexts.append(ctx)
-        ctx.route("https://auth.example/**", lambda r: r.fulfill(status=200, content_type="text/html", body="<p>sign in</p>"))
+        ctx.route("http://127.0.0.1:53682/**", lambda r: r.fulfill(status=200, content_type="text/html", body="<p>sign in</p>"))
         page = ctx.new_page()
         page.on("pageerror", lambda e: errors.append(str(e)))
         page.on("console", lambda m: errors.append(m.text) if "Content Security Policy" in m.text else None)
@@ -383,9 +457,9 @@ def test_connecting_onedrive_opens_the_auth_page_polls_and_shows_the_card(make_o
     expect(ui.tid("google-guide")).to_have_count(0)
     with ui.page.expect_popup() as popup:
         ui.tid("connect-start").click()
-    assert popup.value.url == "https://auth.example/flow-1"
+    assert popup.value.url == f"{HELPER}flow-1"
     expect(ui.tid("connect-waiting")).to_be_visible()
-    expect(ui.tid("auth-link")).to_have_attribute("href", "https://auth.example/flow-1")
+    expect(ui.tid("auth-link")).to_have_attribute("href", f"{HELPER}flow-1")
     assert last_body(ui, "POST", r"/v1/ui/connect/start") == {"provider": "onedrive", "purpose": "read"}
     expect(ui.tid("connect-dialog")).to_have_count(0, timeout=8000)
     assert len(calls(ui, "GET", r"/v1/ui/connect/flows/flow-1")) >= 2                        # polled until it succeeded
@@ -1084,3 +1158,669 @@ def test_the_dictionaries_have_every_key_the_new_screens_use(make_onb):
                                     "NEEDS_CLIENT", "TEST_FAILED")]
     for key in dynamic:
         assert key in dicts["en"] and key in dicts["zh-TW"], key
+
+
+# =========================================================================== the consolidation (docs/ONBOARDING.md section G)
+
+IMPORT_ROWS = [
+    {"name": "work-od", "type": "onedrive", "provider": "onedrive", "supported": True, "imported": False},
+    {"name": "vault", "type": "crypt", "provider": "other", "supported": False, "imported": False},
+    {"name": "photos", "type": "dropbox", "provider": "dropbox", "supported": True, "imported": True},
+]
+TOKEN_BLOCK = 'Paste the following into your remote machine --->\n{"access_token":"AT-secret-123","refresh_token":"RT-secret-456"}\n<---End paste'
+
+
+def question(**kw: Any) -> dict:
+    base = {"name": "config_driveid", "help": "Select a drive.\nSecond line", "default": "", "examples": [], "password": False,
+            "required": False, "exclusive": False, "type": "string"}
+    return {"question": {**base, **kw}}
+
+
+def no_secret_left(ui: Ui, *secrets: str) -> None:
+    """The page keeps what was typed out of the address, the storage, the toasts, the page text and every GET."""
+    storage = ui.page.evaluate("JSON.stringify([Object.entries(localStorage), Object.entries(sessionStorage)])")
+    body_text = ui.page.locator("body").inner_text()
+    for secret in secrets:
+        assert secret not in ui.page.url and secret not in ui.page.evaluate("location.href")
+        assert secret not in storage, "kept in storage"
+        assert secret not in body_text, "shown on the page"
+        assert secret not in ui.tid("toasts").inner_text()
+        for call in ui.mock.calls:
+            assert secret not in call.path and secret not in repr(call.query)
+            if call.method == "GET":
+                assert call.body is None
+
+
+def welcome_ui(make_onb, **kw: Any) -> Ui:
+    return start(make_onb(**kw))
+
+
+# ---- the single first-run rule, the rail
+
+def test_a_routeless_page_goes_to_clouds_only_when_needed(make_onb):
+    ui = make_onb()
+    ui.mock.connect_clouds("gdrive")
+    ui.mock.needed = True                                              # a configured cloud without a complete scan
+    start(ui)
+    expect(ui.tid("view-clouds")).to_be_visible()
+    assert ui.page.evaluate("location.hash") == "#/clouds"
+
+    ui = make_onb()
+    ui.mock.connect_clouds("gdrive")
+    ui.mock.needed = False
+    start(ui)
+    expect(ui.tid("pane-left")).to_be_visible()
+    assert ui.page.evaluate("location.hash") == ""
+
+    ui = make_onb()                                                    # an answer without `needed` changes nothing, even with nothing connected
+    ui.mock.omit_needed = True
+    ui.mock.remotes = copy.deepcopy(REMOTES)
+    start(ui)
+    expect(ui.tid("pane-left")).to_be_visible()
+    assert ui.page.evaluate("location.hash") == ""
+
+
+def test_a_page_opened_with_a_route_is_never_redirected(make_onb):
+    ui = make_onb()
+    ui.mock.needed = True
+    ui.mock.remotes = copy.deepcopy(REMOTES)
+    start(ui)
+    expect(ui.tid("view-clouds")).to_be_visible()
+    ui.page.goto(f"{ui.base}/ui/#/overview")
+    ui.page.reload()
+    expect(ui.tid("view-overview")).to_be_visible()
+    assert ui.page.evaluate("location.hash") == "#/overview"
+
+
+def test_the_rail_starts_with_clouds_has_no_setup_and_alt_0_does_nothing(make_onb):
+    ui = make_onb()
+    ui.mock.connect_clouds("gdrive")
+    start(ui)
+    order = ui.page.eval_on_selector_all('[data-testid="rail"] a', "els => els.map(e => e.dataset.testid)")
+    assert order == ["rail-clouds", "rail-overview", "rail-explore", "rail-compare", "rail-plans", "rail-workspace"]
+    expect(ui.tid("rail-setup")).to_have_count(0)
+    ui.page.keyboard.press("Alt+0")
+    expect(ui.tid("pane-left")).to_be_visible()                        # still the workspace
+    ui.page.keyboard.press("Alt+1")
+    expect(ui.tid("rail-overview")).to_have_attribute("aria-current", "page")
+    expect(ui.tid("rail-overview")).to_have_attribute("title", re.compile(r"\(Alt\+1\)"))
+
+
+def test_an_old_setup_bookmark_lands_on_clouds(make_onb):
+    ui = make_onb()
+    ui.mock.connect_clouds("gdrive")
+    start(ui)
+    ui.go("#/setup")
+    expect(ui.tid("view-clouds")).to_be_visible()
+    assert ui.page.evaluate("location.hash") == "#/clouds"
+    expect(ui.tid("rail-clouds")).to_have_attribute("aria-current", "page")
+
+
+def test_the_overview_empty_state_links_to_clouds(make_onb):
+    ui = make_onb()
+    ui.mock.connect_clouds("gdrive")
+    ui.mock.needed = False
+    start(ui)
+    ui.mock.coverage_override = {"remotes": [], "totals": {"contents": 0, "bytes": 0, "stored_bytes": 0, "redundant_bytes": 0, "copies": 0},
+                                 "intersections": [], "other": None}
+    ui.go("#/overview")
+    expect(ui.tid("ov-setup-link")).to_have_count(0)
+    ui.tid("ov-clouds-link").click()
+    expect(ui.tid("view-clouds")).to_be_visible()
+
+
+# ---- rclone's questions
+
+def test_every_kind_of_question_has_its_input_and_a_password_goes_nowhere_else(make_onb):
+    secret = "s3cret-Pa55-xyz"
+    ui = start(make_onb())
+    ui.mock.questions = [
+        question(name="use_local", type="bool", default="true", exclusive=True, examples=[{"value": "true", "help": "Yes"}, {"value": "false", "help": "No"}])["question"],
+        question(name="folder", default="root", required=True)["question"],
+        question(name="region", examples=[{"value": "eu", "help": "Europe"}, {"value": "us", "help": "US"}])["question"],
+        question(name="drive", exclusive=True, default="a1", help="Which drive?",
+                 examples=[{"value": "a1", "help": "OneDrive (personal)"}, {"value": "b2", "help": "Documents"}])["question"],
+        question(name="token_pw", password=True, required=True, help="Password.")["question"],
+    ]
+    connect_via_dialog(ui, "dropbox")
+    ui.tid("connect-start").click()
+    expect(ui.tid("connect-question")).to_have_attribute("data-name", "use_local", timeout=8000)
+    expect(ui.tid("connect-q-help")).to_contain_text("From rclone")
+    ui.tid("connect-q-no").click()                                                     # a bool: two buttons
+    assert last_body(ui, "POST", r"/v1/ui/connect/flows/flow-1/answer") == {"result": "false"}
+    expect(ui.tid("connect-question")).to_have_attribute("data-name", "folder")
+    expect(ui.tid("connect-q-input")).to_have_value("root")
+    ui.tid("connect-q-input").fill("")
+    expect(ui.tid("connect-q-continue")).to_be_disabled()                              # required
+    ui.tid("connect-q-input").fill("Archive")
+    ui.page.keyboard.press("Enter")                                                    # Enter submits; nothing navigates
+    assert last_body(ui, "POST", r"/v1/ui/connect/flows/flow-1/answer") == {"result": "Archive"}
+    expect(ui.tid("connect-question")).to_have_attribute("data-name", "region")
+    ui.tid("connect-q-select").select_option(index=2)                                  # select-or-type
+    expect(ui.tid("connect-q-input")).to_have_value("us")
+    expect(ui.tid("connect-q-continue")).to_be_enabled()                               # optional answers may be empty too
+    ui.tid("connect-q-continue").click()
+    expect(ui.tid("connect-question")).to_have_attribute("data-name", "drive")
+    expect(ui.tid("connect-q-option-0")).to_be_checked()                               # radios, the default preselected
+    expect(ui.tid("connect-q-help")).to_contain_text("Which drive?")
+    ui.tid("connect-q-option-1").check()
+    ui.tid("connect-q-continue").click()
+    expect(ui.tid("connect-question")).to_have_attribute("data-name", "token_pw")
+    assert last_body(ui, "POST", r"/v1/ui/connect/flows/flow-1/answer") == {"result": "b2"}
+    field = ui.tid("connect-q-input")
+    expect(field).to_have_attribute("type", "password")
+    field.fill(secret)
+    ui.tid("connect-q-continue").click()
+    expect(ui.tid("conn-card-dropbox")).to_be_visible(timeout=8000)
+    assert last_body(ui, "POST", r"/v1/ui/connect/flows/flow-1/answer") == {"result": secret}
+    no_secret_left(ui, secret)
+    assert "?" not in ui.page.url
+
+
+def test_a_drive_choice_after_finish_is_asked_in_the_dialog(make_onb):
+    ui = start(make_onb())
+    ui.mock.questions = [{**DRIVE_CHOICE}]
+    connect_via_dialog(ui, "onedrive")
+    ui.tid("connect-start").click()
+    expect(ui.tid("connect-question")).to_be_visible(timeout=8000)
+    expect(ui.tid("connect-q-name")).to_have_text("config_driveid")
+    expect(ui.tid("connect-q-options")).to_contain_text("b!personal")
+    expect(ui.tid("connect-q-options")).to_contain_text("Documents (team site)")
+    ui.tid("connect-q-option-1").check()
+    ui.tid("connect-q-continue").click()
+    assert last_body(ui, "POST", r"/v1/ui/connect/flows/flow-1/answer") == {"result": "b!library"}
+    expect(ui.tid("conn-card-onedrive")).to_be_visible()
+
+
+def test_a_sign_in_link_that_is_not_rclones_helper_is_never_opened_or_shown(make_onb):
+    ui = start(make_onb())
+    ui.mock.auth_override = "http://evil.example/auth?state=x"
+    ui.mock.flow_script = ["waiting"]
+    opened: list = []
+    ui.page.context.on("page", lambda p: opened.append(p.url))
+    connect_via_dialog(ui, "onedrive")
+    ui.tid("connect-start").click()
+    expect(ui.tid("connect-waiting")).to_be_visible()
+    ui.page.wait_for_timeout(500)
+    assert opened == []
+    expect(ui.tid("auth-link")).to_have_count(0)
+    assert "evil.example" not in ui.page.content()
+    # the genuine helper link opens in a new tab without an opener
+    ui.mock.auth_override = None
+    ui.tid("connect-cancel").click()
+    with ui.page.expect_popup():
+        ui.tid("connect-start").click()
+    link = ui.tid("auth-link")
+    expect(link).to_have_attribute("href", re.compile(r"^http://127\.0\.0\.1:53682/auth\?state="))
+    expect(link).to_have_attribute("target", "_blank")
+    expect(link).to_have_attribute("rel", re.compile("noopener"))
+
+
+def test_cancelling_during_a_question_cancels_the_flow_and_adds_nothing(make_onb):
+    ui = start(make_onb())
+    ui.mock.questions = [{**DRIVE_CHOICE}]
+    connect_via_dialog(ui, "onedrive")
+    ui.tid("connect-start").click()
+    expect(ui.tid("connect-question")).to_be_visible(timeout=8000)
+    ui.tid("connect-cancel").click()
+    assert ui.mock.flows["flow-1"]["cancelled"] is True
+    assert last_body(ui, "POST", r"/v1/ui/connect/flows/flow-1/cancel") == {}
+    expect(ui.tid("connect-question")).to_have_count(0)
+    expect(ui.tid("connect-start")).to_be_enabled()
+    expect(ui.tid("conn-card-onedrive")).to_have_count(0)
+    # Escape during a question cancels it too
+    ui.mock.questions = [{**DRIVE_CHOICE}]
+    ui.tid("connect-start").click()
+    expect(ui.tid("connect-question")).to_be_visible(timeout=8000)
+    ui.page.keyboard.press("Escape")
+    expect(ui.tid("connect-dialog")).to_have_count(0)
+    ui.page.wait_for_timeout(300)
+    assert ui.mock.flows["flow-2"]["cancelled"] is True
+
+
+@pytest.mark.parametrize("code, status, params, text", [
+    ("CONFIG_WRITE", 500, {}, "could not save the connection"),
+    ("TEST_FAILED", 409, {}, "test listing failed"),
+    ("FLOW_FAILED", 409, {}, "did not complete"),
+])
+def test_a_failed_finish_is_worded_from_its_code(make_onb, code, status, params, text):
+    ui = start(make_onb())
+    ui.mock.finish_error = (status, code, "english message")
+    connect_via_dialog(ui, "dropbox")
+    ui.tid("connect-start").click()
+    expect(ui.tid("connect-error")).to_have_attribute("data-code", code, timeout=8000)
+    expect(ui.tid("connect-error")).to_contain_text(text)
+
+
+def test_a_failed_answer_goes_back_to_the_form_and_a_stale_one_is_worded(make_onb):
+    ui = start(make_onb())
+    ui.mock.questions = [{**DRIVE_CHOICE}]
+    connect_via_dialog(ui, "onedrive")
+    ui.tid("connect-start").click()
+    expect(ui.tid("connect-question")).to_be_visible(timeout=8000)
+    ui.mock.answer_error = (409, "NOT_WAITING", "not waiting")
+    ui.tid("connect-q-option-0").check()
+    ui.tid("connect-q-continue").click()
+    expect(ui.tid("connect-error")).to_have_attribute("data-code", "NOT_WAITING")
+    expect(ui.tid("connect-error")).to_contain_text("not waiting for an answer")
+    expect(ui.tid("connect-start")).to_be_enabled()
+
+
+@pytest.mark.parametrize("code, status, params, text", [
+    ("FLOW_BUSY", 409, {}, "Another sign-in is still running"),
+    ("MISSING_FIELD", 400, {"field": "apple_id"}, "The field “Apple ID” is required"),
+    ("MISSING_FIELD", 400, {"field": "password"}, "The field “password” is required"),
+])
+def test_a_busy_flow_and_a_missing_field_are_worded(make_onb, code, status, params, text):
+    ui = start(make_onb())
+    ui.mock.start_error = (status, code, "english message")
+    ui.mock.error_params = params
+    connect_via_dialog(ui, "iclouddrive")
+    ui.tid("connect-apple-id").fill("me@example.com")
+    ui.tid("connect-apple-password").fill("pw")
+    ui.tid("connect-start").click()
+    expect(ui.tid("connect-error")).to_have_attribute("data-code", code)
+    expect(ui.tid("connect-error")).to_contain_text(text)
+
+
+# ---- iCloud
+
+def test_icloud_takes_the_apple_id_and_password_then_asks_the_two_factor_code(make_onb):
+    password, code = "apple-Pa55-word", "654321"
+    ui = start(make_onb())
+    expect(ui.tid("provider-iclouddrive")).to_contain_text("two-factor")
+    connect_via_dialog(ui, "iclouddrive")
+    expect(ui.tid("connect-dialog")).to_contain_text("iCloud Drive")
+    expect(ui.tid("connect-apple-password")).to_have_attribute("type", "password")
+    expect(ui.tid("icloud-twofactor")).to_be_visible()
+    expect(ui.tid("icloud-processlist")).to_contain_text("process list")
+    expect(ui.tid("conn-paste")).to_have_count(0)                          # there is no token to paste for iCloud
+    expect(ui.tid("connect-start")).to_be_disabled()                       # both fields are required
+    ui.tid("connect-apple-id").fill("me@example.com")
+    expect(ui.tid("connect-start")).to_be_disabled()
+    ui.tid("connect-apple-password").fill(password)
+    expect(ui.tid("connect-start")).to_be_enabled()
+    ui.tid("connect-start").click()
+    body = last_body(ui, "POST", r"/v1/ui/connect/start")
+    assert body == {"provider": "iclouddrive", "purpose": "read", "apple_id": "me@example.com", "password": password}
+    expect(ui.tid("connect-question")).to_be_visible()
+    expect(ui.tid("connect-q-name")).to_have_text("config_2fa")
+    expect(ui.tid("connect-apple-password")).to_have_count(0)              # the password field is gone with the form
+    expect(ui.tid("connect-q-retry")).to_have_count(0)
+    ui.tid("connect-q-input").fill("000000")                               # a wrong code is asked again, with the retry line
+    ui.tid("connect-q-continue").click()
+    expect(ui.tid("connect-q-retry")).to_be_visible()
+    expect(ui.tid("connect-q-retry")).to_contain_text("did not accept")
+    ui.tid("connect-q-input").fill("123456")
+    ui.tid("connect-q-continue").click()
+    expect(ui.tid("conn-card-icloud")).to_be_visible()
+    assert ui.mock.flows["flow-1"]["answers"] == ["000000", "123456"]
+    expect(ui.tid("conn-unscoped-icloud")).to_contain_text("cannot be limited to reading")
+    expect(ui.tid("conn-state-icloud")).to_contain_text("Connected, read-only")
+    no_secret_left(ui, password, "000000", "123456")
+    assert all(password not in repr(c.body) for c in ui.mock.calls if c.path != "/v1/ui/connect/start")
+    assert all("123456" not in repr(c.body) for c in ui.mock.calls if not c.path.endswith("/answer"))
+
+
+def test_the_icloud_name_is_chosen_at_the_start(make_onb):
+    ui = start(make_onb())
+    connect_via_dialog(ui, "iclouddrive")
+    ui.tid("conn-name-toggle").click()
+    ui.tid("conn-name").fill("family-icloud")
+    ui.tid("connect-apple-id").fill("me@example.com")
+    ui.tid("connect-apple-password").fill("pw")
+    ui.tid("connect-start").click()
+    assert last_body(ui, "POST", r"/v1/ui/connect/start")["name"] == "family-icloud"
+
+
+def test_the_icloud_question_form_and_dialog_in_traditional_chinese(make_onb):
+    ui = start(make_onb(locale="zh-TW"))
+    expect(ui.tid("provider-iclouddrive")).to_contain_text("雙重驗證碼")
+    connect_via_dialog(ui, "iclouddrive")
+    expect(ui.tid("connect-dialog")).to_contain_text("Apple ID 密碼")
+    expect(ui.tid("icloud-processlist")).to_contain_text("程序清單")
+    ui.tid("connect-apple-id").fill("me@example.com")
+    ui.tid("connect-apple-password").fill("pw")
+    ui.tid("connect-start").click()
+    expect(ui.tid("connect-question")).to_contain_text("rclone 詢問")
+    expect(ui.tid("connect-q-help")).to_contain_text("rclone 的原文")
+    expect(ui.tid("connect-q-continue")).to_have_text("繼續")
+    ui.tid("connect-q-input").fill("000000")
+    ui.tid("connect-q-continue").click()
+    expect(ui.tid("connect-q-retry")).to_contain_text("沒有接受")
+    shot(ui, "icloud-question-zh")
+
+
+# ---- a token pasted from another computer
+
+def test_the_paste_disclosure_shows_the_exact_command_and_sends_the_token_once(make_onb):
+    ui = start(make_onb())
+    connect_via_dialog(ui, "onedrive")
+    expect(ui.tid("conn-paste-token")).not_to_be_visible()                 # a disclosure, closed
+    ui.tid("conn-paste-toggle").click()
+    expect(ui.tid("conn-paste-command")).to_have_text(
+        "rclone authorize onedrive '--onedrive-access-scopes=Files.Read Files.Read.All offline_access'")
+    expect(ui.tid("conn-paste-scope")).to_contain_text("cannot check what a pasted token is allowed to do")
+    expect(ui.tid("conn-paste-submit")).to_be_disabled()
+    ui.tid("conn-paste-token").fill(TOKEN_BLOCK)
+    assert not [c for c in ui.mock.calls if c.path == "/v1/ui/connect/paste"]        # nothing leaves until submit
+    assert "AT-secret-123" not in ui.page.evaluate("JSON.stringify([Object.entries(localStorage), Object.entries(sessionStorage)])")
+    ui.tid("conn-paste-submit").click()
+    expect(ui.tid("conn-card-onedrive")).to_be_visible(timeout=8000)
+    assert last_body(ui, "POST", r"/v1/ui/connect/paste") == {"provider": "onedrive", "purpose": "read", "token": TOKEN_BLOCK.strip()}
+    assert last_body(ui, "POST", r"/v1/ui/connect/flows/flow-1/finish") == {}                 # finished as after a browser sign-in
+    assert not [c for c in ui.mock.calls if c.path == "/v1/ui/connect/start"]
+    no_secret_left(ui, "AT-secret-123", "RT-secret-456")
+    assert all("AT-secret-123" not in repr(c.body) for c in ui.mock.calls if c.path != "/v1/ui/connect/paste")
+
+
+def test_the_paste_command_for_drive_carries_the_client_id_and_the_token_needs_the_client(make_onb):
+    ui = start(make_onb())
+    connect_via_dialog(ui, "drive")
+    ui.tid("conn-paste-toggle").click()
+    expect(ui.tid("conn-paste-command")).to_have_text("rclone authorize drive CLIENT_ID CLIENT_SECRET --drive-scope=drive.readonly")
+    ui.tid("client-id").fill(GOOD_ID)
+    expect(ui.tid("conn-paste-command")).to_have_text(f"rclone authorize drive {GOOD_ID} CLIENT_SECRET --drive-scope=drive.readonly")
+    ui.tid("conn-paste-token").fill('{"access_token":"AT-1"}')
+    expect(ui.tid("conn-paste-submit")).to_be_disabled()                   # the client secret and the production confirmation are missing
+    ui.tid("client-secret").fill(GOOD_SECRET)
+    ui.tid("google-confirm-prod").check()
+    expect(ui.tid("conn-paste-submit")).to_be_enabled()
+    ui.tid("conn-paste-submit").click()
+    expect(ui.tid("conn-card-gdrive")).to_be_visible(timeout=8000)
+    assert last_body(ui, "POST", r"/v1/ui/connect/paste") == {
+        "provider": "drive", "purpose": "read", "token": '{"access_token":"AT-1"}', "client_id": GOOD_ID, "client_secret": GOOD_SECRET}
+    no_secret_left(ui, GOOD_SECRET, "AT-1")
+
+
+def test_an_unreadable_pasted_token_is_worded_and_the_field_is_empty_again(make_onb):
+    ui = start(make_onb())
+    ui.mock.paste_error = (400, "TOKEN_UNREADABLE", "not a token")
+    connect_via_dialog(ui, "dropbox")
+    ui.tid("conn-paste-toggle").click()
+    ui.tid("conn-paste-token").fill("nonsense-123")
+    ui.tid("conn-paste-submit").click()
+    expect(ui.tid("connect-error")).to_have_attribute("data-code", "TOKEN_UNREADABLE")
+    expect(ui.tid("connect-error")).to_contain_text("not a token drive-merge can read")
+    ui.tid("conn-paste-toggle").click()
+    expect(ui.tid("conn-paste-token")).to_have_value("")
+    no_secret_left(ui, "nonsense-123")
+
+
+def test_a_second_sign_in_can_be_pasted_too(make_onb):
+    ui = make_onb()
+    ui.mock.connect_clouds("dropbox", writable=())
+    start(ui, "#/clouds")
+    ui.tid("conn-allow-dropbox").click()
+    ui.tid("conn-paste-toggle").click()
+    ui.tid("conn-paste-token").fill('{"access_token":"AT-W"}')
+    ui.tid("conn-paste-submit").click()
+    expect(ui.tid("conn-card-dropbox")).to_have_attribute("data-state", "rw", timeout=8000)
+    assert last_body(ui, "POST", r"/v1/ui/connect/paste") == {"provider": "dropbox", "purpose": "write", "token": '{"access_token":"AT-W"}', "name": "dropbox"}
+
+
+# ---- remotes rclone already has
+
+def test_remotes_of_the_persons_rclone_config_can_be_imported(make_onb):
+    ui = make_onb()
+    ui.mock.importable_info["remotes"] = copy.deepcopy(IMPORT_ROWS)
+    start(ui)
+    expect(ui.tid("import-list")).to_be_visible()
+    expect(ui.tid("import-work-od")).to_contain_text("onedrive")
+    expect(ui.tid("import-add-work-od")).to_be_enabled()
+    expect(ui.tid("import-add-vault")).to_be_disabled()
+    expect(ui.tid("import-vault")).to_contain_text("Not supported")
+    expect(ui.tid("import-add-photos")).to_have_count(0)                   # imported already
+    expect(ui.tid("import-photos")).to_contain_text("Imported")
+    expect(ui.tid("import-encrypted")).to_have_count(0)
+    shot(ui, "import-en")
+    ui.tid("import-add-work-od").click()
+    expect(ui.tid("conn-card-work-od")).to_be_visible()
+    assert last_body(ui, "POST", r"/v1/ui/connect/import") == {"source": "work-od"}
+    expect(ui.tid("conn-unscoped-work-od")).to_be_visible()
+    expect(ui.tid("conn-state-work-od")).to_contain_text("Connected, read-only")
+    expect(ui.tid("import-add-work-od")).to_have_count(0)
+    expect(ui.tid("toast")).to_contain_text("Connected work-od")
+
+
+def test_an_import_that_needs_an_answer_asks_in_the_dialog(make_onb):
+    ui = make_onb()
+    ui.mock.importable_info["remotes"] = copy.deepcopy(IMPORT_ROWS)
+    ui.mock.questions = [{**DRIVE_CHOICE}]
+    start(ui)
+    ui.tid("import-add-work-od").click()
+    expect(ui.tid("connect-question")).to_be_visible()
+    ui.tid("connect-q-option-1").check()
+    ui.tid("connect-q-continue").click()
+    expect(ui.tid("conn-card-work-od")).to_be_visible()
+    assert last_body(ui, "POST", r"/v1/ui/connect/flows/flow-1/answer") == {"result": "b!library"}
+
+
+def test_an_import_refusal_is_worded(make_onb):
+    ui = make_onb()
+    ui.mock.importable_info["remotes"] = copy.deepcopy(IMPORT_ROWS)
+    ui.mock.start_error = (400, "IMPORT_UNSUPPORTED", "unsupported")
+    ui.mock.error_params = {"type": "onedrive"}
+    start(ui)
+    ui.tid("import-add-work-od").click()
+    expect(ui.tid("toast").first).to_contain_text("A remote of type “onedrive” cannot be imported")
+
+
+def test_an_encrypted_rclone_config_is_said_and_lists_nothing(make_onb):
+    ui = make_onb()
+    ui.mock.importable_info = {"config_path": "/home/u/.config/rclone/rclone.conf", "encrypted": True, "remotes": []}
+    start(ui)
+    expect(ui.tid("import-encrypted")).to_contain_text("encrypted")
+    expect(ui.tid("import-list")).to_have_count(0)
+
+
+def test_no_import_section_without_remotes(make_onb):
+    ui = start(make_onb())
+    expect(ui.tid("provider-tiles")).to_be_visible()
+    expect(ui.tid("import-section")).to_have_count(0)
+
+
+# ---- cards: Test results, Allow changes, manual remotes
+
+@pytest.mark.parametrize("code, params, text", [
+    ("AUTH_EXPIRED", {}, "Disconnect it and connect it again"),
+    ("NETWORK", {}, "could not reach the cloud"),
+    ("NOT_FOUND", {}, "Not found"),
+    ("RCLONE_ERROR", {"detail": "Failed to create file system: oauth2: cannot fetch"}, "rclone reported an error"),
+])
+def test_a_test_failure_is_worded_from_its_code(make_onb, code, params, text):
+    ui = make_onb()
+    ui.mock.connect_clouds("dropbox")
+    ui.mock.test_results["dropbox"] = {"ok": False, "account": None, "quota": None, "error": "raw stderr tail", "code": code, "params": params}
+    start(ui, "#/clouds")
+    err = ui.tid("conn-error-dropbox")
+    expect(err).to_have_attribute("data-code", code)
+    expect(err).to_contain_text("The connection test failed")
+    expect(err).to_contain_text(text)
+    expect(err).not_to_contain_text("raw stderr tail")
+    if "detail" in params:
+        expect(ui.tid("conn-error-detail-dropbox")).to_contain_text("oauth2: cannot fetch")
+        expect(ui.tid("conn-error-detail-dropbox")).to_contain_text("From rclone")
+    expect(ui.tid("conn-card-dropbox")).to_have_attribute("data-state", "relogin" if code == "AUTH_EXPIRED" else "error")
+
+
+def test_allow_changes_on_a_sign_in_that_cannot_be_limited_asks_for_confirmation_instead(make_onb):
+    ui = make_onb()
+    ui.mock.connect_clouds("dropbox", writable=())
+    ui.mock.conns[0].update(scoped=False, imported_from="my-dropbox")
+    start(ui, "#/clouds")
+    expect(ui.tid("conn-unscoped-dropbox")).to_be_visible()
+    ui.tid("conn-allow-dropbox").click()
+    expect(ui.tid("connect-dialog")).to_have_count(0)                      # no second sign-in
+    expect(ui.tid("dialog")).to_contain_text("there is no second sign-in")
+    ui.tid("dialog-cancel").click()
+    assert not [c for c in ui.mock.calls if c.path == "/v1/ui/connect/start"]
+    ui.tid("conn-allow-dropbox").click()
+    ui.tid("dialog-ok").click()
+    expect(ui.tid("conn-card-dropbox")).to_have_attribute("data-state", "rw")
+    assert last_body(ui, "POST", r"/v1/ui/connect/start") == {"provider": "dropbox", "purpose": "write", "name": "dropbox"}
+    assert last_body(ui, "POST", r"/v1/ui/connect/flows/flow-1/finish") == {"name": "dropbox"}
+    expect(ui.tid("toast")).to_contain_text("Changes are now allowed on dropbox")
+
+
+def test_a_remote_set_up_by_hand_gets_a_card_with_test_and_sync_only(make_onb):
+    ui = make_onb()
+    ui.mock.connect_clouds("gdrive", "dropbox")
+    ui.mock.manual = [{"name": "onedrive", "provider": "onedrive", "writable": False}]
+    ui.mock.remotes.append({"id": 9, "name": "onedrive", "provider": "onedrive", "writable": False, "case_insensitive": False})
+    ui.mock.needed = False
+    start(ui, "#/clouds")
+    card = ui.tid("conn-card-onedrive")
+    expect(card).to_be_visible()
+    expect(card).to_have_attribute("data-source", "config")
+    expect(ui.tid("conn-manual-onedrive")).to_contain_text("config.toml")
+    expect(ui.tid("welcome")).to_have_count(0)                             # something is configured
+    expect(ui.tid("conn-quota-onedrive")).to_contain_text("412 GB of 1000 GB used")           # from the automatic Test
+    assert len(calls(ui, "POST", r"/v1/ui/connections/onedrive/test")) == 1
+    for gone in ("allow", "disconnect", "free"):
+        expect(ui.tid(f"conn-{gone}-onedrive")).to_have_count(0)
+    ui.tid("conn-sync-onedrive").click()
+    assert last_body(ui, "POST", r"/v1/ui/sync") == {"remotes": ["onedrive"]}
+    ui.mock.test_results["onedrive"] = {"ok": False, "account": None, "quota": None, "error": "x", "code": "AUTH_EXPIRED", "params": {}}
+    ui.tid("conn-test-onedrive").click()
+    expect(card).to_have_attribute("data-state", "relogin")
+    expect(ui.tid("welcome-sync")).to_be_visible()
+
+
+# ---- the read-only fallback
+
+def test_without_approvals_the_view_is_read_only_with_commands_and_no_automatic_test(make_onb):
+    ui = make_onb(approvals_enabled=False)
+    ui.mock.connect_clouds("gdrive", "dropbox", writable=())
+    ui.mock.manual = [{"name": "onedrive", "provider": "onedrive", "writable": False}]
+    ui.mock.remotes.append({"id": 9, "name": "onedrive", "provider": "onedrive", "writable": False, "case_insensitive": False})
+    ui.mock.importable_info["remotes"] = copy.deepcopy(IMPORT_ROWS)
+    start(ui, "#/clouds")
+    expect(ui.tid("clouds-readonly")).to_be_visible()
+    ui.tid("clouds-cmd-scan-copy").click()                                  # no clipboard permission yet: nothing happens, nothing throws
+    expect(ui.tid("toast")).to_have_count(0)
+    connect = ui.tid("clouds-cmd-connect")
+    for cmd in ("drivemerge connect drive", "drivemerge connect onedrive", "drivemerge connect dropbox", "drivemerge connect iclouddrive"):
+        expect(connect).to_contain_text(cmd)
+    expect(ui.tid("clouds-cmd-scan")).to_contain_text("drivemerge scan --all")
+    expect(ui.tid("clouds-cmd-scan")).to_contain_text("drivemerge identity rebuild")
+    ui.page.wait_for_timeout(500)
+    assert not [c for c in ui.mock.calls if c.method == "POST" and c.path.startswith("/v1/ui/connections/")]      # no Test by itself
+    for testid in ("connect-drive", "connect-onedrive", "connect-dropbox", "connect-iclouddrive", "conn-test-gdrive", "conn-sync-gdrive",
+                   "conn-allow-gdrive", "conn-disconnect-gdrive", "conn-test-onedrive", "conn-sync-onedrive", "import-add-work-od", "welcome-sync"):
+        expect(ui.tid(testid)).to_be_disabled()
+    ui.page.context.grant_permissions(["clipboard-read", "clipboard-write"], origin=ui.base)
+    ui.tid("clouds-cmd-connect-copy").click()
+    expect(ui.tid("toast")).to_contain_text("Copied")
+    assert ui.page.evaluate("navigator.clipboard.readText()") == ui.tid("clouds-cmd-connect").inner_text()
+    shot(ui, "readonly-en")
+
+
+def test_with_approvals_the_read_only_panel_is_absent(make_onb):
+    ui = start(make_onb())
+    expect(ui.tid("clouds-readonly")).to_have_count(0)
+
+
+# ---- every key the new elements use
+
+def test_the_dictionaries_have_every_key_the_consolidated_screens_use(make_onb):
+    ui = start(make_onb())
+    dicts = ui.page.evaluate("import('/ui/static/i18n.js').then(m => m.dictionaries)")
+    web = Path(__file__).resolve().parent.parent / "src" / "drivemerge" / "web"
+    used: set[str] = set()
+    for name in ("onboarding.js", "question.js"):
+        used |= set(re.findall(r"""\bt\(\s*['"]([A-Za-z0-9_.+]+)['"]""", (web / name).read_text(encoding="utf-8")))
+    assert {"conn.q.title", "conn.paste.toggle", "conn.import.add", "conn.ro.title", "conn.allowSameTitle"} <= used
+    dynamic = ["conn.field.apple_id", "conn.field.password", "conn.tile.iclouddrive"] + \
+              [f"err.{c}" for c in ("MISSING_FIELD", "NOT_WAITING", "TOKEN_UNREADABLE", "CONFIG_WRITE", "IMPORT_UNSUPPORTED", "IMPORT_ENCRYPTED",
+                                    "AUTH_EXPIRED", "NETWORK", "RCLONE_ERROR", "NOT_FOUND", "BAD_NAME", "BAD_REQUEST")]
+    for lang in ("zh-TW", "en"):
+        for key in sorted(used | set(dynamic)):
+            assert key in dicts[lang], (lang, key)
+        gone = [k for k in dicts[lang] if k.startswith(("setup.", "connect.", "nav.setup")) or k == "ov.setupLink"]
+        assert not gone, gone
+        for code in ("REMOTE_EXISTS", "REMOTE_NOT_FOUND", "CONFIG_LAYOUT", "RCLONE_MISSING", "NO_CONFIG_PATH", "SIGNIN_TIMEOUT", "CANCELLED"):
+            assert f"err.{code}" not in dicts[lang], code
+    placeholders = {"MISSING_FIELD": {"field"}, "IMPORT_UNSUPPORTED": {"type"}, "NOT_WAITING": set(), "TOKEN_UNREADABLE": set(),
+                    "CONFIG_WRITE": set(), "IMPORT_ENCRYPTED": set(), "AUTH_EXPIRED": set(), "NETWORK": set(), "RCLONE_ERROR": set()}
+    for lang in ("zh-TW", "en"):
+        for code, names in placeholders.items():
+            assert set(re.findall(r"\{(\w+)\}", dicts[lang][f"err.{code}"])) == names, (lang, code)
+    assert re.search(r"[一-鿿]", dicts["zh-TW"]["conn.paste.scope"]) and not re.search(r"[一-鿿]", dicts["en"]["conn.paste.scope"])
+    assert "小寫" in dicts["zh-TW"]["err.BAD_NAME"] and "lowercase" in dicts["en"]["err.BAD_NAME"]
+
+
+# ---- screenshots of the Clouds view in its key states
+
+@pytest.mark.parametrize("scheme", ["light", "dark"])
+@pytest.mark.parametrize("locale", ["en-US", "zh-TW"])
+@pytest.mark.parametrize("width", [1440, 900])
+def test_screenshots_of_the_clouds_view(make_onb, scheme, locale, width):
+    tag = f"{scheme}-{locale}-{width}"
+    try:
+        SHOTS.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pytest.skip("no screenshot directory")
+
+    def snap(ui: Ui, name: str) -> None:
+        ui.page.wait_for_timeout(250)
+        ui.page.screenshot(path=str(SHOTS / f"clouds-{name}-{tag}.png"))
+        assert (SHOTS / f"clouds-{name}-{tag}.png").stat().st_size > 5_000
+
+    def fresh(**kw: Any) -> Ui:
+        ui = make_onb(locale=locale, color_scheme=scheme, width=width, **kw)
+        ui.mock.importable_info["remotes"] = copy.deepcopy(IMPORT_ROWS)
+        return ui
+
+    ui = start(fresh())
+    expect(ui.tid("import-list")).to_be_visible()
+    snap(ui, "fresh")
+
+    ui.mock.flow_script = ["waiting"]                                       # connecting, with the sign-in link
+    ui.tid("connect-onedrive").click()
+    ui.tid("connect-start").click()
+    expect(ui.tid("auth-link")).to_be_visible()
+    snap(ui, "connecting")
+    ui.tid("connect-cancel").click()
+    ui.page.keyboard.press("Escape")
+
+    ui.mock.questions = [{**DRIVE_CHOICE}]                                  # a question
+    ui.mock.flow_script = ["succeeded"]
+    ui.tid("connect-onedrive").click()
+    ui.tid("connect-start").click()
+    expect(ui.tid("connect-question")).to_be_visible(timeout=8000)
+    snap(ui, "question")
+    ui.tid("connect-cancel").click()
+    ui.page.keyboard.press("Escape")
+
+    ui.tid("connect-iclouddrive").click()                                   # the iCloud form
+    ui.tid("connect-apple-id").fill("me@example.com")
+    ui.tid("connect-apple-password").fill("not-shown-in-shots")
+    snap(ui, "icloud")
+    ui.page.keyboard.press("Escape")
+
+    ui.tid("connect-dropbox").click()                                       # the paste-a-token dialog
+    ui.tid("conn-paste-toggle").click()
+    ui.tid("conn-paste-token").fill('{"access_token":"…","token_type":"bearer"}')
+    ui.tid("conn-paste-command").scroll_into_view_if_needed()
+    snap(ui, "paste")
+    ui.page.keyboard.press("Escape")
+
+    ui = start(fresh())                                                     # connected: cards, an import list
+    ui.mock.connect_clouds("gdrive", "dropbox", writable=("gdrive",))
+    ui.mock.manual = [{"name": "onedrive", "provider": "onedrive", "writable": False}]
+    ui.mock.remotes.append({"id": 9, "name": "onedrive", "provider": "onedrive", "writable": False, "case_insensitive": False})
+    ui.mock.conns.append({"name": "icloud", "provider": "iclouddrive", "account": "me@icloud.example", "read": True, "write": False,
+                          "writable": False, "created_at": "2025-01-01T00:00:00Z", "scoped": False})
+    ui.mock.test_results["dropbox"] = {"ok": False, "account": None, "quota": None, "error": "x", "code": "AUTH_EXPIRED", "params": {}}
+    ui.page.reload()
+    expect(ui.tid("conn-card-onedrive")).to_be_visible()
+    expect(ui.tid("conn-card-dropbox")).to_have_attribute("data-state", "relogin")
+    ui.tid("import-section").scroll_into_view_if_needed()
+    snap(ui, "import")
+
+    ui = start(fresh(approvals_enabled=False))                              # the read-only fallback
+    ui.mock.connect_clouds("gdrive")
+    ui.page.reload()
+    expect(ui.tid("clouds-readonly")).to_be_visible()
+    snap(ui, "readonly")

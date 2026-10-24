@@ -941,6 +941,58 @@ a.btn-primary { color: var(--accent-ink); }
   .twisty-btn .icon { transition: none; }
 }
 
+/* ================================================================== rclone's questions, read-only panel (docs/ONBOARDING.md G5) */
+/* read-only fallback */
+.su-ro { padding: 14px 16px 16px; background: var(--info-bg); color: var(--text); border: 1px solid var(--border-strong); border-radius: var(--radius); }
+.su-ro h2 { display: flex; align-items: center; gap: 8px; margin: 0 0 6px; font-size: 15px; color: var(--info-ink); }
+.su-ro > p { margin: 0 0 10px; }
+.su-ro-steps { margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 10px; }
+.su-ro-steps p { margin: 0 0 4px; }
+.su-code { position: relative; }
+.su-code pre {
+  margin: 0; padding: 10px 76px 10px 12px; background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+  font-size: 12.5px; overflow: auto; white-space: pre; max-height: 220px;
+}
+.su-copy { position: absolute; top: 6px; right: 6px; }
+
+/* the question form */
+.su-question { display: flex; flex-direction: column; gap: 10px; }
+.su-q-title { margin: 0; font-size: 14px; font-weight: 600; }
+.su-q-title code { background: var(--hover); padding: 1px 7px; border-radius: 5px; font-size: 12.5px; }
+.su-rclone { border: 1px dashed var(--border-strong); border-radius: 8px; background: var(--surface-2); overflow: hidden; }
+.su-rclone-tag { display: flex; align-items: center; gap: 6px; padding: 4px 10px; font-size: 11.5px; color: var(--muted); border-bottom: 1px dashed var(--border-strong); }
+.su-rclone-text { margin: 0; padding: 8px 10px; font: 12.5px/1.5 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 210px; overflow: auto; }
+.su-options { display: flex; flex-direction: column; padding: 4px 6px 8px; max-height: 300px; overflow: auto; }
+.su-option { display: flex; align-items: flex-start; gap: 9px; padding: 6px 6px; border-radius: 6px; cursor: pointer; }
+.su-option:hover { background: var(--hover); }
+.su-option.on { background: var(--accent-soft); }
+.su-option input { margin-top: 3px; accent-color: var(--accent); }
+.su-option-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.su-option-main code { font-size: 12.5px; overflow-wrap: anywhere; }
+.su-option-help { color: var(--muted); font-size: 12.5px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.su-option-value { display: flex; align-items: center; gap: 8px; }
+.su-bool { display: flex; gap: 8px; }
+.su-q-input { display: flex; flex-direction: column; gap: 8px; }
+.su-q-input .field input, .su-q-input .select { width: 100%; max-width: none; }
+.su-q-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.su-retry { display: flex; align-items: center; gap: 6px; margin: 0; padding: 6px 9px; border-radius: 7px; background: var(--warn-bg); color: var(--warn); font-size: 13px; }
+.su-icloud { display: flex; flex-direction: column; gap: 8px; }
+.su-icloud p { margin: 0; }
+.su-icloud .field input { width: 100%; }
+
+/* the paste-a-token disclosure and the import list */
+.conn-paste > p, .conn-paste > .guide-warn, .conn-paste > .su-code { margin: 8px 0; }
+.conn-paste .conn-paste-label { font-weight: 600; }
+.conn-paste .su-code pre { min-height: 44px; box-sizing: border-box; display: flex; align-items: center; font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.conn-paste-token { width: 100%; font: 12.5px/1.45 var(--mono); resize: vertical; box-sizing: border-box; }
+.conn-paste .btn { margin-top: 8px; }
+.connect-busy { display: flex; align-items: center; gap: 8px; margin: 8px 0 0; }
+.conn-note { margin: 0; font-size: 12.5px; }
+.import-list { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.import-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 8px 12px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); }
+.import-row .muted { font-size: 12.5px; }
+.view-clouds .su-ro { margin-bottom: 14px; }
+
 /* ================================================================== clouds, connect, sync, free space (docs/ONBOARDING.md) */
 .view-clouds .view-body, .view-free .view-body { max-width: 1080px; width: 100%; margin: 0 auto; }
 .section-h { margin: 0 0 8px; font-size: 14px; }
@@ -986,7 +1038,8 @@ a.btn-primary { color: var(--accent-ink); }
 .prov-drive { background: #1a73e8; }
 .prov-onedrive { background: #0f6cbd; }
 .prov-dropbox { background: #0061ff; }
-.prov-mark:not(.prov-drive):not(.prov-onedrive):not(.prov-dropbox) { background: var(--cloud-7); }
+.prov-iclouddrive { background: #0a6fd8; }
+.prov-mark:not(.prov-drive):not(.prov-onedrive):not(.prov-dropbox):not(.prov-iclouddrive) { background: var(--cloud-7); }
 .rclone-chip { display: inline-flex; align-items: center; gap: 4px; padding: 2px 9px; border-radius: 10px; background: var(--ok-bg); color: var(--ok); font-size: 12px; font-weight: 600; }
 .rclone-banner { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; padding: 10px 14px; margin: 0; }
 .rclone-banner .note { flex-basis: 100%; margin: 0; }

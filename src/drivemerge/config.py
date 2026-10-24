@@ -3,36 +3,26 @@
 from __future__ import annotations
 
 import contextlib
+import importlib.resources
+import json
 import os
+import re
+import secrets
 import sqlite3
 import tempfile
+import threading
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import providers
+from .db import connect as db_connect
 from .db import set_quarantine_dir, utcnow
 
 DEFAULT_CONFIG_PATH = Path(os.environ.get("DRIVEMERGE_CONFIG", "~/.config/drive-merge/config.toml")).expanduser()
 DEFAULT_DB_PATH = "~/.local/share/drive-merge/catalog.db"
 RCLONE_CONF_NAME = "rclone.conf"            # drive-merge's own rclone config, next to the main config
 CONNECTIONS_NAME = "connections.toml"       # [[remotes]] written by `drivemerge connect` / the page
-
-
-def write_private(path: str | Path, text: str) -> None:
-    """Write `text` to `path` atomically (temp file + rename) with mode 600."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(text)
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, path)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp)
-        raise
 
 
 @dataclass
@@ -194,3 +184,197 @@ def sync_remotes(conn: sqlite3.Connection, config: Config) -> None:
                  case_insensitive = excluded.case_insensitive""",
             (r.name, r.provider, r.read, r.write, int(r.folds_case), utcnow()),
         )
+
+
+# --------------------------------------------------------------------------- writing the file
+# The setup screen appends a [[remotes]] block and edits one `write` line; everything else in the file, comments
+# included, stays as it is. Every write re-parses the result and leaves the file untouched when anything is off.
+
+class ConfigError(ValueError):
+    """A refusal to edit the config file, with a machine-readable `code` and `params` for the page to word."""
+
+    def __init__(self, code: str, message: str, **params: str):
+        super().__init__(message)
+        self.code, self.params = code, params
+
+
+RCLONE_PROVIDERS = {"drive": "drive", "dropbox": "dropbox", "onedrive": "onedrive", "iclouddrive": "iclouddrive",
+                    "local": "local"}
+PROVIDER_EXTRA_ARGS = {"drive": ("--fast-list", "--drive-skip-shortcuts")}
+_write_lock = threading.Lock()
+_HEADER = re.compile(r"^\s*\[\[?\s*([A-Za-z0-9_.\"' -]+?)\s*\]\]?\s*(?:#.*)?$")
+_NAME_LINE = re.compile(r"^\s*name\s*=\s*(\"(?:[^\"\\]|\\.)*\"|'[^']*')\s*(?:#.*)?$")
+
+
+def provider_of(rclone_type: str) -> str:
+    """drive-merge's provider key for an rclone backend type; anything it has no profile for is `other`."""
+    return RCLONE_PROVIDERS.get(rclone_type, "other")
+
+
+def write_private(path: Path, text: str) -> None:
+    """Write `text` to `path` readable by the owner only, atomically (temp file beside it, fsync, rename).
+    A symbolic link is written through, so it keeps pointing at the real file."""
+    path = Path(os.path.realpath(path))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def _toml_str(value: str) -> str:
+    return json.dumps(value, ensure_ascii=False)      # a JSON string is a valid TOML basic string
+
+
+def _toml_list(values) -> str:
+    return "[" + ", ".join(_toml_str(v) for v in values) + "]"
+
+
+def _read_text(path: Path, name: str) -> tuple[str, dict]:
+    try:
+        text = Path(path).read_bytes().decode("utf-8")        # keeps \r\n as it is
+        return text, tomllib.loads(text)
+    except OSError as e:
+        raise ConfigError("CONFIG_WRITE", f"cannot read {path}: {e}", name=name) from e
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as e:
+        raise ConfigError("CONFIG_LAYOUT", f"{path} is not valid TOML ({e}); fix it by hand first", name=name) from e
+
+
+def _commit(path: Path, name: str, new_text: str, expected: list[dict]) -> None:
+    """Write `new_text` after checking that it parses and that [[remotes]] is exactly `expected` (raw tables)."""
+    try:
+        data = tomllib.loads(new_text)
+        parse_config(data)
+    except (tomllib.TOMLDecodeError, ValueError, KeyError, TypeError) as e:
+        raise ConfigError("CONFIG_LAYOUT", f"the edited config would not parse ({e}); {path} was not changed",
+                          name=name) from e
+    if data.get("remotes") != expected:
+        raise ConfigError("CONFIG_LAYOUT", f"the edit would change more than the remote {name!r}; "
+                                           f"{path} was not changed", name=name)
+    try:
+        write_private(path, new_text)
+    except OSError as e:
+        raise ConfigError("CONFIG_WRITE", f"cannot write {path}: {e}", name=name) from e
+
+
+def add_remote_block(path: str | Path, remote: RemoteConfig) -> None:
+    """Append a `[[remotes]]` block for `remote` (extra_args default to the provider's when none are given).
+
+    REMOTE_EXISTS when the name is taken; CONFIG_LAYOUT when the file cannot take the block; the file is untouched
+    on any error."""
+    path = Path(path)
+    with _write_lock:
+        text, data = _read_text(path, remote.name)
+        existing = data.get("remotes", [])
+        if not isinstance(existing, list) or any(not isinstance(r, dict) for r in existing):
+            raise ConfigError("CONFIG_LAYOUT", "[[remotes]] in the config is not a list of tables", name=remote.name)
+        if any(r.get("name") == remote.name for r in existing):
+            raise ConfigError("REMOTE_EXISTS", f"remote {remote.name!r} is already in {path}", name=remote.name)
+        extra = remote.extra_args or PROVIDER_EXTRA_ARGS.get(remote.provider, ())
+        table = {"name": remote.name, "provider": remote.provider, "read": remote.read}
+        lines = ["[[remotes]]", f"name = {_toml_str(remote.name)}", f"provider = {_toml_str(remote.provider)}",
+                 f"read = {_toml_str(remote.read)}"]
+        if remote.write:
+            table["write"] = remote.write
+            lines.append(f"write = {_toml_str(remote.write)}")
+        if remote.hash_types is not None:
+            table["hash_types"] = list(remote.hash_types)
+            lines.append(f"hash_types = {_toml_list(remote.hash_types)}")
+        if extra:
+            table["extra_args"] = list(extra)
+            lines.append(f"extra_args = {_toml_list(extra)}")
+        if remote.case_insensitive is not None:
+            table["case_insensitive"] = remote.case_insensitive
+            lines.append(f"case_insensitive = {'true' if remote.case_insensitive else 'false'}")
+        nl = "\r\n" if "\r\n" in text else "\n"
+        body = text.rstrip("\r\n")
+        new_text = (body + nl + nl if body else "") + nl.join(lines) + nl
+        _commit(path, remote.name, new_text, [*existing, table])
+
+
+def set_remote_write(path: str | Path, name: str, write: str | None) -> None:
+    """Set (or, with None, remove) the `write` key of the `[[remotes]]` block named `name`, in place.
+
+    REMOTE_NOT_FOUND when no such remote; CONFIG_LAYOUT when its block cannot be located line by line (remotes
+    written as inline tables, say); the file is untouched on any error."""
+    path = Path(path)
+    with _write_lock:
+        text, data = _read_text(path, name)
+        existing = data.get("remotes", [])
+        if not isinstance(existing, list) or not any(isinstance(r, dict) and r.get("name") == name for r in existing):
+            raise ConfigError("REMOTE_NOT_FOUND", f"remote {name!r} is not in {path}", name=name)
+        nl = "\r\n" if "\r\n" in text else "\n"
+        lines = text.splitlines()
+        starts = [i for i, ln in enumerate(lines) if re.fullmatch(r"\s*\[\[\s*remotes\s*\]\]\s*(?:#.*)?", ln)]
+        found = []
+        for i in starts:
+            end = next((j for j in range(i + 1, len(lines)) if _HEADER.match(lines[j])), len(lines))
+            for j in range(i + 1, end):
+                m = _NAME_LINE.match(lines[j])
+                if m:
+                    try:
+                        if tomllib.loads(f"n = {m.group(1)}")["n"] == name:
+                            found.append((i, end))
+                    except tomllib.TOMLDecodeError:
+                        pass
+                    break
+        if len(found) != 1:
+            raise ConfigError("CONFIG_LAYOUT", f"cannot find the [[remotes]] block of {name!r} in {path} "
+                                               "to edit it in place; edit the file by hand", name=name)
+        start, end = found[0]
+        write_at = next((j for j in range(start + 1, end) if re.match(r"\s*write\s*=", lines[j])), None)
+        if write is None:
+            if write_at is not None:
+                del lines[write_at]
+        elif write_at is not None:
+            lines[write_at] = f"write = {_toml_str(write)}"
+        else:
+            after = next((j for j in range(start + 1, end) if re.match(r"\s*read\s*=", lines[j])), None)
+            if after is None:
+                after = next(j for j in range(start + 1, end) if _NAME_LINE.match(lines[j]))
+            lines.insert(after + 1, f"write = {_toml_str(write)}")
+        expected = []
+        for r in existing:
+            if r.get("name") == name:
+                r = {k: v for k, v in r.items() if k != "write"}
+                if write is not None:
+                    r["write"] = write
+            expected.append(r)
+        new_text = nl.join(lines) + (nl if text.endswith(("\n", "\r")) else "")
+        _commit(path, name, new_text, expected)
+
+
+def _template() -> str:
+    return importlib.resources.files("drivemerge").joinpath("config_template.toml").read_text(encoding="utf-8")
+
+
+def write_new_config(path: str | Path) -> Path:
+    """Write a fresh config (mode 600, a new API token) and create its catalog; replaces whatever is at `path`.
+
+    The packaged template keeps its example [[remotes]] entries as comments, so the file starts with no clouds."""
+    path = Path(path)
+    text, count = re.subn(r'(?m)^token\s*=\s*"".*$', f'token = "{secrets.token_urlsafe(32)}"', _template(), count=1)
+    if count != 1:
+        raise ValueError("config template has no empty [api] token line")
+    write_private(path, text)
+    cfg = load_config(path)                            # make sure what we wrote parses
+    db_connect(cfg.db_path).close()
+    return path
+
+
+def ensure_config(path: str | Path) -> bool:
+    """Create the config at `path` when the file is missing (what `drivemerge init` does); True when it was
+    created. An existing file is never touched."""
+    path = Path(path)
+    if path.exists():
+        return False
+    write_new_config(path)
+    return True

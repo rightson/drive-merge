@@ -20,6 +20,7 @@ import hmac
 import json
 import mimetypes
 import os
+import re
 import secrets
 import socket
 import sys
@@ -27,10 +28,10 @@ import threading
 import time
 import webbrowser
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, field, is_dataclass
+from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from importlib import resources
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import uvicorn
 from fastapi import APIRouter, Body, Depends, FastAPI, Query, Request, Response
@@ -42,13 +43,24 @@ from . import __version__, connections, plans
 from .api import (
     LOOPBACK_HOSTS, QuotaCache, bearer_ok, build_router, install_error_handlers, scrub_secrets,
 )
-from .config import Config
+from .config import (
+    Config, ConfigError, RemoteConfig, add_remote_block, load_config, provider_of, set_remote_write,
+)
 from .models import Op, Plan
+from .rclone import AUTH_URL, Rclone, RcloneCancelled, RcloneError, RcloneTimeout, classify_failure
 from .service import Service, draft_of
 
 SESSION_COOKIE = "dm_session"
 MAX_SESSIONS = 32          # token holders only, but a loop must not grow memory without bound
 KEEP_JOBS = 50
+SIGNIN_TIMEOUT_S = 600.0   # rclone waits this long for the browser, and a question waits this long for its answer
+ANSWER_TIMEOUT_S = 600.0
+CREATE_TIMEOUT_S = 120.0
+NEW_REMOTE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,31}")
+ADOPT_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.+@-]{0,63}")
+MAX_ANSWER = 65536
+# What each cloud needs to start signing in: rclone type, and the option values this screen sets itself.
+CONNECT_TYPES = {"drive": "drive", "dropbox": "dropbox", "onedrive": "onedrive", "iclouddrive": "iclouddrive"}
 _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 _TEXT = "; charset=utf-8"
 _MEDIA = {".html": "text/html" + _TEXT, ".js": "text/javascript" + _TEXT, ".mjs": "text/javascript" + _TEXT,
@@ -90,6 +102,30 @@ class ApproveBody(_Body):
 
 class SyncBody(_Body):
     remotes: list[str] | None = None
+
+
+class ConnectBody(_Body):
+    provider: Literal["drive", "dropbox", "onedrive", "iclouddrive"]
+    name: str = Field(max_length=200)
+    client_id: str | None = Field(default=None, max_length=512)
+    client_secret: str | None = Field(default=None, max_length=512)
+    apple_id: str | None = Field(default=None, max_length=512)       # iCloud only: rclone needs it to start
+    password: str | None = Field(default=None, max_length=512)       # iCloud only; forwarded, never kept
+    remote_auth: bool = False        # sign in on another machine: rclone asks for a token made by `rclone authorize`
+
+
+class AnswerBody(_Body):
+    result: str = Field(max_length=MAX_ANSWER)
+
+
+class NameBody(_Body):
+    name: str = Field(max_length=200)
+
+
+class EnableWriteBody(_Body):
+    name: str = Field(max_length=200)
+    client_id: str | None = Field(default=None, max_length=512)
+    client_secret: str | None = Field(default=None, max_length=512)
 
 
 RescanBody = SyncBody  # the old name of the sync body (POST /v1/ui/rescan is an alias of /v1/ui/sync)
@@ -180,6 +216,15 @@ class _Sessions:
             return self._by_id.get(session_id)
 
 
+class CodedError(str):
+    """A job failure the page words from `code` and `params`; as text it is the English message."""
+
+    def __new__(cls, code: str, message: str, **params: Any):
+        self = super().__new__(cls, message)
+        self.code, self.params = code, params
+        return self
+
+
 @dataclass
 class _Job:
     id: str
@@ -188,6 +233,8 @@ class _Job:
     progress: dict = field(default_factory=dict)
     result: Any = None
     error: str | None = None
+    code: str | None = None
+    params: dict = field(default_factory=dict)
 
 
 class _Jobs:
@@ -222,20 +269,36 @@ class _Jobs:
         except Exception as e:  # a job must always end in done or failed
             result, error = None, _describe(e)
         with self._lock:
-            job.result, job.error = result, error
+            job.result, job.error = result, (str(error) if error else error)
+            job.code, job.params = getattr(error, "code", None), dict(getattr(error, "params", {}))
             job.status = "failed" if error else "done"
 
     def update(self, job: _Job, **progress: Any) -> None:
         with self._lock:
             job.progress.update(progress)
 
+    def reset(self, job: _Job, **progress: Any) -> None:
+        """Replace the whole progress (a stage change must not keep the last stage's keys)."""
+        with self._lock:
+            job.progress = dict(progress)
+
+    def get(self, job_id: str) -> _Job:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                raise KeyError(f"no job {job_id}")
+            return job
+
     def view(self, job_id: str) -> dict:
         with self._lock:
             job = self._jobs.get(job_id)
             if job is None:
                 raise KeyError(f"no job {job_id}")
-            return {"id": job.id, "kind": job.kind, "status": job.status, "progress": dict(job.progress),
+            view = {"id": job.id, "kind": job.kind, "status": job.status, "progress": dict(job.progress),
                     "result": job.result, "error": job.error}
+            if job.code:
+                view.update(code=job.code, params=dict(job.params))
+            return view
 
 
 def _reports(jobs: _Jobs, job: _Job) -> Callable[..., None]:
@@ -266,6 +329,92 @@ def _reports(jobs: _Jobs, job: _Job) -> Callable[..., None]:
         jobs.update(job, **flat, reports=count)
 
     return report
+
+
+# --------------------------------------------------------------------------- #
+# Connecting a cloud: rclone's non-interactive configuration, driven in a thread
+# --------------------------------------------------------------------------- #
+
+class _Connect:
+    """What the answer and cancel routes need to reach a running connect job. The answer is handed over once and
+    never copied anywhere else: it is not part of the job view, the progress or any error."""
+
+    def __init__(self) -> None:
+        self.cancel = threading.Event()
+        self._lock = threading.Lock()
+        self._arrived = threading.Event()
+        self._answer: str | None = None
+        self.waiting = False
+
+    def ask(self) -> None:
+        with self._lock:
+            self._answer = None
+            self._arrived.clear()
+            self.waiting = True
+
+    def give(self, answer: str) -> bool:
+        with self._lock:
+            if not self.waiting:
+                return False
+            self.waiting = False
+            self._answer = answer
+            self._arrived.set()
+            return True
+
+    def wait(self, timeout: float) -> str:
+        """The answer, once it arrives. RcloneCancelled when cancelled; RcloneTimeout when none comes in `timeout`."""
+        deadline = time.monotonic() + timeout
+        try:
+            while True:
+                if self.cancel.is_set():
+                    raise RcloneCancelled("cancelled while waiting for an answer")
+                if self._arrived.wait(0.05):
+                    with self._lock:
+                        answer, self._answer = self._answer or "", None
+                    return answer
+                if time.monotonic() > deadline:
+                    raise RcloneTimeout("no answer in time")
+        finally:
+            with self._lock:
+                self.waiting = False
+
+
+def _question(opt: dict) -> dict:
+    """The page's view of one rclone question. Only what the form needs; nothing the person typed."""
+    examples = opt.get("Examples") or []
+    return {
+        "name": str(opt.get("Name") or ""),
+        "help": str(opt.get("Help") or "")[:4000],
+        "default": opt.get("Default") if isinstance(opt.get("Default"), (str, int, float, bool)) else "",
+        "examples": [{"value": str(e.get("Value", "")), "help": str(e.get("Help", ""))[:500]}
+                     for e in examples[:200] if isinstance(e, dict)],
+        "password": bool(opt.get("IsPassword")),
+        "required": bool(opt.get("Required")),
+        "exclusive": bool(opt.get("Exclusive")),
+        "type": str(opt.get("Type") or "string"),
+    }
+
+
+def _connect_failure(exc: BaseException, name: str) -> CodedError:
+    """The coded failure for whatever stopped a connect job. Never built from a message that could hold an answer
+    (only the stderr tail rclone printed, from which the secrets were already removed)."""
+    if isinstance(exc, RcloneCancelled):
+        return CodedError("CANCELLED", "the sign-in was cancelled", name=name)
+    if isinstance(exc, RcloneTimeout):
+        return CodedError("SIGNIN_TIMEOUT", "no sign-in in 10 minutes", name=name)
+    if isinstance(exc, ConfigError):
+        return CodedError(exc.code, str(exc), **exc.params)
+    if isinstance(exc, RcloneError):
+        tail = [ln.strip() for ln in exc.stderr.splitlines() if ln.strip()]
+        detail = (tail[-1] if tail else "no output")[:300]
+        return CodedError("RCLONE_ERROR", f"rclone failed: {detail}", name=name, detail=detail)
+    if isinstance(exc, OSError):
+        return CodedError("CONFIG_WRITE", "the config file could not be written", name=name)
+    return CodedError("RCLONE_ERROR", f"unexpected {type(exc).__name__}", name=name, detail=type(exc).__name__)
+
+
+def _remote_view(service: Service, name: str) -> dict:
+    return next(r for r in service.setup_state()["remotes"] if r["name"] == name)
 
 
 # --------------------------------------------------------------------------- #
@@ -326,6 +475,10 @@ def _disabled_message(request: Request) -> str:
         cli = f"`drivemerge plan execute {plan_id}`"
     elif path.endswith("/bridge"):
         cli = "`drivemerge bridge`"
+    elif "/setup/" in path:
+        return ("connecting, adopting and enabling clouds from the browser is off: `drivemerge ui` must be started "
+                "from an interactive terminal, outside an AI agent. In your own terminal run `rclone config`, add a "
+                "[[remotes]] entry to config.toml, then run `drivemerge scan --all`")
     elif path.endswith("/purge"):
         cli = f"`drivemerge plan purge {plan_id}`"
     elif "/connect" in path or "/connections" in path:
@@ -383,12 +536,13 @@ def _static_response(root: Path, rel: str) -> FileResponse:
 # --------------------------------------------------------------------------- #
 
 def create_ui_app(service: Service, *, config: Config, api_token: str, ui_token: str,
-                  approvals_enabled: bool) -> FastAPI:
+                  approvals_enabled: bool, config_path: Path | None = None) -> FastAPI:
     """FastAPI app: REST routes, workspace routes, the human channel and the single-page app.
 
     `ui_token` is exchanged once per browser for a session cookie. `api_token` may be empty, which
     leaves the browser session as the only way in. `approvals_enabled` is decided by whoever
-    started the process (see `approvals_allowed`); when false the human channel answers 403.
+    started the process (see `approvals_allowed`); when false the human channel answers 403. `config_path` is the
+    file the Setup screen may write; without it those routes answer 409 NO_CONFIG_PATH.
     """
     from . import workspace
 
@@ -402,7 +556,11 @@ def create_ui_app(service: Service, *, config: Config, api_token: str, ui_token:
     lock = threading.Lock()  # one shared SQLite connection: one service call at a time
     sessions = _Sessions()
     jobs = _Jobs()
+    connects: dict[str, _Connect] = {}
     web = _web_root()
+    if config_path is not None and not service.config_path:
+        service.config_path = str(config_path)
+
     quotas = QuotaCache()
 
     def job_service() -> Service:
@@ -426,7 +584,12 @@ def create_ui_app(service: Service, *, config: Config, api_token: str, ui_token:
         problems = "; ".join(f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors())
         return _refusal(422, _coded(problems, "BAD_REQUEST"))
 
+    def config_error(_: Request, exc: ConfigError) -> JSONResponse:
+        status = {"REMOTE_EXISTS": 409, "REMOTE_NOT_FOUND": 404, "CONFIG_LAYOUT": 409}.get(exc.code, 500)
+        return _refusal(status, _coded(str(exc), exc.code, exc.params))
+
     app.add_exception_handler(UiError, ui_error)
+    app.add_exception_handler(ConfigError, config_error)
     app.add_exception_handler(workspace.WorkspaceError, workspace_error)
     app.add_exception_handler(RequestValidationError, invalid_request)
 
@@ -516,6 +679,31 @@ def create_ui_app(service: Service, *, config: Config, api_token: str, ui_token:
             # Clouds a run changed since their last completed scan: the catalog (and so the tree) is behind them.
             "outdated": outdated,
         }
+
+    @router.get("/v1/ui/setup")
+    def setup() -> dict:
+        service.rclone_facts()               # runs rclone outside the lock when its answer is not cached
+        with lock:
+            state = service.setup_state()
+        state["needed"] = not state["remotes"] or not state["scanned"]
+        return state
+
+    @router.post("/v1/ui/setup/test")
+    def setup_test(body: NameBody) -> dict:
+        """List the top of one configured cloud and say what went wrong, worded from a code."""
+        with lock:
+            remote = next((r for r in config.remotes if r.name == body.name), None)
+        if remote is None:
+            raise UiError(404, "NOT_FOUND", f"no remote {body.name!r} in drive-merge")
+        failure = service.rclone.test_remote(remote.read)
+        if failure is None:
+            return {"ok": True}
+        code = classify_failure(failure.returncode, failure.stderr)
+        params = {}
+        if code == "RCLONE_ERROR":
+            tail = [ln.strip() for ln in failure.stderr.splitlines() if ln.strip()]
+            params["detail"] = (tail[-1] if tail else str(failure))[:300]
+        return {"ok": False, "code": code, "params": params}
 
     @router.get("/v1/tree/roots")
     def tree_roots(draft: int | None = None) -> dict:
@@ -750,6 +938,207 @@ def create_ui_app(service: Service, *, config: Config, api_token: str, ui_token:
 
         return {"job_id": jobs.start("bridge", work, bridged=0, failed=0, total=None).id}
 
+    # ---- setup: connect, adopt, enable writing (all human-only: they grant access to a cloud)
+
+    def need_path() -> Path:
+        if config_path is None:
+            raise UiError(409, "NO_CONFIG_PATH", "the server was started without a config file path, so it cannot "
+                                                 "add clouds; edit config.toml by hand")
+        return Path(config_path)
+
+    def swap_config(path: Path, name: str) -> None:
+        """Adopt the remotes now in the config file (and nothing else of it) for this server and later jobs."""
+        nonlocal config
+        try:
+            fresh = load_config(path)
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            raise ConfigError("CONFIG_LAYOUT", f"{path} could not be read back ({type(e).__name__})",
+                              name=name) from e
+        new = replace(config, remotes=fresh.remotes)
+        with lock:
+            service.reload_config(new)
+            config = new
+
+    def remote_view(name: str) -> dict:
+        service.rclone_facts()               # rclone runs outside the lock when its answer is not cached
+        with lock:
+            return _remote_view(service, name)
+
+    def check_new_name(name: str, *, others: tuple[str, ...] = ()) -> None:
+        if not NEW_REMOTE_NAME.fullmatch(name):
+            raise UiError(400, "BAD_NAME", "a cloud name is letters, digits, - and _ (at most 32), starting with a "
+                                           "letter or digit")
+        taken = {r.name for r in config.remotes}
+        taken |= {p.split(":", 1)[0] for r in config.remotes for p in (r.read, r.write) if p and ":" in p}
+        try:
+            taken |= {r["name"] for r in service.rclone.list_remotes()}
+        except RcloneError:
+            pass
+        for n in (name, *others):
+            if n in taken:
+                raise UiError(409, "REMOTE_EXISTS", f"{n!r} already exists in rclone or in drive-merge", name=n)
+
+    def start_connect(*, name: str, provider: str, options: dict[str, str], remote_auth: bool,
+                      mode: str, base: str | None = None) -> str:
+        """Start the connect job: create the rclone remote and walk rclone's questions. `mode` is 'new' (add a
+        read-only remote when done) or 'write' (record `name` as the write path of the existing remote `base`)."""
+        path = need_path()
+        ctl = _Connect()
+        rc: Rclone = service.rclone
+        rtype = CONNECT_TYPES[provider]
+
+        def work(job: _Job) -> tuple[Any, str | None]:
+            connects[job.id] = ctl
+            state: dict[str, Any] = {"auth_url": None}
+
+            def stage(stage_name: str, **extra: Any) -> None:
+                jobs.reset(job, stage=stage_name, name=name, provider=provider, mode=mode, **extra)
+
+            def on_stderr(line: str) -> None:
+                found = AUTH_URL.search(line)       # only rclone's own helper on 127.0.0.1:53682 is passed on
+                if found:
+                    state["auth_url"] = found.group(0)
+                    stage("signin", auth_url=state["auth_url"])
+
+            try:
+                stage("starting")
+                out = rc.config_create(name, rtype, options, on_stderr=on_stderr, cancel=ctl.cancel,
+                                       timeout=CREATE_TIMEOUT_S)
+                while out.get("State"):
+                    opt = out.get("Option") or {}
+                    if not opt:
+                        raise RcloneError("rclone gave a state without a question", 0, str(out.get("Error") or ""))
+                    if opt.get("Name") == "config_is_local" and not state.get("local_asked"):
+                        state["local_asked"] = True
+                        answer = "false" if remote_auth else "true"
+                    else:
+                        question = _question(opt)
+                        if out.get("Error"):
+                            question["retry"] = True      # rclone refused the last answer; its text is not passed on
+                        stage("question", question=question)
+                        ctl.ask()
+                        answer = ctl.wait(ANSWER_TIMEOUT_S)
+                    stage("working")
+                    out = rc.config_continue(name, out["State"], answer, on_stderr=on_stderr, cancel=ctl.cancel,
+                                             timeout=SIGNIN_TIMEOUT_S)
+                    del answer
+                if out.get("Error"):
+                    raise RcloneError("rclone reported an error", 0, str(out["Error"]))
+                stage("saving")
+                if mode == "new":
+                    add_remote_block(path, RemoteConfig(name=name, provider=provider_of(rtype), read=f"{name}:"))
+                    swap_config(path, name)
+                    shown = name
+                else:
+                    set_remote_write(path, base, f"{name}:")
+                    swap_config(path, base)
+                    shown = base
+                service.forget_rclone()
+                jobs.reset(job, stage="done", name=name, provider=provider, mode=mode)
+                return {"remote": remote_view(shown)}, None
+            except Exception as e:
+                failure = _connect_failure(e, name)
+                try:
+                    rc.config_delete(name)         # the half-made remote (rclone writes it at the first step)
+                except Exception:
+                    pass
+                service.forget_rclone()
+                jobs.reset(job, stage="failed", name=name, provider=provider, mode=mode)
+                return None, failure
+            finally:
+                connects.pop(job.id, None)
+
+        return jobs.start("connect", work, stage="starting", name=name, provider=provider, mode=mode).id
+
+    @human.post("/v1/ui/setup/connect", status_code=202)
+    def setup_connect(body: ConnectBody) -> dict:
+        need_path()
+        check_new_name(body.name)
+        if service.rclone.version_info() is None:
+            raise UiError(409, "RCLONE_MISSING", f"rclone cannot be run (binary: {config.rclone_binary!r}); "
+                                                 "install it or set [rclone] binary in config.toml",
+                          binary=config.rclone_binary)
+        options: dict[str, str] = {}
+        if body.provider == "drive":
+            options["scope"] = "drive.readonly"
+            options.update({k: v for k, v in (("client_id", body.client_id), ("client_secret", body.client_secret)) if v})
+        elif body.client_id or body.client_secret:
+            raise UiError(400, "BAD_REQUEST", "client_id and client_secret apply to Google Drive only")
+        if body.provider == "iclouddrive":
+            for key in ("apple_id", "password"):
+                if not getattr(body, key):
+                    raise UiError(400, "MISSING_FIELD", f"iCloud Drive needs {key}", field=key)
+            options.update(apple_id=body.apple_id, password=body.password)
+        elif body.apple_id or body.password:
+            raise UiError(400, "BAD_REQUEST", "apple_id and password apply to iCloud Drive only")
+        return {"job_id": start_connect(name=body.name, provider=body.provider, options=options,
+                                        remote_auth=body.remote_auth, mode="new")}
+
+    def connect_job(job_id: str) -> _Job:
+        job = jobs.get(job_id)           # KeyError -> 404 NOT_FOUND
+        if job.kind != "connect":
+            raise UiError(404, "NOT_FOUND", f"no connect job {job_id}")
+        return job
+
+    @human.post("/v1/ui/setup/connect/{job_id}/answer")
+    def setup_answer(job_id: str, body: AnswerBody) -> dict:
+        connect_job(job_id)
+        ctl = connects.get(job_id)
+        if ctl is None or not ctl.give(body.result):
+            raise UiError(409, "NOT_WAITING", f"connect job {job_id} is not waiting for an answer", job=job_id)
+        return {"ok": True}
+
+    @human.post("/v1/ui/setup/connect/{job_id}/cancel")
+    def setup_cancel(job_id: str) -> dict:
+        connect_job(job_id)
+        ctl = connects.get(job_id)
+        if ctl is not None:
+            ctl.cancel.set()
+        return {"ok": True}
+
+    @human.post("/v1/ui/setup/adopt")
+    def setup_adopt(body: NameBody) -> dict:
+        path = need_path()
+        if not ADOPT_NAME.fullmatch(body.name):
+            raise UiError(400, "BAD_NAME", "that name cannot be used as a cloud name")
+        with lock:
+            names = {r.name for r in config.remotes}
+        if body.name in names:
+            raise UiError(409, "REMOTE_EXISTS", f"{body.name!r} is already in drive-merge", name=body.name)
+        listed = {r["name"]: r for r in service.rclone.list_remotes()}
+        if body.name not in listed:
+            raise UiError(404, "REMOTE_NOT_FOUND", f"rclone has no remote {body.name!r}", name=body.name)
+        add_remote_block(path, RemoteConfig(name=body.name, provider=provider_of(listed[body.name]["type"]),
+                                            read=f"{body.name}:"))
+        swap_config(path, body.name)
+        service.forget_rclone()
+        return {"remote": remote_view(body.name)}
+
+    @human.post("/v1/ui/setup/enable-write")
+    def setup_enable_write(body: EnableWriteBody, response: Response) -> dict:
+        path = need_path()
+        with lock:
+            remote = next((r for r in config.remotes if r.name == body.name), None)
+        if remote is None:
+            raise UiError(404, "REMOTE_NOT_FOUND", f"no remote {body.name!r} in drive-merge", name=body.name)
+        if remote.write is not None:
+            return {"remote": remote_view(remote.name)}
+        if remote.provider != "drive":
+            set_remote_write(path, remote.name, remote.read)    # their tokens are not scope-limited
+            swap_config(path, remote.name)
+            return {"remote": remote_view(remote.name)}
+        rw = f"{remote.name}-rw"
+        check_new_name(rw)
+        if service.rclone.version_info() is None:
+            raise UiError(409, "RCLONE_MISSING", f"rclone cannot be run (binary: {config.rclone_binary!r}); "
+                                                 "install it or set [rclone] binary in config.toml",
+                          binary=config.rclone_binary)
+        options = {"scope": "drive"}
+        options.update({k: v for k, v in (("client_id", body.client_id), ("client_secret", body.client_secret)) if v})
+        response.status_code = 202
+        return {"job_id": start_connect(name=rw, provider="drive", options=options, remote_auth=False,
+                                        mode="write", base=remote.name)}
+
     def start_sync(body: SyncBody) -> dict:
         known = [r.name for r in service.config.remotes]
         names = list(dict.fromkeys(body.remotes or known))
@@ -766,7 +1155,9 @@ def create_ui_app(service: Service, *, config: Config, api_token: str, ui_token:
                 with guard:  # replace, never mutate: the job view serialises the previous dict concurrently
                     state[name] = {"state": st, "files": files, "dirs": dirs, "bytes": size}
                     snapshot = dict(state)
-                jobs.update(job, remotes=snapshot,
+                jobs.update(job, remotes=snapshot, remote=name,   # remote/remote_index: what the Setup page's bar reads
+                            remote_index=min(len(names), sum(1 for v in snapshot.values()
+                                                             if v["state"] in ("done", "failed")) + 1),
                             remotes_done=sum(1 for v in snapshot.values() if v["state"] in ("done", "failed")),
                             files=sum(v["files"] for v in snapshot.values()),
                             bytes=sum(v["bytes"] for v in snapshot.values()))
@@ -774,6 +1165,9 @@ def create_ui_app(service: Service, *, config: Config, api_token: str, ui_token:
             svc = job_service()
             try:
                 result = svc.sync(names, progress=progress)
+                result["scans"] = [      # one entry per cloud, as the Setup page reads them
+                    {"remote": n, **(r.get("scan") or {"status": r["status"], "error": r.get("error")})}
+                    for n, r in result["remotes"].items()]
                 bad = [n for n, r in result["remotes"].items() if r["status"] != "complete"]
                 return result, f"sync did not complete for: {', '.join(bad)}" if bad else None
             finally:
@@ -943,7 +1337,8 @@ def _open_when_ready(host: str, port: int, url: str, timeout: float = 15.0) -> N
     threading.Thread(target=run, name="drivemerge-open-browser", daemon=True).start()
 
 
-def run_ui(config: Config, *, host: str | None = None, port: int | None = None, open_browser: bool = True) -> None:
+def run_ui(config: Config, *, host: str | None = None, port: int | None = None, open_browser: bool = True,
+           config_path: Path | None = None) -> None:
     """Serve the workspace on loopback and print the one-time URL that opens a browser session."""
     host = host or config.api.host
     port = config.api.port if port is None else port
@@ -951,8 +1346,9 @@ def run_ui(config: Config, *, host: str | None = None, port: int | None = None, 
         raise ValueError(f"refusing to bind {host!r}: the workspace is loopback-only")
     approvals, why_not = approvals_allowed()
     ui_token = secrets.token_urlsafe(24)
-    app = create_ui_app(Service(config, config_path=config.config_path), config=config, api_token=config.api.token, ui_token=ui_token,
-                        approvals_enabled=approvals)
+    app = create_ui_app(Service(config, config_path=config_path or config.config_path), config=config,
+                        api_token=config.api.token, ui_token=ui_token, approvals_enabled=approvals,
+                        config_path=config_path or config.config_path)
     netloc = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
     url = f"http://{netloc}/ui/#token={ui_token}"
     print(f"drive-merge workspace: {url}", flush=True)
