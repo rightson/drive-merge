@@ -496,7 +496,7 @@ def test_reorganise_school_and_research_folders_from_two_panes(make_world, perso
     expect(parked).to_have_attribute("data-quarantine", "root")
     expect(parked.get_by_test_id("quarantine-label")).to_have_text("隔離區")
     expect(parked).to_have_attribute("draggable", "false")
-    assert "drivemerge plan restore" in parked.get_attribute("title") and "plan purge" in parked.get_attribute("title")
+    assert "隔離區」頁面" in parked.get_attribute("title") and "drivemerge plan" not in parked.get_attribute("title")
     me.drag(("left", f"dbx:{QUARANTINE}"), ("right", "gd:Research"))
     me.drag(("right", "gd:Research/論文資料"), ("left", f"dbx:{QUARANTINE}"))
     me.staged(0)
@@ -1239,4 +1239,120 @@ def test_a_read_only_destination_is_reported_once_and_without_its_cascade(make_w
     page.get_by_test_id("preview-button").click()
     expect(page.get_by_test_id("preview-modal").get_by_test_id("violation").first.get_by_test_id("problem-raw")).to_have_text(
         'READ_ONLY_REMOTE "gd:" has no write_remote configured.')
+    me.finish()
+
+
+# --------------------------------------------------------------------------- the Quarantine view (docs/QUARANTINE.md)
+
+def _item(page, name: str):
+    """The row of one quarantined file in the plan's quarantine (by its exact name, not a name that ends the same way)."""
+    return page.locator('[data-testid^="qr-item-"]').filter(has=page.get_by_text(name, exact=True))
+
+
+def test_a_dedupe_is_restored_and_purged_from_the_quarantine_view_without_overwriting_anything(make_world, person):
+    """Real rclone, real catalog, real server, real browser. A dedupe parks four files on Dropbox. From the Quarantine
+    view one is restored (typed word, file back at its original path, the catalog-is-behind banner), one whose original
+    path somebody has since taken stays where it is (ORIGINAL_TAKEN, nothing overwritten), and one is purged for good
+    (gone from the quarantine folder, its witness untouched)."""
+    folder = "Backup/thesis drafts (copy)"
+    backup = {f"{folder}/{rel.split('/', 2)[2]}": data
+              for rel, data in _blobs()["gd"].items() if rel.startswith("Research/thesis-drafts/")}
+    world = make_world(extra={"dbx": backup})
+    dbx, gd = world.roots["dbx"], world.roots["gd"]
+    me = person(world)
+    page = me.page
+    me.open()
+
+    # 1. the dedupe, as in the suggestion story, then a rescan so that the catalog knows the quarantine
+    page.get_by_test_id("suggestions-toggle").click()
+    page.get_by_test_id("sug-tab-duplicates").click()
+    page.get_by_test_id("suggestion-card").first.get_by_test_id("suggestion-add").click()
+    me.staged(1)
+    page.get_by_test_id("suggestions-toggle").click()
+    page.get_by_test_id("preview-button").click()
+    assert _run_the_preview(me) == "done"
+    page.get_by_test_id("preview-modal").get_by_test_id("preview-close").click()
+    banner = page.get_by_test_id("catalog-banner")
+    expect(banner).to_be_visible()
+    banner.get_by_test_id("catalog-rescan").click()
+    expect(banner).to_have_count(0, timeout=60_000)
+    parked = sorted(dbx.rglob(f"{QUARANTINE}/*/{folder}/*"))
+    assert len(parked) == 4
+    plan_id = int(parked[0].relative_to(dbx).parts[1])
+
+    # 2. the view: dbx holds four files, the plan is listed, the plan's items are the four copies
+    page.get_by_test_id("rail-quarantine").click()
+    expect(page.get_by_test_id("view-quarantine")).to_be_visible()
+    expect(page.get_by_test_id("qr-cloud-dbx")).to_have_attribute("data-files", "4")
+    expect(page.get_by_test_id(f"qr-plan-row-{plan_id}")).to_be_visible()
+    me.shot("90-quarantine-overview")
+    page.get_by_test_id(f"qr-plan-open-{plan_id}").click()
+    expect(page.get_by_test_id("view-quarantine-plan")).to_be_visible()
+    expect(page.locator('[data-testid^="qr-item-"]')).to_have_count(4)
+    me.shot("91-quarantine-plan")
+
+    # 3. restore one: the file is back at its original path, byte for byte, and the catalog is behind again
+    notes_original = backup[f"{folder}/notes.md"]
+    _item(page, "notes.md").locator("input[type=checkbox]").check()
+    page.get_by_test_id("qr-restore-selected").click()
+    dialog = page.get_by_test_id("qr-dialog")
+    expect(dialog.get_by_test_id("qr-check-will")).to_be_visible()
+    expect(dialog.get_by_test_id("qr-check-taken")).to_have_count(0)
+    confirm = dialog.get_by_test_id("qr-confirm")
+    expect(confirm).to_be_disabled()
+    dialog.get_by_test_id("qr-confirm-input").fill("restor")
+    expect(confirm).to_be_disabled()
+    dialog.get_by_test_id("qr-confirm-input").fill("restore")
+    expect(confirm).to_be_enabled()
+    confirm.click()
+    expect(dialog.get_by_test_id("qr-result")).to_have_attribute("data-status", "done", timeout=60_000)
+    me.shot("92-quarantine-restored")
+    assert (dbx / folder / "notes.md").read_bytes() == notes_original
+    assert not list(dbx.rglob(f"{QUARANTINE}/*/{folder}/notes.md"))
+    dialog.get_by_test_id("qr-cancel").click()
+    expect(banner).to_be_visible()
+    expect(banner).to_contain_text("dbx")
+
+    # 4. somebody takes the original path of another file; restoring it must refuse and overwrite nothing
+    taken = dbx / folder / "chapter1-outline.md"
+    taken.parent.mkdir(parents=True, exist_ok=True)
+    taken.write_bytes(b"written by hand after the dedupe")
+    _item(page, "chapter1-outline.md").locator("input[type=checkbox]").check()
+    page.get_by_test_id("qr-restore-selected").click()
+    dialog = page.get_by_test_id("qr-dialog")
+    dialog.get_by_test_id("qr-confirm-input").fill("restore")
+    dialog.get_by_test_id("qr-confirm").click()
+    result = dialog.get_by_test_id("qr-result")
+    expect(result).to_have_attribute("data-status", "failed", timeout=60_000)
+    failure = result.locator('[data-testid^="qr-failure-"]')
+    expect(failure).to_have_count(1)
+    expect(failure).to_have_attribute("data-code", "ORIGINAL_TAKEN")
+    expect(failure).to_contain_text("chapter1-outline.md")
+    me.shot("93-quarantine-original-taken")
+    assert taken.read_bytes() == b"written by hand after the dedupe", "a restore never overwrites"
+    assert list(dbx.rglob(f"{QUARANTINE}/*/{folder}/chapter1-outline.md")), "the quarantined copy stays"
+    dialog.get_by_test_id("qr-cancel").click()
+
+    # 5. purge another one for good: gone from the quarantine folder, the witness on Drive is untouched
+    witness = gd / "Research/thesis-drafts/advisor-meeting-notes.md"
+    witness_before = witness.read_bytes()
+    _item(page, "advisor-meeting-notes.md").locator("input[type=checkbox]").check()
+    page.get_by_test_id("qr-purge-menu").click()
+    page.get_by_test_id("qr-purge-selected").click()
+    dialog = page.get_by_test_id("qr-dialog")
+    expect(dialog.get_by_test_id("qr-check-will")).to_be_visible()
+    dialog.get_by_test_id("qr-confirm-input").fill("purge")
+    dialog.get_by_test_id("qr-confirm").click()
+    expect(dialog.get_by_test_id("qr-result")).to_have_attribute("data-status", "done", timeout=60_000)
+    assert not list(dbx.rglob(f"{QUARANTINE}/*/{folder}/advisor-meeting-notes.md"))
+    assert not (dbx / folder / "advisor-meeting-notes.md").exists(), "a purge deletes; it never restores"
+    assert witness.read_bytes() == witness_before == backup[f"{folder}/advisor-meeting-notes.md"]
+    dialog.get_by_test_id("qr-cancel").click()
+    assert list(dbx.rglob(f"{QUARANTINE}/*/{folder}/chapter1-outline.md")) and list(dbx.rglob(f"{QUARANTINE}/*/{folder}/draft.docx"))
+
+    # 6. the plan's list now counts what is left: two held, one restored, one purged
+    page.get_by_test_id("qr-filter-state").select_option("all")
+    expect(page.locator('[data-testid^="qr-item-"][data-state="restored"]')).to_have_count(1)
+    expect(page.locator('[data-testid^="qr-item-"][data-state="purged"]')).to_have_count(1)
+    expect(page.locator('[data-testid^="qr-item-"][data-state="held"]')).to_have_count(2)
     me.finish()

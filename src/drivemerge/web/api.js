@@ -53,8 +53,21 @@ async function call(method, path, { query, body, quiet401 = false } = {}) {
 
 const list = (r, key) => (Array.isArray(r) ? r : (r && r[key]) || []);
 
-export const login = (token) => call('POST', '/v1/ui/session', { body: { token }, quiet401: true });
-export const config = () => call('GET', '/v1/ui/config');
+// Whether this server lets the page approve (the session exchange and /v1/ui/config say so). Words that point at the
+// terminal or at a view of the page (errorText) depend on it, so it is remembered here, next to the CSRF token.
+let approvals = null;
+export const approvalsEnabled = () => approvals === true;
+
+export const login = async (token) => {
+  const r = await call('POST', '/v1/ui/session', { body: { token }, quiet401: true });
+  if (r && typeof r.approvals_enabled === 'boolean') approvals = r.approvals_enabled;
+  return r;
+};
+export const config = async () => {
+  const r = await call('GET', '/v1/ui/config');
+  if (r && typeof r.approvals_enabled === 'boolean') approvals = r.approvals_enabled;
+  return r;
+};
 
 export const roots = async (draft) => list(await call('GET', '/v1/tree/roots', { query: { draft } }), 'roots');
 export const tree = ({ remote, path, draft, view, ghosts, limit, offset }) =>
@@ -147,4 +160,17 @@ export const installRclone = () => call('POST', '/v1/ui/rclone/install', { body:
 export const release = (remote, { path, keep } = {}) => call('GET', `/v1/release/${encodeURIComponent(remote)}`, {
   query: { path: path || undefined, keep_on: keep && keep.length ? keep.join(',') : undefined },
 });
+/** `body` is {confirm: 'purge', older_than_days, op_ids?}; `op_ids` restricts the purge to those held items (docs/QUARANTINE.md section E). */
 export const purge = (planId, body) => call('POST', `/v1/ui/plans/${planId}/purge`, { body });
+
+// Quarantine (docs/QUARANTINE.md section E). The first three only read; restore, purge and purgeDue are human-channel jobs
+// that answer {job_id}.
+export const quarantine = () => call('GET', '/v1/quarantine');
+/** `query`: {state, remote, path, offset, limit}. */
+export const quarantineItems = (planId, query) => call('GET', `/v1/quarantine/plans/${planId}`, { query });
+/** `body`: {action: 'restore' | 'purge', op_ids?, older_than_days?}. */
+export const quarantineCheck = (planId, body) => call('POST', `/v1/quarantine/plans/${planId}/check`, { body });
+/** `body`: {confirm: 'restore', op_ids?}. */
+export const restore = (planId, body) => call('POST', `/v1/ui/plans/${planId}/restore`, { body });
+/** `body`: {confirm: 'purge', remote?}: purge, plan after plan, every item past its retention. */
+export const purgeDue = (body) => call('POST', '/v1/ui/quarantine/purge', { body });

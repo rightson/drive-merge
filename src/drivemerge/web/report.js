@@ -1,10 +1,12 @@
 // The simulation report and the run panel, shared by the workspace preview (preview.js) and the plan review
 // (plans.js, docs/PLANS.md section E): problem lists in plain language, the per-cloud table, the progress panel, the
 // approval fields and the hook that approves, executes and rescans.
-import { html, useEffect, useRef, useState } from './vendor/htm-preact-standalone.mjs';
+import { html, useContext, useEffect, useRef, useState } from './vendor/htm-preact-standalone.mjs';
 import { t } from './i18n.js';
 import * as api from './api.js';
 import { Icon } from './icons.js';
+import { AppCtx } from './ctx.js';
+import { quarantineHash, refreshQuarantine } from './qstore.js';
 import {
   describeAction, errorText, fmtBytes, fmtLoc, fmtNum, problemDetail, rescanText, sleep, staleText, violationLoc,
 } from './util.js';
@@ -134,8 +136,24 @@ export function CloudTable({ remotes }) {
         <td class="num">${r.files_quarantined ? `${fmtNum(r.files_quarantined)} · ${fmtBytes(r.bytes_quarantined)}` : '–'}</td></tr>`)}</tbody></table>`;
 }
 
+/**
+ * What to do after a run that stopped: with approvals the quarantine can be restored on the page, so the sentence points
+ * to the Quarantine view; without, the terminal command stays. `onLeave` closes a dialog that the link would leave behind.
+ */
+export function FailedHelp({ planId, onLeave }) {
+  const ctx = useContext(AppCtx);
+  if (!ctx || !ctx.config || ctx.config.approvals_enabled === false) return t('prog.failedHelp', { id: planId });
+  const go = (e) => {
+    if (e.ctrlKey || e.metaKey || e.shiftKey || e.button) return;
+    e.preventDefault();
+    if (onLeave) onLeave();
+    ctx.nav(quarantineHash(planId));
+  };
+  return html`${t('prog.failedHelpPage', { id: planId })} <a href=${quarantineHash(planId)} data-testid="failure-quarantine-link" onClick=${go}>${t('qr.openLink')}</a>`;
+}
+
 /** The progress panel of a run (and of the rescan after it). */
-export function ProgressBox({ phase, job, prog, planId, error }) {
+export function ProgressBox({ phase, job, prog, planId, error, onLeave }) {
   const finished = prog ? (prog.done || 0) + (prog.failed || 0) + (prog.skipped || 0) : 0;
   const total = prog ? prog.ops_total || 0 : 0;
   const pct = phase === 'done' || phase === 'rescanning' || phase === 'rescanned' ? 100 : total ? Math.min(100, Math.round((finished / total) * 100)) : 0;
@@ -155,7 +173,7 @@ export function ProgressBox({ phase, job, prog, planId, error }) {
     ${failureLines.length > 0 && html`<p class="note" data-testid="failure-raw-note">${t('prog.rawDetails')}</p>
       <ul class="progress-failures" data-testid="progress-failures">
       ${failureLines.map((x, i) => html`<li key=${i}><${Icon} name="alert" size=${13} /> ${x}</li>`)}</ul>`}
-    ${phase === 'failed' && html`<p class="note" data-testid="failure-help">${t('prog.failedHelp', { id: planId })}</p>`}
+    ${phase === 'failed' && html`<p class="note" data-testid="failure-help"><${FailedHelp} planId=${planId} onLeave=${onLeave} /></p>`}
     ${phase === 'done' && html`<p class="note" data-testid="rescan-help">${t('prog.rescanHelp')}</p>`}
     ${error && html`<p class="note error">${error}</p>`}
   </section>`;
@@ -265,6 +283,7 @@ export function useRunner({
       || (out.job.result && (out.job.result.error || out.job.result.status === 'failed'));
     setPhase(failed ? 'failed' : 'done');
     ctx.markOutdated(touched, draftId);  // the executor does not touch the catalog; only a scan does
+    refreshQuarantine();                 // a run may have parked files: the rail badge and the Quarantine view hear of it
   }
 
   async function approveAndExecute() {

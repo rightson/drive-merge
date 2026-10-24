@@ -6,6 +6,7 @@ import { t } from './i18n.js';
 import * as api from './api.js';
 import { Icon, iconFor } from './icons.js';
 import { AppCtx } from './ctx.js';
+import { quarantineHash } from './qstore.js';
 import {
   ancestorsOf, baseName, errorText, fmtBytes, fmtLoc, fmtNum, isUnder, joinPath, keyOf, parentOf, splitKey,
 } from './util.js';
@@ -718,6 +719,7 @@ function Badges({ node }) {
 }
 
 function Row({ row, s, tabbable, editable, onClick, onFocus, onToggle, dispatch, onMenu, onDragStart, onDragOver, onDrop, onRename, onBeginRename, onMore, onGhost }) {
+  const ctx = useContext(AppCtx);
   const indent = { paddingLeft: `${8 + row.level * 16}px` };
   if (row.kind === 'loading') return html`<div class="row row-msg" role="presentation" style=${indent}>${t('common.loading')}</div>`;
   if (row.kind === 'empty') return html`<div class="row row-msg" role="presentation" style=${indent}>${t('pane.empty')}</div>`;
@@ -757,7 +759,13 @@ function Row({ row, s, tabbable, editable, onClick, onFocus, onToggle, dispatch,
   const category = n.quarantine_root ? 'quarantine' : isDir ? (n.path ? 'folder' : 'cloud') : n.category || 'other';
   const renaming = s.renaming === key;
   const locked = !!n.quarantine;
-  const tip = n.quarantine_root ? t('quarantine.tip', { dir: n.name }) : locked ? t('quarantine.inside') : undefined;
+  // With approvals the Quarantine view restores and purges; a page without them can only point at the terminal.
+  const page = !!ctx && ctx.config.approvals_enabled !== false;
+  const tip = n.quarantine_root ? t(page ? 'quarantine.tipPage' : 'quarantine.tip', { dir: n.name })
+    : locked ? t(page ? 'quarantine.insidePage' : 'quarantine.inside') : undefined;
+  // `<quarantine dir>/<plan id>`: the folder one plan parked its files in.
+  const planFolder = n.quarantine && !n.quarantine_root && /^[^/]+\/(\d+)$/.exec(n.path || '');
+  const openQuarantine = (e, id) => { e.stopPropagation(); ctx.nav(quarantineHash(id)); };
 
   return html`<div class=${cls.join(' ')} style=${indent} role="treeitem" aria-level=${row.level + 1}
     aria-selected=${selected} aria-expanded=${isDir ? open : undefined} tabindex=${tabbable ? 0 : -1}
@@ -806,6 +814,9 @@ function Row({ row, s, tabbable, editable, onClick, onFocus, onToggle, dispatch,
     : null}
       <span class="meta-size">${isDir ? (n.bytes > 0 ? fmtBytes(n.bytes) : '') : fmtBytes(n.size)}</span>
     </span>
+    ${n.quarantine_root && html`<button class="link q-open" tabindex="-1" data-testid="quarantine-open" onClick=${(e) => openQuarantine(e, null)}>${t('qr.treeOpen')}</button>`}
+    ${planFolder && html`<button class="link q-open" tabindex="-1" data-testid="quarantine-open-plan" onClick=${(e) => openQuarantine(e, Number(planFolder[1]))}>
+      ${t('qr.treeOpenPlan')}</button>`}
     ${isDir && !locked && html`<button class="row-menu-btn" tabindex="-1" aria-hidden="true" data-testid=${'row-menu-' + key} title=${t('menu.open')}
       onClick=${(e) => { e.stopPropagation(); const r = e.currentTarget.getBoundingClientRect(); onMenu(key, { x: r.left - 120, y: r.bottom }); }}>
       <${Icon} name="more" size=${14} /></button>`}

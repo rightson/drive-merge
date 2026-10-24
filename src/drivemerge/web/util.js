@@ -1,5 +1,6 @@
 // Pure helpers: paths, formatting, action descriptions. No DOM, no state.
 import { t } from './i18n.js';
+import { approvalsEnabled } from './api.js';
 
 // A tree node is identified by "remote:path" (path '' is the remote root). Remote names cannot contain ':'.
 export const keyOf = (remote, path) => `${remote}:${path}`;
@@ -84,7 +85,9 @@ export function problemDetail(ns, item) {
 export function errorText(err) {
   if (!err) return '';
   if (err.status === 0) return t('err.network');
-  const known = err.code && t(`err.${err.code}`, wordParams('err', err.params), '');
+  // With approvals the quarantine can be restored and purged on the page itself; without, only a terminal can.
+  const key = err.code === 'QUARANTINE' && approvalsEnabled() ? 'err.QUARANTINE_PAGE' : `err.${err.code}`;
+  const known = err.code && t(key, wordParams('err', err.params), '');
   return known || err.message || t('err.unknown');
 }
 
