@@ -909,7 +909,38 @@ def test_typing_a_folder_updates_the_address_and_asks_again(make_onb):
     ui = free_ui(make_onb)
     ui.tid("free-path").fill("/Backup/2020/")
     expect(ui.tid("free-path")).to_have_value("Backup/2020", timeout=5000)
-    assert ui.mock.last("GET", r"/v1/release/dropbox").query["path"] == "Backup/2020"
+    # The request goes out just before the box shows the cleaned path, but the mock records it only when Playwright gets
+    # round to the route event: wait for the request itself rather than reading the mock at once.
+    def asked() -> list:
+        return [c for c in calls(ui, "GET", r"/v1/release/dropbox") if c.query.get("path") == "Backup/2020"]
+
+    for _ in range(125):
+        if asked():
+            break
+        ui.page.wait_for_timeout(40)
+    assert asked(), f"no report asked for Backup/2020; saw {[c.query for c in calls(ui, 'GET', r'/v1/release/dropbox')]}"
+    assert ui.page.evaluate("location.hash") == "#/free/dropbox?path=Backup/2020"
+
+
+# Types into the folder box the moment it is inserted, before preact has run the view's mount effects (they wait for the
+# next frame, which a loaded machine delays): what a fill or a fast typist does when the frame comes late.
+TYPE_ON_INSERT = """
+new MutationObserver((ms, obs) => {
+  const box = document.querySelector('[data-testid=free-path]');
+  if (!box) return;
+  obs.disconnect();
+  box.value = '/Backup/2020/';
+  box.dispatchEvent(new Event('input', { bubbles: true }));
+}).observe(document, { subtree: true, childList: true });
+"""
+
+
+def test_a_folder_typed_before_the_first_frame_is_kept(make_onb):
+    ui = make_onb()
+    ui.mock.connect_clouds("gdrive", "dropbox", "onedrive", writable=("gdrive", "dropbox", "onedrive"))
+    ui.page.add_init_script(TYPE_ON_INSERT)
+    start(ui, "#/free/dropbox")
+    expect(ui.tid("free-path")).to_have_value("Backup/2020", timeout=5000)
 
 
 def test_the_freshness_gate_asks_to_sync_first_and_create_syncs_before_building(make_onb):
