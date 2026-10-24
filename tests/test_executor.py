@@ -188,6 +188,12 @@ class Env:
     def purge(self, pid: int, **kw) -> ExecResult:
         return executor.purge_quarantine(self.conn, self.spy, self.config, pid, **kw)
 
+    def restore_ops(self, pid: int, op_ids) -> ExecResult:
+        return executor.restore_plan(self.conn, self.spy, self.config, pid, op_ids=op_ids)
+
+    def purge_ops(self, pid: int, op_ids, **kw) -> ExecResult:
+        return executor.purge_quarantine(self.conn, self.spy, self.config, pid, older_than_days=0, op_ids=op_ids, **kw)
+
     def plan_status(self, pid: int) -> str:
         return plans.get_plan(self.conn, pid, with_ops=False).status
 
@@ -1552,6 +1558,207 @@ def test_purge_does_not_look_for_a_witness_when_the_file_is_already_gone(env):
     env.roots["gd"].joinpath(env.qpath(pid, "docs/a.bin")).unlink()
     env.roots["gd"].joinpath("keep/a.bin").unlink()
     assert env.purge(pid, older_than_days=0) == ExecResult(pid, "done", skipped=1)
+
+
+# --------------------------------------------------------------------------- #
+# Restore and purge for the Quarantine view (docs/QUARANTINE.md section C)
+# --------------------------------------------------------------------------- #
+
+def _op_ids(env, pid):
+    return [o.id for o in plans.load_ops(env.conn, pid)]
+
+
+def _failure(res, **want):
+    [f] = [f for f in res.failures if all(f[k] == v for k, v in want.items())]
+    return f
+
+
+def test_restore_can_be_limited_to_some_ops_and_ignores_ids_that_are_not_quarantined_ops(env):
+    pid, files = _three_deletes(env)
+    env.run(pid)
+    ids = _op_ids(env, pid)
+    other_pid, _ = _quarantined_pair(env)
+    other = _op_ids(env, other_pid)[0]
+    res = env.restore_ops(pid, [ids[1], other, 987654])
+    assert res == ExecResult(pid, "done", done=1)
+    assert env.exists("dbx", "b/two.bin") and not env.exists("gd", "a/one.bin") and not env.exists("ic", "c/three.bin")
+    assert [s for s, _ in env.op_states(pid)] == ["done", "skipped", "done"]
+    # the op of the other plan was never touched
+    assert env.exists("gd", env.qpath(other_pid, "docs/a.bin")) and not env.exists("gd", "docs/a.bin")
+    # an empty selection restores nothing; None restores the rest
+    assert env.restore_ops(pid, []) == ExecResult(pid, "done")
+    assert env.restore(pid) == ExecResult(pid, "done", done=2)
+
+
+def test_restore_reports_progress_after_every_item_newest_first(env):
+    pid, _ = _three_deletes(env)
+    env.run(pid)
+    env.put("dbx", "b/two.bin", b"taken")
+    seen = []
+    res = executor.restore_plan(env.conn, env.spy, env.config, pid, progress=lambda *a: seen.append(a))
+    assert seen == [(1, 0, 3), (1, 1, 3), (2, 1, 3)]
+    assert (res.done, res.failed) == (2, 1)
+
+
+def test_restore_failures_carry_a_code_and_the_facts_the_page_needs(env):
+    pid, files = _three_deletes(env)
+    env.run(pid)
+    env.put("dbx", "b/two.bin", b"a new file lives here now")
+    (env.roots["ic"] / env.qpath(pid, "c/three.bin")).unlink()
+    res = env.restore(pid)
+    ids = _op_ids(env, pid)
+    assert (res.status, res.done, res.failed) == ("partial", 1, 2) and len(res.failures) == 2
+    taken = _failure(res, code="ORIGINAL_TAKEN")
+    assert taken == {"op_id": ids[1], "seq": 2, "remote": "dbx", "path": "b/two.bin", "code": "ORIGINAL_TAKEN",
+                     "params": {"remote": "dbx", "path": "b/two.bin"}, "error": taken["error"]}
+    assert "occupied" in taken["error"]
+    gone = _failure(res, code="QUARANTINE_GONE")
+    assert (gone["op_id"], gone["remote"], gone["path"], gone["params"]) == (
+        ids[2], "ic", "c/three.bin", {"remote": "ic", "path": "c/three.bin"})
+    # newest first: the gone one (seq 3) is reported before the occupied one (seq 2)
+    assert [f["seq"] for f in res.failures] == [3, 2]
+
+
+def test_restore_into_a_read_only_cloud_is_a_coded_failure(env):
+    pid = env.plan([Op("delete", env.rid("ro"), "x.bin")], approve=False)
+    env.put("ro", env.qpath(pid, "x.bin"), blob(10))
+    env.conn.execute("UPDATE plan_ops SET status = 'done', executed_at = '2000-01-01T00:00:00.000000Z' "
+                     "WHERE plan_id = ?", (pid,))
+    res = env.restore(pid)
+    assert _failure(res)["code"] == "READ_ONLY" and _failure(res)["params"] == {"remote": "ro"}
+    res = env.purge(pid, older_than_days=0)
+    assert _failure(res)["code"] == "READ_ONLY" and _failure(res)["params"] == {"remote": "ro"}
+
+
+@pytest.mark.parametrize("bad", ["../victim.txt", "a//b.txt", "/abs.txt"])
+def test_restore_and_purge_report_a_path_that_could_leave_the_remote_as_bad_path(env, bad):
+    pid = env.plan([Op("delete", env.rid("gd"), "x.txt")], approve=False)
+    plans.set_status(env.conn, pid, "done")
+    env.conn.execute("UPDATE plan_ops SET src_path = ?, status = 'done', executed_at = "
+                     "'2000-01-01T00:00:00.000000Z' WHERE plan_id = ?", (bad, pid))
+    for res in (env.restore(pid), env.purge(pid, older_than_days=0)):
+        f = _failure(res)
+        assert f["code"] == "BAD_PATH" and f["params"] == {"path": bad} and f["path"] == bad
+    assert env.spy.calls == []
+
+
+def test_restore_that_the_cloud_did_not_carry_out_is_verify_failed(env, monkeypatch):
+    pid, files = _three_deletes(env)
+    env.run(pid)
+    monkeypatch.setattr(env.spy, "moveto", lambda *a: None)     # the cloud silently ignores the move
+    res = env.restore_ops(pid, _op_ids(env, pid)[:1])
+    f = _failure(res)
+    assert (res.status, res.failed) == ("partial", 1)
+    assert f["code"] == "VERIFY_FAILED" and f["params"] == {"remote": "gd", "path": "a/one.bin"}
+    assert [s for s, _ in env.op_states(pid)] == ["done"] * 3, "a failed item is not marked restored"
+
+
+def test_purge_that_the_cloud_did_not_carry_out_is_verify_failed(env, monkeypatch):
+    pid, data = _quarantined_pair(env)
+    monkeypatch.setattr(env.spy, "deletefile", lambda *a: None)
+    f = _failure(env.purge(pid, older_than_days=0))
+    assert f["code"] == "VERIFY_FAILED" and f["params"] == {"remote": "gd", "path": "docs/a.bin"}
+    assert env.read("gd", env.qpath(pid, "docs/a.bin")) == data
+
+
+def test_purge_failures_name_the_missing_witness_record_or_the_unproven_witness(env):
+    pid, data = _quarantined_pair(env)
+    env.conn.execute("UPDATE plan_ops SET witness_remote_id = NULL, witness_path = NULL WHERE plan_id = ?", (pid,))
+    f = _failure(env.purge(pid, older_than_days=0))
+    assert f["code"] == "NO_WITNESS_RECORD" and f["params"] == {"remote": "gd", "path": "docs/a.bin"}
+
+    pid, data = _quarantined_pair(env, seed=22)
+    env.roots["gd"].joinpath("keep/a.bin").unlink()
+    f = _failure(env.purge(pid, older_than_days=0))
+    assert f["code"] == "WITNESS_UNPROVEN"
+    assert f["params"] == {"remote": "gd", "path": "docs/a.bin", "witness": "gd:keep/a.bin"}
+    assert "is kept" in f["error"]
+    assert env.read("gd", env.qpath(pid, "docs/a.bin")) == data
+
+    pid, data = _quarantined_pair(env, seed=23)
+    env.put("gd", "keep/a.bin", blob(130, 99))          # same size, other bytes
+    assert _failure(env.purge(pid, older_than_days=0))["code"] == "WITNESS_UNPROVEN"
+
+
+def test_a_failure_without_a_code_of_its_own_is_op_failed_with_no_params(env):
+    pid, data = _quarantined_pair(env)
+    env.spy.stat_error = RcloneError("boom")
+    f = _failure(env.restore(pid))
+    assert f["code"] == "OP_FAILED" and f["params"] == {} and f["remote"] == "gd" and f["path"] == "docs/a.bin"
+
+
+def test_failures_are_capped_at_200_but_counted_in_full(env):
+    pid = env.plan([Op("delete", env.rid("gd"), "x.txt")], approve=False)
+    plans.set_status(env.conn, pid, "done")
+    env.conn.execute("UPDATE plan_ops SET src_path = 'a//0', status = 'done', executed_at = "
+                     "'2000-01-01T00:00:00.000000Z' WHERE plan_id = ?", (pid,))
+    for seq in range(2, 251):
+        env.conn.execute(
+            "INSERT INTO plan_ops(plan_id, seq, op, src_remote_id, src_path, status, executed_at) "
+            "VALUES (?, ?, 'delete', ?, ?, 'done', '2000-01-01T00:00:00.000000Z')",
+            (pid, seq, env.rid("gd"), f"a//{seq}"))
+    res = env.restore(pid)
+    assert res.failed == 250 and len(res.failures) == executor.MAX_FAILURES == 200
+    assert res.failures[0]["seq"] == 250, "newest first, like the run itself"
+
+
+def test_execute_and_a_clean_restore_report_no_failures(env):
+    pid, _ = _three_deletes(env)
+    res = env.run(pid)
+    assert res.failures == []
+    assert env.restore(pid).failures == []
+
+
+def test_purge_can_be_limited_to_some_ops_and_reports_progress(env):
+    pid, files = _three_deletes(env)
+    env.run(pid)
+    ids = _op_ids(env, pid)
+    other_pid, _ = _quarantined_pair(env)
+    seen = []
+    res = executor.purge_quarantine(env.conn, env.spy, env.config, pid, older_than_days=0,
+                                    op_ids=[ids[0], ids[2], _op_ids(env, other_pid)[0], 424242],
+                                    progress=lambda *a: seen.append(a))
+    assert res == ExecResult(pid, "done", done=2)
+    assert seen == [(1, 0, 2), (2, 0, 2)]
+    assert env.exists("dbx", env.qpath(pid, "b/two.bin"))
+    assert not env.exists("gd", env.qpath(pid, "a/one.bin")) and not env.exists("ic", env.qpath(pid, "c/three.bin"))
+    assert env.exists("gd", env.qpath(other_pid, "docs/a.bin")), "the other plan's quarantine is not touched"
+    assert env.purge_ops(pid, []) == ExecResult(pid, "done")
+
+
+def test_purge_progress_counts_only_the_items_old_enough_to_be_attempted(env):
+    pid, _ = _three_deletes(env)
+    env.run(pid)
+    _age(env, pid, 1, 40)
+    seen = []
+    res = executor.purge_quarantine(env.conn, env.spy, env.config, pid, older_than_days=30,
+                                    progress=lambda *a: seen.append(a))
+    assert (res.done, res.skipped) == (1, 2) and seen == [(1, 0, 1)]
+
+
+def test_purge_progress_reports_failures_and_an_item_already_gone_as_settled(env):
+    pid, _ = _three_deletes(env)
+    env.run(pid)
+    (env.roots["ic"] / env.qpath(pid, "c/three.bin")).unlink()
+    env.roots["gd"].joinpath("keep/two.bin").unlink()
+    seen = []
+    res = executor.purge_quarantine(env.conn, env.spy, env.config, pid, older_than_days=0,
+                                    progress=lambda *a: seen.append(a))
+    assert (res.done, res.failed, res.skipped) == (1, 1, 1)
+    assert seen == [(1, 0, 3), (1, 1, 3), (2, 1, 3)]
+
+
+def test_a_plan_that_is_executing_is_refused_with_a_code(env):
+    env.put("gd", "a.bin", blob(10))
+    env.scan("gd")
+    pid = env.plan([env.copy("gd", "a.bin", "gd", "b.bin")])
+    plans.set_status(env.conn, pid, "executing")
+    for call in (lambda: env.restore(pid), lambda: env.purge(pid)):
+        with pytest.raises(ExecutionError) as caught:
+            call()
+        assert caught.value.code == "PLAN_EXECUTING" and caught.value.params == {"plan": pid}
+        assert "executing" in str(caught.value)
+    assert ExecutionError("plain").code is None and ExecutionError("plain").params == {}
 
 
 # --------------------------------------------------------------------------- #

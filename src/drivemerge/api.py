@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from . import __version__, builders, connections, plans
+from . import __version__, builders, connections, plans, quarantine
 from .compare import CompareError
 from .config import Config
 from .service import Service, ServiceError, scrub_secrets
@@ -89,6 +89,12 @@ class PlanBody(_Body):
     kind: str
     params: dict[str, Any] = Field(default_factory=dict)
     title: str | None = None
+
+
+class QuarantineCheckBody(_Body):
+    action: str
+    op_ids: list[int] | None = Field(default=None, max_length=5000)
+    older_than_days: int = Field(default=0, le=36500)
 
 
 class EstimateBody(_Body):
@@ -168,6 +174,11 @@ def install_error_handlers(app: FastAPI, *, coded: bool = False) -> None:
         # Always coded: compare, coverage and explore refusals are the same facts for a script and for the page.
         return _error(exc.status, str(exc), code=exc.code, params=exc.params)
 
+    def quarantine_error(_: Request, exc: quarantine.QuarantineError) -> JSONResponse:
+        # Always coded: the facts of a refused quarantine look-up are the same for a script and for the page.
+        status = 404 if exc.code == "NOT_FOUND" else 400 if exc.code in ("BAD_OPS", "BAD_QUERY") else 409
+        return _error(status, _message(exc), code=exc.code, params=exc.params)
+
     app.add_exception_handler(StarletteHTTPException, http_error)
     for exc_type in (ValueError, ServiceError):  # ServiceError subclasses ValueError
         app.add_exception_handler(exc_type, bad_request)
@@ -175,6 +186,7 @@ def install_error_handlers(app: FastAPI, *, coded: bool = False) -> None:
     app.add_exception_handler(CompareError, compare_error)
     app.add_exception_handler(connections.ConnectError, connect_error)
     app.add_exception_handler(plans.PlanError, plan_error)
+    app.add_exception_handler(quarantine.QuarantineError, quarantine_error)
     app.add_exception_handler(KeyError, not_found)
 
 
@@ -353,6 +365,30 @@ def build_router(service: Service, lock: threading.Lock, *, dependencies: list[A
     def simulate_plan(plan_id: int) -> dict:
         with lock:
             return scrub_secrets(service.simulate(plan_id))
+
+    @api.get("/v1/quarantine")
+    def quarantine_report() -> dict:
+        """What every executed plan parked in quarantine, per cloud (with its cached quota or null) and per plan."""
+        with lock:
+            report = service.quarantine_report()
+            config = service.config
+        for row in report["remotes"]:
+            row["quota"] = quotas.get(config, row["remote"])
+        return scrub_secrets(report)
+
+    @api.get("/v1/quarantine/plans/{plan_id}")
+    def quarantine_items(plan_id: int, state: str = "held", remote: str | None = None, path: str | None = None,
+                         offset: int = 0, limit: int = 200) -> dict:
+        with lock:
+            return scrub_secrets(service.quarantine_items(plan_id, state=state, remote=remote or None,
+                                                          path_prefix=path or None, offset=offset, limit=limit))
+
+    @api.post("/v1/quarantine/plans/{plan_id}/check")
+    def quarantine_check(plan_id: int, body: QuarantineCheckBody) -> dict:
+        """Read-only: what a restore or purge of these items would attempt and keep."""
+        with lock:
+            return service.quarantine_check(plan_id, body.action, op_ids=body.op_ids,
+                                            older_than_days=body.older_than_days)
 
     @api.post("/v1/plans/{plan_id}/cancel")
     def cancel_plan(plan_id: int) -> dict:

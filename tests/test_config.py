@@ -59,6 +59,23 @@ def test_the_key_must_be_a_real_boolean(value):
         parse_config({"remotes": [_remote("disk", "local", case_insensitive=value)]})
 
 
+# --- quarantine retention (docs/QUARANTINE.md section D) --------------------------------------------------
+
+def test_quarantine_retention_defaults_to_thirty_days():
+    assert parse_config({}).safety.quarantine_retention_days == 30
+    assert parse_config({"safety": {"execution_enabled": True}}).safety.quarantine_retention_days == 30
+
+
+def test_quarantine_retention_is_read_from_the_safety_table():
+    assert parse_config({"safety": {"quarantine_retention_days": 7}}).safety.quarantine_retention_days == 7
+
+
+@pytest.mark.parametrize("value", [0, -1, "30", 1.5, True, None])
+def test_quarantine_retention_must_be_a_whole_number_of_days_of_at_least_one(value):
+    with pytest.raises(ValueError, match="quarantine_retention_days"):
+        parse_config({"safety": {"quarantine_retention_days": value}})
+
+
 # --- writing the file (docs/ONBOARDING.md section G4.6) -----------------------------------------------
 # drive-merge never edits a human's config.toml in place any more: connections.toml is rewritten whole. What stays
 # is the private, atomic writer, a fresh config, and the rclone type -> provider map.

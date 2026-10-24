@@ -19,8 +19,8 @@ import tempfile
 from pathlib import Path
 
 from . import (
-    builders, classify, compare, coverage, db, dirstats, executor, explore, identity, plans, search, simulate,
-    suggest, workspace,
+    builders, classify, compare, coverage, db, dirstats, executor, explore, identity, plans, quarantine, search,
+    simulate, suggest, workspace,
 )
 from .config import DEFAULT_CONFIG_PATH, Config, load_config, sync_remotes
 from .models import Plan
@@ -82,6 +82,9 @@ class Service:
         sync_remotes(self.conn, config)
         self.rclone = rclone or make_rclone(config)
         self._connections_seen = self._connections_mtime()
+        # Progress callback a background job hangs on its own service: restore and purge report to it when
+        # their caller passes none (so the job can call purge(plan_id, older_than_days=...) as a person would).
+        self.default_progress = None
 
     def _connections_mtime(self) -> int | None:
         """mtime of connections.toml next to the config file; None without a config file or without the file."""
@@ -453,6 +456,7 @@ class Service:
         """Run an approved plan. A finished workspace plan also closes its draft, so the browser,
         the CLI and a later rescan all agree that the staged moves have happened."""
         result = _plain(executor.execute_plan(self.conn, self.rclone, self.config, plan_id, progress=progress))
+        result.pop("failures", None)        # only a restore or a purge lists the items that stayed
         plan = plans.get_plan(self.conn, plan_id, with_ops=False)
         draft_id = draft_of(plan)
         if draft_id is not None and result.get("status") == "done":
@@ -557,12 +561,70 @@ class Service:
         return self._flow(connections.start_flow(self.config, provider, purpose="write", name=name,
                                                  client_id=client_id, client_secret=client_secret))
 
-    def restore(self, plan_id: int) -> dict:
-        return _plain(executor.restore_plan(self.conn, self.rclone, self.config, plan_id))
+    def restore(self, plan_id: int, *, op_ids: list[int] | None = None, progress=None) -> dict:
+        """Put this plan's quarantined files (or only `op_ids`) back where they were. `progress(done, failed, total)`."""
+        return _plain(executor.restore_plan(self.conn, self.rclone, self.config, plan_id,
+                                            op_ids=op_ids, progress=progress or self.default_progress))
 
-    def purge(self, plan_id: int, *, older_than_days: int = 30) -> dict:
+    def purge(self, plan_id: int, *, older_than_days: int = 30, op_ids: list[int] | None = None,
+              progress=None) -> dict:
+        """Delete this plan's quarantined files (or only `op_ids`) that are old enough, after proving each witness
+        live. `progress(settled, failed, total)`."""
         return _plain(executor.purge_quarantine(self.conn, self.rclone, self.config, plan_id,
-                                                older_than_days=older_than_days))
+                                                older_than_days=older_than_days, op_ids=op_ids,
+                                                progress=progress or self.default_progress))
+
+    def purge_due(self, remote: str | None = None, progress=None) -> dict:
+        """Purge, plan after plan (oldest first), every item whose retention period has passed (on `remote` when
+        given). Nothing else calls this: retention never purges by itself. A plan that fails does not stop the others.
+        `progress(plans_total=, plans_done=, purged=, failed=)` is called at the start and after every item."""
+        executor._require_enabled(self.config)
+        retention = self.config.safety.quarantine_retention_days
+        wanted = quarantine.due_items(self.conn, quarantine_dir=self.config.safety.quarantine_dir,
+                                      retention_days=retention, remote=remote)
+        out: dict = {"plans": [], "done": 0, "failed": 0, "skipped": 0}
+        total = len(wanted)
+
+        def report(plans_done: int, purged: int, failed: int) -> None:
+            if progress:
+                progress(plans_total=total, plans_done=plans_done, purged=purged, failed=failed)
+
+        report(0, 0, 0)
+        for n, (plan_id, op_ids) in enumerate(wanted.items()):
+            try:
+                result = self.purge(
+                    plan_id, older_than_days=retention, op_ids=op_ids if remote else None,
+                    progress=lambda settled, failed, _total, n=n: report(n, out["done"] + settled, out["failed"] + failed))
+                entry = {"plan_id": plan_id, "status": result["status"], "done": result["done"],
+                         "failed": result["failed"], "skipped": result["skipped"],
+                         "failures": result["failures"], "error": result["error"]}
+            except Exception as e:      # this plan could not be purged at all; the others still can
+                entry = {"plan_id": plan_id, "status": "failed", "done": 0, "failed": 0, "skipped": 0,
+                         "failures": [], "error": str(e) or type(e).__name__}
+            out["plans"].append(entry)
+            for key in ("done", "failed", "skipped"):
+                out[key] += entry[key]
+            report(n + 1, out["done"], out["failed"])
+        out["error"] = next((p["error"] for p in out["plans"] if p["error"]), None)
+        return out
+
+    # ---------------------------------------------------------- quarantine (read-only)
+
+    def quarantine_report(self) -> dict:
+        """Held files per cloud and plan, what is due, and the files nothing accounts for (quarantine.py)."""
+        return quarantine.quarantine_report(
+            self.conn, quarantine_dir=self.config.safety.quarantine_dir,
+            retention_days=self.config.safety.quarantine_retention_days)
+
+    def quarantine_items(self, plan_id: int, **kw) -> dict:
+        return quarantine.plan_items(
+            self.conn, plan_id, quarantine_dir=self.config.safety.quarantine_dir,
+            retention_days=self.config.safety.quarantine_retention_days, **kw)
+
+    def quarantine_check(self, plan_id: int, action: str, **kw) -> dict:
+        return quarantine.check(
+            self.conn, plan_id, action, quarantine_dir=self.config.safety.quarantine_dir,
+            retention_days=self.config.safety.quarantine_retention_days, **kw)
 
 
 __all__ = ["Service", "ServiceError", "PLAN_KINDS", "RESERVED_PARAMS", "draft_of", "scrub_secrets"]

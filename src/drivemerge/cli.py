@@ -1,7 +1,7 @@
 """The `drivemerge` command line.
 
 Every command goes through `service.Service` (plus config loading). Commands
-that change a cloud (`plan approve|execute|restore|purge`) are human-only and
+that change a cloud (`plan approve|execute|restore|purge`, `quarantine purge-due`) are human-only and
 share one gate, `_gate`. `plan reset` only fixes a plan's state in the catalog,
 so it is not gated.
 
@@ -31,6 +31,7 @@ from typing import Any
 from . import config as config_mod
 from . import connections
 from . import db, executor, plans
+from . import quarantine as quarantine_mod
 from . import service as service_mod
 from .rclone import RcloneError
 
@@ -880,30 +881,170 @@ def cmd_plan_execute(ctx: Ctx) -> int:
     return _result(ctx, "executed", pid, ctx.service.execute(pid, progress=_exec_progress))
 
 
+def _chosen_ops(ctx: Ctx, action: str, **kw: Any) -> list[int] | None:
+    """The `--op` ids, validated against the plan's held items (a stranger's id is refused, never ignored)."""
+    ops = list(dict.fromkeys(ctx.args.op or [])) or None
+    if ops is not None:
+        ctx.service.quarantine_check(ctx.args.id, action, op_ids=ops, **kw)
+    return ops
+
+
 def cmd_plan_restore(ctx: Ctx) -> int:
     pid = ctx.args.id
+    ops: list[int] | None = None
 
     def prepare() -> Confirmation:
+        nonlocal ops
+        ops = _chosen_ops(ctx, "restore")        # after the human check: a stranger's op id is refused here
         plan = ctx.service.plan(pid, ops_limit=10)
-        return Confirmation(_summary(ctx, plan), f'Type "restore {pid}" to move plan {pid}\'s quarantined files back: ',
-                            f"restore {pid}")
+        what = f"{len(ops)} chosen file(s) of plan {pid}" if ops else f"plan {pid}'s quarantined files"
+        return Confirmation(_summary(ctx, plan), f'Type "restore {pid}" to move {what} back: ', f"restore {pid}")
 
     _gate("restore a plan", prepare)
-    return _result(ctx, "restored", pid, ctx.service.restore(pid))
+    return _result(ctx, "restored", pid, ctx.service.restore(pid, **({"op_ids": ops} if ops else {})))
 
 
 def cmd_plan_purge(ctx: Ctx) -> int:
-    pid, days = ctx.args.id, ctx.args.older_than_days
+    pid = ctx.args.id
+    days = ctx.config.safety.quarantine_retention_days if ctx.args.older_than_days is None else ctx.args.older_than_days
+    ops: list[int] | None = None
 
     def prepare() -> Confirmation:
+        nonlocal ops
+        ops = _chosen_ops(ctx, "purge", older_than_days=days)
         plan = ctx.service.plan(pid, ops_limit=10)
+        which = f"{len(ops)} chosen quarantined file(s) of plan {pid}" if ops else f"Quarantined files of plan {pid}"
         return Confirmation(
             _summary(ctx, plan),
-            f'Quarantined files of plan {pid} older than {days} day(s) will be deleted for good. '
+            f'{which} older than {days} day(s) will be deleted for good. '
             f'Type "purge {pid}" to continue: ', f"purge {pid}")
 
     _gate("purge a plan's quarantine", prepare)
-    return _result(ctx, "purged", pid, ctx.service.purge(pid, older_than_days=days))
+    return _result(ctx, "purged", pid, ctx.service.purge(pid, older_than_days=days, **({"op_ids": ops} if ops else {})))
+
+
+# ------------------------------------------------------------------- commands: quarantine
+
+def _when(ts: str | None) -> str:
+    return str(ts or "")[:10] or "-"
+
+
+def cmd_quarantine(ctx: Ctx) -> int:
+    report = ctx.service.quarantine_report()
+    if ctx.json:
+        _dump(report)
+        return EXIT_OK
+    t = report["totals"]
+    print(f"Quarantine {report['quarantine_dir']!r}: {_n(t['files'])} file(s), {format_size(t['bytes'])} held; "
+          f"{_n(t['due_files'])} ({format_size(t['due_bytes'])}) past the {report['retention_days']}-day retention. "
+          "Nothing is ever deleted on a timer.")
+    clouds = [r for r in report["remotes"] if r["files"]]
+    if clouds:
+        print("\n".join(_table(["CLOUD", "FILES", "SIZE", "DUE", "DUE SIZE", "PLANS"],
+                              [[r["remote"], _n(r["files"]), format_size(r["bytes"]), _n(r["due_files"]),
+                                format_size(r["due_bytes"]), r["plans"]] for r in clouds], "lrrrrr")))
+    held = [p for p in report["plans"] if p["held"]["files"]]
+    if held:
+        print()
+        print("\n".join(_table(
+            ["PLAN", "KIND", "CLOUDS", "HELD", "SIZE", "DUE", "OLDEST", "NEXT DUE"],
+            [[p["plan_id"], p["kind"], ",".join(p["remotes"]), _n(p["held"]["files"]), format_size(p["held"]["bytes"]),
+              _n(p["due"]["files"]), _when(p["oldest_at"]), _when(p["next_due_at"])] for p in held], "rllrrrll")))
+        print("\nSee a plan's files: drivemerge quarantine show PLAN   Restore: drivemerge plan restore PLAN")
+    settled = len(report["plans"]) - len(held)
+    if settled:
+        print(f"{settled} plan(s) with everything restored or removed.")
+    for u in report["unknown"]:
+        print(f"Unknown on {u['remote']}: {_n(u['files'])} file(s), {format_size(u['bytes'])} that no plan of this "
+              f"catalog put there (e.g. {', '.join(u['examples'])}); they can be neither restored nor removed here.")
+    if not clouds and not held and not report["unknown"]:
+        print("Nothing in quarantine.")
+    return EXIT_OK
+
+
+def _notes(item: dict) -> str:
+    if item["state"] != "held":
+        return ""
+    c = item["catalog"]
+    return " ".join(n for n, bad in (("original-taken", c["original_taken"]), ("not-seen", not c["seen"]),
+                                     ("witness-gone", c["witness_live"] is False)) if bad)
+
+
+def cmd_quarantine_show(ctx: Ctx) -> int:
+    a = ctx.args
+    got = ctx.service.quarantine_items(a.id, state=a.state, remote=a.remote, path_prefix=a.prefix,
+                                       offset=a.offset, limit=a.limit)
+    if ctx.json:
+        _dump(got)
+        return EXIT_OK
+    plan = got["plan"]
+    print(f"Plan {plan['id']} ({plan['kind']}, {plan['status']}): {_n(got['total'])} {a.state} file(s), "
+          f"{format_size(got['bytes'])}")
+    if got["items"]:
+        print("\n".join(_table(
+            ["OP", "CLOUD", "PATH", "SIZE", "STATE", "DUE", "NOTES"],
+            [[i["op_id"], i["remote"], i["path"], format_size(i["size"]), i["state"],
+              ("now" if i["due"] else _when(i["due_at"])) if i["state"] == "held" else "-", _notes(i)]
+             for i in got["items"]], "rlllllll")))
+        shown = got["offset"] + len(got["items"])
+        if shown < got["total"]:
+            print(f"... {_n(got['total'] - shown)} more (--offset {shown})")
+        print("Restore chosen files: drivemerge plan restore PLAN --op OP [--op OP ...]")
+    return EXIT_OK
+
+
+class _NothingDue(Exception):
+    pass
+
+
+def cmd_quarantine_purge_due(ctx: Ctx) -> int:
+    remote = ctx.args.remote
+
+    def prepare() -> Confirmation:
+        if not ctx.config.safety.execution_enabled:
+            raise executor.ExecutionDisabled(
+                "execution is disabled. To allow drive-merge to change your clouds, set "
+                f"`execution_enabled = true` under [safety] in {ctx.config_path}, then run this again")
+        if remote is not None:
+            ctx.config.remote(remote)
+        report = ctx.service.quarantine_report()
+        rows = [r for r in report["remotes"] if r["due_files"] and (remote is None or r["remote"] == remote)]
+        if not rows:
+            raise _NothingDue
+        days = report["retention_days"]
+        files, size = sum(r["due_files"] for r in rows), sum(r["due_bytes"] for r in rows)
+
+        def show() -> None:
+            print(f"Quarantined more than {days} day(s) ago; each surviving copy is checked again first:")
+            print("\n".join(_table(["CLOUD", "FILES", "SIZE"],
+                                   [[r["remote"], _n(r["due_files"]), format_size(r["due_bytes"])] for r in rows],
+                                   "lrr")))
+            print()
+
+        return Confirmation(show, f'{_n(files)} file(s), {format_size(size)} will be deleted for good. '
+                                  'Type "purge" to continue: ', "purge")
+
+    try:
+        _gate("delete the quarantine past its retention period", prepare)
+    except _NothingDue:
+        if ctx.json:
+            _dump({"plans": [], "done": 0, "failed": 0, "skipped": 0, "error": None})
+        else:
+            print("Nothing in quarantine is past its retention period.")
+        return EXIT_OK
+    res = ctx.service.purge_due(remote=remote)
+    failed = bool(res["failed"]) or bool(res.get("error"))
+    if ctx.json:
+        _dump(res)
+    else:
+        print(f"Purged {_n(res['done'])} file(s) from {_n(len(res['plans']))} plan(s): "
+              f"{_n(res['failed'])} failed, {_n(res['skipped'])} skipped")
+        for p in res["plans"]:
+            print(f"  plan {p['plan_id']}: {p['status']} - {_n(p['done'])} done, {_n(p['failed'])} failed, "
+                  f"{_n(p['skipped'])} skipped")
+        if res.get("error"):
+            print(f"error: {res['error']}", file=sys.stderr)
+    return EXIT_ERROR if failed else EXIT_OK
 
 
 # ---------------------------------------------------------------------- commands: the rest
@@ -1283,9 +1424,29 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("id", type=int, metavar="ID")
     p = add(plan, "restore", cmd_plan_restore, "move a plan's quarantined files back (human, interactive terminal only)")
     p.add_argument("id", type=int, metavar="ID")
+    p.add_argument("--op", type=int, action="append", metavar="OP_ID",
+                   help="only this quarantined file (an op id from `drivemerge quarantine show`); repeatable")
     p = add(plan, "purge", cmd_plan_purge, "permanently delete a plan's old quarantine (human, interactive terminal only)")
     p.add_argument("id", type=int, metavar="ID")
-    p.add_argument("--older-than-days", type=int, default=30, metavar="N", help="default 30")
+    p.add_argument("--older-than-days", type=int, default=None, metavar="N",
+                   help="default: [safety] quarantine_retention_days (30)")
+    p.add_argument("--op", type=int, action="append", metavar="OP_ID",
+                   help="only this quarantined file (an op id from `drivemerge quarantine show`); repeatable")
+
+    p = add(sub, "quarantine", cmd_quarantine,
+            "what executed plans parked in quarantine; `show` lists a plan's files, `purge-due` empties what is past "
+            "retention (human, interactive terminal only)")
+    qsub = p.add_subparsers(dest="quarantine_command", metavar="SUBCOMMAND", required=False)
+    p = add(qsub, "show", cmd_quarantine_show, "one plan's quarantined files")
+    p.add_argument("id", type=int, metavar="PLAN_ID")
+    p.add_argument("--state", choices=quarantine_mod.STATES, default="held")
+    p.add_argument("--remote", metavar="NAME")
+    p.add_argument("--prefix", metavar="FOLDER", help="only originals at or below this folder")
+    p.add_argument("--offset", type=int, default=0, metavar="N")
+    p.add_argument("--limit", type=int, default=200, metavar="N", help="at most 500")
+    p = add(qsub, "purge-due", cmd_quarantine_purge_due,
+            "permanently delete every quarantined file past its retention period (human, interactive terminal only)")
+    p.add_argument("--remote", metavar="NAME", help="only files on this cloud")
 
     p = add(sub, "changes", cmd_changes, "catalog change feed")
     p.add_argument("--cursor", metavar="C", help="'<row_version>:<id>' from a previous call")
