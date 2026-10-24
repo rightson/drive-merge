@@ -25,6 +25,7 @@ from . import (
 from .config import DEFAULT_CONFIG_PATH, Config, load_config, sync_remotes
 from .models import Plan
 from .connections import make_rclone
+from .quota import QuotaCache
 from .rclone import Rclone
 from .scanner import scan_remote
 
@@ -75,8 +76,11 @@ def draft_of(plan: Plan) -> int | None:
 
 class Service:
     def __init__(self, config: Config, conn: sqlite3.Connection | None = None, rclone: Rclone | None = None,
-                 config_path: str | Path | None = None):
+                 config_path: str | Path | None = None, quotas: QuotaCache | None = None):
         self.config = config
+        # Shared with the page and with every job service of the same server, so a quota the page fetched is
+        # the free space the simulator checks. The CLI starts empty: no quota known, none checked.
+        self.quotas = quotas if quotas is not None else QuotaCache()
         self.config_path = config_path if config_path is not None else config.config_path
         self.conn = conn if conn is not None else db.connect(config.db_path)
         sync_remotes(self.conn, config)
@@ -344,11 +348,39 @@ class Service:
                        groups_total=result.stats["groups_examined"])
         return out
 
+    def free_bytes(self) -> dict[int, int]:
+        """remote_id -> free bytes, for every cloud whose quota was fetched less than QUOTA_TTL ago. A cloud
+        with no quota, a stale one, or a failed lookup is left out: unknown free space is never checked."""
+        known = {}
+        for rid, name in self.conn.execute("SELECT id, name FROM remotes").fetchall():
+            free = self.quotas.free_bytes(name)
+            if free is not None:
+                known[rid] = free
+        return known
+
     def policy(self) -> simulate.SafetyPolicy:
-        """The simulator's safety policy as configured; one place so every caller simulates alike."""
+        """The simulator's safety policy as configured; one place so every caller simulates alike.
+
+        Free space is not part of the digest: it changes with every upload by anyone, so binding it would
+        make approvals go stale for no reason. require_room checks it again before approval and execution."""
         s = self.config.safety
         return simulate.SafetyPolicy(allow_probable_delete=s.allow_probable_delete, min_copies=s.min_copies,
-                                     quarantine_dir=s.quarantine_dir)
+                                     free_bytes=self.free_bytes() or None, quarantine_dir=s.quarantine_dir)
+
+    def require_room(self, plan_id: int) -> None:
+        """Raise plans.StaleSimulation if a cloud now has less known free space than the plan's last
+        simulation writes into it. A failed plan is not checked: its done ops already used some of that space."""
+        plan = plans.get_plan(self.conn, plan_id, with_ops=False)
+        sim = plans.latest_simulation(self.conn, plan_id)
+        if plan.status == "failed" or sim is None:
+            return
+        free = self.free_bytes()
+        for d in sim.remotes:
+            room = free.get(d.remote_id)
+            if room is not None and d.bytes_in > room:
+                raise plans.StaleSimulation(
+                    f"{d.remote} now has {room} bytes free, less than the {d.bytes_in} plan {plan_id} writes "
+                    f"into it; simulate again")
 
     def simulate(self, plan_id: int) -> dict:
         report = simulate.simulate_plan(self.conn, plan_id, policy=self.policy())
@@ -450,11 +482,13 @@ class Service:
     # ---------------------------------------------------------- human-only
 
     def approve(self, plan_id: int, code: str, *, approved_by: str) -> None:
+        self.require_room(plan_id)
         plans.approve_plan(self.conn, plan_id, code, approved_by=approved_by)
 
     def execute(self, plan_id: int, *, progress=None) -> dict:
         """Run an approved plan. A finished workspace plan also closes its draft, so the browser,
         the CLI and a later rescan all agree that the staged moves have happened."""
+        self.require_room(plan_id)
         result = _plain(executor.execute_plan(self.conn, self.rclone, self.config, plan_id, progress=progress))
         result.pop("failures", None)        # only a restore or a purge lists the items that stayed
         plan = plans.get_plan(self.conn, plan_id, with_ops=False)

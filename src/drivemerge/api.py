@@ -9,7 +9,6 @@ from __future__ import annotations
 import hmac
 import re
 import threading
-import time
 from collections.abc import Callable
 from typing import Any, Literal
 
@@ -22,51 +21,13 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from . import __version__, builders, connections, plans, quarantine
 from .compare import CompareError
 from .config import Config
+from .quota import QUOTA_FAIL_TTL, QUOTA_TTL, QuotaCache  # noqa: F401 - re-exported
 from .service import Service, ServiceError, scrub_secrets
 
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 _NO_PLAN = re.compile(r"no plan \d+")
-QUOTA_TTL = 600.0          # seconds a quota from test_connection is reused
-QUOTA_FAIL_TTL = 60.0      # a failed lookup is not retried for this long
 _CONNECT_STATUS = {"NOT_FOUND": 404, "BAD_NAME": 400, "NEEDS_CLIENT": 400, "MISSING_FIELD": 400, "BAD_REQUEST": 400,
                    "TOKEN_UNREADABLE": 400, "NOT_WAITING": 409, "IMPORT_UNSUPPORTED": 400}
-
-
-class QuotaCache:
-    """Per-cloud used/total/free from `connections.test_connection`, kept for ten minutes so a page that shows
-    several clouds does not call every provider on each view. None means unknown (not a connection, or it failed)."""
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._by_name: dict[str, tuple[float, dict | None]] = {}
-
-    def put(self, name: str, result: dict) -> None:
-        quota = result.get("quota") if result.get("ok") else None
-        with self._lock:
-            self._by_name[name] = (time.monotonic() + (QUOTA_TTL if quota else QUOTA_FAIL_TTL), quota)
-
-    def drop(self, name: str) -> None:
-        with self._lock:
-            self._by_name.pop(name, None)
-
-    def get(self, config: Config, name: str) -> dict | None:
-        """The cached quota; looks it up through test_connection when the cache is empty or old. Never raises."""
-        with self._lock:
-            hit = self._by_name.get(name)
-        if hit is not None and hit[0] > time.monotonic():
-            return hit[1]
-        try:
-            remote = config.remote(name)
-        except KeyError:
-            return None
-        if not getattr(remote, "connection", False):
-            return None
-        try:
-            result = connections.test_connection(config, name)
-        except Exception:  # unknown quota is not an error for the report
-            result = {"ok": False}
-        self.put(name, result)
-        return result.get("quota") if result.get("ok") else None
 
 
 class _Body(BaseModel):
@@ -223,7 +184,7 @@ def build_router(service: Service, lock: threading.Lock, *, dependencies: list[A
     page, and the code reaches a human only through the workspace preview, the plan review or the CLI.
     `created_by(request)` names who proposes a plan (default "api"; the UI app says "ui" for a browser session)."""
     api = APIRouter(dependencies=dependencies)
-    quotas = quotas if quotas is not None else QuotaCache()
+    quotas = quotas if quotas is not None else service.quotas
 
     @api.get("/v1/setup")
     def setup() -> dict:
