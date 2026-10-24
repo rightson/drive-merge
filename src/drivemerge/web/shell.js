@@ -3,6 +3,7 @@
 //   #/plans   #/plans/<id>   #/plans/new/dedupe?...   #/plans/new/consolidate?...   (docs/PLANS.md)
 //   #/clouds   #/free/<remote>?path=...&keep=a,b   (docs/ONBOARDING.md)
 //   #/quarantine?remote=...   #/quarantine/<id>?state=&remote=&path=   (docs/QUARANTINE.md)
+//   #/rules   #/rules/edit/<id>?back=...   #/rules/v/<id>   (docs/RULES.md)
 // No route (or the token exchange's #token=) means the workspace, so a page opened as before shows the workspace.
 import { html, useEffect, useState } from './vendor/htm-preact-standalone.mjs';
 import { t } from './i18n.js';
@@ -15,25 +16,27 @@ import { Plans } from './plans.js';
 import { Clouds } from './onboarding.js';
 import { Free } from './free.js';
 import { Quarantine } from './quarantine.js';
+import { Rules } from './rules.js';
 import { duePlans, useQuarantine } from './qstore.js';
 
-// The keys Alt+1 ... Alt+6 select, in order; the rail shows Plans and Quarantine between Compare and the workspace.
-export const VIEWS = ['overview', 'explore', 'compare', 'workspace', 'plans', 'quarantine'];
-export const RAIL = ['clouds', 'overview', 'explore', 'compare', 'plans', 'quarantine', 'workspace'];
+// The keys Alt+1 ... Alt+7 select, in order; the rail shows Plans, Quarantine and Rules between Compare and the workspace.
+export const VIEWS = ['overview', 'explore', 'compare', 'workspace', 'plans', 'quarantine', 'rules'];
+export const RAIL = ['clouds', 'overview', 'explore', 'compare', 'plans', 'quarantine', 'rules', 'workspace'];
 const VIEW_ICON = {
-  clouds: 'cloud', overview: 'chart', explore: 'search', compare: 'swap', workspace: 'columns', plans: 'plans', quarantine: 'lock',
+  clouds: 'cloud', overview: 'chart', explore: 'search', compare: 'swap', workspace: 'columns', plans: 'plans', quarantine: 'lock', rules: 'rules',
 };
 const ROUTE = /^\/(clouds|overview|explore|compare|workspace)(?:\?(.*))?$/;
 const FREE_ROUTE = /^\/free\/([^/?]+)(?:\?(.*))?$/;
 const PLANS_ROUTE = /^\/plans((?:\/[^?]*)?)(?:\?(.*))?$/;
 const QUARANTINE_ROUTE = /^\/quarantine(?:\/(\d+))?(?:\?(.*))?$/;
+const RULES_ROUTE = /^\/rules(?:\/(edit|v)\/(\d+))?\/?(?:\?(.*))?$/;
 
 /** Where a plans route points: the list, one plan's review, or a form that creates a plan. */
 function plansPage(sub) {
   const path = sub.replace(/\/+$/, '');
   const id = /^\/(\d+)$/.exec(path);
   if (id) return { page: 'review', id: Number(id[1]) };
-  const form = /^\/new\/(dedupe|consolidate)$/.exec(path);
+  const form = /^\/new\/(dedupe|consolidate|reorganize)$/.exec(path);
   if (form) return { page: 'new', kind: form[1] };
   return { page: 'list' };
 }
@@ -51,6 +54,11 @@ export function parseHash(hash) {
   }
   const q = QUARANTINE_ROUTE.exec(h);
   if (q) return { view: 'quarantine', id: q[1] ? Number(q[1]) : null, params: new URLSearchParams(q[2] || ''), hash: `#${h}`, explicit: true };
+  const r = RULES_ROUTE.exec(h);
+  if (r) {
+    const page = r[1] === 'edit' ? 'edit' : r[1] === 'v' ? 'version' : 'overview';
+    return { view: 'rules', page, id: r[2] ? Number(r[2]) : null, params: new URLSearchParams(r[3] || ''), hash: `#${h}`, explicit: true };
+  }
   const p = PLANS_ROUTE.exec(h);
   if (p) return { view: 'plans', params: new URLSearchParams(p[2] || ''), hash: `#${h}`, explicit: true, ...plansPage(p[1] || '') };
   return { view: 'workspace', params: new URLSearchParams(), hash: '', explicit: false };
@@ -94,12 +102,12 @@ export function useRoute() {
 
 const isTyping = (el) => !!el && (['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName) || el.isContentEditable);
 
-/** Alt+1 ... Alt+6 switch views; "/" jumps to the Explore box unless a text field has the keyboard. */
+/** Alt+1 ... Alt+7 switch views; "/" jumps to the Explore box unless a text field has the keyboard. */
 export function useShortcuts(route) {
   useEffect(() => {
     const onKey = (e) => {
       if (document.querySelector('.modal-backdrop')) return;
-      if (e.altKey && !e.ctrlKey && !e.metaKey && /^Digit[1-6]$/.test(e.code)) {
+      if (e.altKey && !e.ctrlKey && !e.metaKey && /^Digit[1-7]$/.test(e.code)) {
         e.preventDefault();
         const view = VIEWS[Number(e.code.slice(5)) - 1];
         navigate(remembered[view] || `#/${view}`);
@@ -118,8 +126,8 @@ export function useShortcuts(route) {
   }, [route.view]);
 }
 
-/** `waiting`: how many plans wait for a review (a badge on the Plans item, read by assistive technology as well). */
-export function Rail({ route, waiting = 0 }) {
+/** `waiting`: how many plans wait for a review (a badge on the Plans item, read by assistive technology as well); `proposals`: rule changes waiting for review (a badge on Rules). */
+export function Rail({ route, waiting = 0, proposals = 0 }) {
   const quarantined = useQuarantine();
   const due = duePlans(quarantined.data);
   return html`<nav class="rail" aria-label=${t('nav.label')} data-testid="rail">
@@ -133,7 +141,10 @@ export function Rail({ route, waiting = 0 }) {
         <span class="visually-hidden">${t('plans.waitingTip', { n: waiting })}</span></span>`}
       ${view === 'quarantine' && due > 0 && html`<span class="rail-badge" data-testid="rail-quarantine-badge" data-count=${due}
         title=${t('qr.railDue', { n: due })}><span aria-hidden="true">${due > 99 ? '99+' : due}</span>
-        <span class="visually-hidden">${t('qr.railDue', { n: due })}</span></span>`}</a>`)}
+        <span class="visually-hidden">${t('qr.railDue', { n: due })}</span></span>`}
+      ${view === 'rules' && proposals > 0 && html`<span class="rail-badge" data-testid="rail-rules-badge" data-count=${proposals}
+        title=${t('rules.railTip', { n: proposals })}><span aria-hidden="true">${proposals > 99 ? '99+' : proposals}</span>
+        <span class="visually-hidden">${t('rules.railTip', { n: proposals })}</span></span>`}</a>`)}
   </nav>`;
 }
 
@@ -146,5 +157,6 @@ export function ViewHost({ route }) {
   if (route.view === 'compare') return html`<${Compare} params=${route.params} />`;
   if (route.view === 'plans') return html`<${Plans} route=${route} />`;
   if (route.view === 'quarantine') return html`<${Quarantine} route=${route} />`;
+  if (route.view === 'rules') return html`<${Rules} route=${route} />`;
   return null;
 }

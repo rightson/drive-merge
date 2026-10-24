@@ -67,7 +67,7 @@ function commonFolder(paths) {
   return out.join('/');
 }
 
-function Copies({ r, remotes, onReveal, onCompare, onDedupe }) {
+function Copies({ r, remotes, onReveal, onCompare, onDedupe, onRules }) {
   const folders = [];
   for (const c of r.copies) {
     const where = { remote: c.remote, path: parentOf(c.path) };
@@ -87,13 +87,15 @@ function Copies({ r, remotes, onReveal, onCompare, onDedupe }) {
         <span class="mono" title=${`${c.remote}:${c.path}`}>${c.remote}:${c.path}</span>
         ${!c.matched && html`<span class="badge badge-nomatch" title=${t('ex.noMatchTip')}>${t('ex.noMatch')}</span>`}</span>
       <span class="ex-copy-mtime muted" role="cell">${fmtDay(c.mtime)}</span>
-      <button class="btn btn-tiny" data-testid="ex-reveal" onClick=${() => onReveal({ remote: c.remote, path: c.path })}>
+      <span class="ex-copy-actions"><button class="btn btn-tiny" data-testid="ex-reveal" onClick=${() => onReveal({ remote: c.remote, path: c.path })}>
         <${Icon} name="jump" size=${12} /> ${t('ex.reveal')}</button>
+      <button class="btn btn-tiny" data-testid="ex-rules" title=${t('ex.rulesTip')} onClick=${() => onRules({ remote: c.remote, path: c.path })}>
+        <${Icon} name="rules" size=${12} /> ${t('ex.rules')}</button></span>
     </div>`)}
   </div>`;
 }
 
-function ResultRow({ r, remotes, open, onToggle, onReveal, onCompare, onDedupe }) {
+function ResultRow({ r, remotes, open, onToggle, onReveal, onCompare, onDedupe, onRules }) {
   const counts = {};
   r.copies.forEach((c) => { counts[c.remote] = (counts[c.remote] || 0) + 1; });
   const cat = iconFor({ is_dir: false, category: r.category });
@@ -110,7 +112,7 @@ function ResultRow({ r, remotes, open, onToggle, onReveal, onCompare, onDedupe }
       <span class="ex-size num" role="cell">${fmtBytes(r.size)}</span>
       <span class="ex-mtime muted" role="cell">${fmtDay(r.mtime)}</span>
     </div>
-    ${open && html`<${Copies} r=${r} remotes=${remotes} onReveal=${onReveal} onCompare=${onCompare} onDedupe=${onDedupe} />`}
+    ${open && html`<${Copies} r=${r} remotes=${remotes} onReveal=${onReveal} onCompare=${onCompare} onDedupe=${onDedupe} onRules=${onRules} />`}
   </div>`;
 }
 
@@ -202,6 +204,23 @@ export function Explore({ params }) {
   const reveal = (loc) => ctx.revealInWorkspace(loc);
   const compare = (a, b) => ctx.nav(compareHash(a, b));
   const dedupe = ({ remote, path }) => ctx.nav(plansHash('/new/dedupe', { remote, path }));
+  /** "Where would the rules put this?": the editor's Explain, on a draft that copies the active rules (one that already does is reused). */
+  const rulesFor = async ({ remote, path }) => {
+    try {
+      const state = await api.rules();
+      const a = state.active || {};
+      const drafts = Array.isArray(state.drafts) ? state.drafts : (state.drafts && state.drafts.versions) || [];
+      let id = (drafts.find((d) => d.sha256 === a.sha256) || {}).id;
+      if (!id) {
+        const text = a.text || (await api.rulesDefault()).text;
+        const made = await api.createRuleVersion({ text, ...(a.version_id ? { base_id: a.version_id } : {}) });
+        id = (made.version || made).id;
+      }
+      ctx.nav(`#/rules/edit/${id}?explain=${encodeURIComponent(`${remote}:${path}`)}`);
+    } catch (e) {
+      ctx.toast('error', errorText(e));
+    }
+  };
 
   const order = (list) => [...list].sort((a, b) => names.indexOf(a.name) - names.indexOf(b.name));
 
@@ -272,7 +291,7 @@ export function Explore({ params }) {
             <span role="columnheader">${t('ex.col.modified')}</span>
           </div>
           ${state.results.map((r) => html`<${ResultRow} key=${r.key} r=${r} remotes=${remotes} open=${!!open[r.key]}
-            onToggle=${() => setOpen((o) => ({ ...o, [r.key]: !o[r.key] }))} onReveal=${reveal} onCompare=${compare} onDedupe=${dedupe} />`)}
+            onToggle=${() => setOpen((o) => ({ ...o, [r.key]: !o[r.key] }))} onReveal=${reveal} onCompare=${compare} onDedupe=${dedupe} onRules=${rulesFor} />`)}
         </div>
         ${!state.loading && !state.error && data && shown === 0 && html`<p class="empty-hint" data-testid="ex-none">${t('ex.none')}</p>`}
         ${data && shown < total && html`<div class="ex-more"><button class="btn" data-testid="ex-load-more" disabled=${more}

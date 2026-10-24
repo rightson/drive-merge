@@ -1,5 +1,5 @@
 // Plans (docs/PLANS.md): the list of every plan, the review of one, and the two forms that build a new one
-// (dedupe, consolidate) with a live estimate. Nothing here changes a cloud: it asks the server for the same plans the
+// (dedupe, consolidate, reorganize) with a live estimate. Nothing here changes a cloud: it asks the server for the same plans the
 // CLI and Claude make, shows the same simulation, and approves with the same typed code.
 import {
   html, useContext, useEffect, useMemo, useRef, useState,
@@ -15,6 +15,7 @@ import {
   ApprovalFields, Card, CliBox, CloudTable, ExecNote, FailedHelp, ProgressBox, Problems, SimStatus, useRunner,
 } from './report.js';
 import { PlanQuarantineBox } from './quarantine.js';
+import { PlanRulesBox, RulesField } from './rules.js';
 import { quarantineHash, refreshQuarantine } from './qstore.js';
 import {
   ago, baseName, buildText, errorText, fmtBytes, fmtDateTime, fmtNum, parentOf, rootCauses, sleep,
@@ -65,6 +66,12 @@ export function planSummary(p) {
     return t(q.delete_sources ? 'plans.sum.consolidateClean' : 'plans.sum.consolidate', {
       target: `${q.target}:${cleanPath(q.target_root)}`, from,
     });
+  }
+  if (p.kind === 'reorganize' && q.remote) {
+    const parts = [];
+    if (q.target_root) parts.push(t('plans.scope.root', { path: cleanPath(q.target_root) }));
+    if (q.path_prefix) parts.push(t('plans.scope.path', { path: q.path_prefix }));
+    return t('plans.sum.reorganize', { cloud: q.remote, scope: parts.length ? ` · ${parts.join(' · ')}` : '' });
   }
   if (p.kind === 'release' && q.remote) {
     return t('plans.sum.release', { cloud: q.remote, scope: q.path_prefix ? ` · ${t('plans.scope.path', { path: q.path_prefix })}` : '' });
@@ -225,6 +232,8 @@ function PlanList({ route }) {
         onClick=${(e) => { e.preventDefault(); ctx.nav(plansHash('/new/dedupe')); }}><${Icon} name="copy" size=${14} /> ${t('plans.newDedupe')}</a>
       <a class="btn btn-small" href=${plansHash('/new/consolidate')} data-testid="plans-new-consolidate"
         onClick=${(e) => { e.preventDefault(); ctx.nav(plansHash('/new/consolidate')); }}><${Icon} name="merge" size=${14} /> ${t('plans.newConsolidate')}</a>
+      <a class="btn btn-small" href=${plansHash('/new/reorganize')} data-testid="plans-new-reorganize"
+        onClick=${(e) => { e.preventDefault(); ctx.nav(plansHash('/new/reorganize')); }}><${Icon} name="rules" size=${14} /> ${t('plans.newReorganize')}</a>
       <a class="btn btn-small" href=${freeHash(freeTarget)} data-testid="plans-new-free"
         onClick=${(e) => { e.preventDefault(); ctx.nav(freeHash(freeTarget)); }}><${Icon} name="cloud" size=${14} /> ${t('plans.newFree')}</a>
     <//>
@@ -444,6 +453,7 @@ function PlanReview({ id }) {
     <div class="view-body">
       ${phase === 'loading' && html`<div class="center-msg" data-testid="plan-loading"><span class="spinner"></span> ${t('plans.loading')}</div>`}
       ${phase === 'error' && html`<div class="note error" data-testid="plan-error">${loadError} <button class="btn btn-small" onClick=${load}>${t('common.retry')}</button></div>`}
+      ${plan && html`<${PlanRulesBox} plan=${plan} />`}
       ${plan && html`<div class="pl-facts" data-testid="plan-facts">
         <${KindPill} kind=${plan.kind} /><${StatusPill} status=${status} /><${Who} by=${plan.created_by} />
         <span class="muted">${t('plans.created', { when: fmtDateTime(plan.created_at) })}</span>
@@ -756,14 +766,14 @@ function parseConsolidate(p) {
   return {
     target: p.get('target') || '', root: p.get('root') || '', sources: p.has('src') ? listParam(p.get('src')) : null,
     reorg: p.get('reorg') === '1', probable: p.get('probable') === '1', path: p.get('path') || '', prefer: listParam(p.get('prefer')),
-    del: p.get('del') === '1',
+    del: p.get('del') === '1', rules: p.get('rules') || '',
   };
 }
 
 function serializeConsolidate(f) {
   return {
     target: f.target, root: f.root, src: f.sources === null ? '' : f.sources.join(','), reorg: f.reorg ? '1' : '', probable: f.probable ? '1' : '',
-    path: f.path, prefer: f.prefer.join(','), del: f.del ? '1' : '',
+    path: f.path, prefer: f.prefer.join(','), del: f.del ? '1' : '', rules: f.rules,
   };
 }
 
@@ -774,6 +784,7 @@ function consolidateParams(f, target, sources) {
   if (f.sources !== null) p.sources = sources;
   if (cleanPath(f.path)) p.path_prefix = cleanPath(f.path);
   if (f.prefer.length) p.prefer_remotes = f.prefer;
+  if (f.rules) p.rules_version = Number(f.rules);
   return p;
 }
 
@@ -878,7 +889,7 @@ function Consolidate({ route }) {
             onInput=${(e) => update({ path: e.target.value })} /></label>
         <div class="field"><span>${t('plans.prefer')}</span>
           <${PreferList} remotes=${remotes} value=${form.prefer} onChange=${(prefer) => update({ prefer })} /></div>
-        <p class="pl-help">${t('cons.rulesHelp')}</p>
+        <${RulesField} value=${form.rules} onChange=${(rules) => update({ rules })} />
         <details class=${'pl-details pl-cleanup' + (form.del ? ' on' : '')} data-testid="cons-cleanup" open=${form.del || undefined}>
           <summary>${t('cons.cleanup')}</summary>
           <p>${t('cons.cleanupText')}</p>
@@ -920,12 +931,106 @@ function Consolidate({ route }) {
   </main>`;
 }
 
+// ---- reorganize
+function parseReorganize(p) {
+  return { remote: p.get('remote') || '', root: p.get('root') || '', path: p.get('path') || '', rules: p.get('rules') || '' };
+}
+
+function serializeReorganize(f) {
+  return { remote: f.remote, root: f.root, path: f.path, rules: f.rules };
+}
+
+function reorganizeParams(f, remote) {
+  if (!remote) return null;
+  const p = { remote };
+  if (cleanPath(f.root)) p.target_root = cleanPath(f.root);
+  if (cleanPath(f.path)) p.path_prefix = cleanPath(f.path);
+  if (f.rules) p.rules_version = Number(f.rules);
+  return p;
+}
+
+/** Move the files of one cloud to the places the layout rules give them (same cloud only; docs/RULES.md section 6). */
+function Reorganize({ route }) {
+  const ctx = useContext(AppCtx);
+  const remotes = ctx.config.remotes || [];
+  const writable = remotes.filter((r) => r.writable !== false);
+  const [form, update] = useUrlForm(ctx, route, 'reorganize', parseReorganize, serializeReorganize);
+  const remote = writable.some((r) => r.name === form.remote) ? form.remote : (writable[0] && writable[0].name) || '';
+  const params = reorganizeParams(form, remote);
+  const [est] = useEstimate('reorganize', params, null);
+  const [creating, setCreating] = useState(false);
+  const [createError, setCreateError] = useState(null);
+  const data = est.data;
+  const stats = (data && data.stats) || {};
+  const ops = data ? data.ops : 0;
+  const nothing = data && (data.nothing_to_do || ops === 0);
+  async function create() {
+    setCreating(true);
+    setCreateError(null);
+    try {
+      const r = await api.createPlan({ kind: 'reorganize', params });
+      if (!r.plan_id) { setCreateError({ code: r.code || 'NOTHING_TO_DO' }); return; }
+      ctx.refreshPlans();
+      ctx.nav(plansHash(`/${r.plan_id}`));
+    } catch (e) {
+      setCreateError(e);
+    } finally {
+      setCreating(false);
+    }
+  }
+  return html`<main class="view view-plans view-form" data-testid="view-plan-new" data-kind="reorganize" aria-label=${t('reorg.title')}>
+    <${ViewHeader} title=${t('reorg.title')} hint=${t('reorg.hint')}>
+      <button class="btn btn-small" data-testid="plan-back-top" onClick=${() => ctx.nav(plansHash())}>${t('plans.back')}</button><//>
+    <div class="pl-form-layout">
+      <form class="pl-form" onSubmit=${(e) => e.preventDefault()} aria-label=${t('reorg.title')}>
+        <h2>${t('reorg.scope')}</h2>
+        ${writable.length === 0 && html`<p class="pl-warn" role="alert"><${Icon} name="alert" size=${14} /> ${t('cons.noWritable')}</p>`}
+        <label class="field"><span>${t('reorg.cloud')}</span>
+          <select class="select" data-testid="reorg-remote" value=${remote} onChange=${(e) => update({ remote: e.target.value })}>
+            ${writable.map((r) => html`<option key=${r.name} value=${r.name}>${r.name}</option>`)}
+          </select></label>
+        <label class="field"><span>${t('reorg.root')}</span>
+          <input type="text" data-testid="reorg-root" value=${form.root} placeholder=${t('cons.rootPlaceholder')} autocomplete="off" spellcheck="false"
+            onInput=${(e) => update({ root: e.target.value })} /></label>
+        <label class="field"><span>${t('dedupe.path')}</span>
+          <input type="text" data-testid="reorg-path" value=${form.path} placeholder=${t('dedupe.pathPlaceholder')} autocomplete="off" spellcheck="false"
+            onInput=${(e) => update({ path: e.target.value })} /></label>
+        <p class="pl-help">${t('reorg.help')}</p>
+        <${RulesField} value=${form.rules} onChange=${(rules) => update({ rules })} />
+        <div class="pl-form-foot">
+          ${createError && html`<p class="pl-error" role="alert" data-testid="create-error">${createError.code === 'NOTHING_TO_DO' ? t('plans.NOTHING_TO_DO') : buildText(createError)}</p>`}
+          <button type="button" class="btn btn-primary" data-testid="create-plan" disabled=${creating || est.loading || !data || !(ops > 0)} onClick=${create}>
+            <${Icon} name="plus" size=${15} /> ${t('plans.create')}</button>
+        </div>
+      </form>
+      <section class="pl-estimate" aria-live="polite" aria-label=${t('plans.estimate')} data-testid="estimate">
+        <h2>${t('plans.estimate')} ${est.loading && html`<span class="pl-working" data-testid="estimating"><span class="spinner" aria-hidden="true"></span> ${t('plans.estimating')}</span>`}</h2>
+        ${est.error && html`<p class="view-error pl-est-error" role="alert" data-testid="estimate-error">${buildText(est.error)}</p>`}
+        ${!params && html`<p class="empty-hint">${t('reorg.fixForm')}</p>`}
+        ${data && html`<div class=${est.loading ? 'pl-stale' : ''}>
+          ${nothing ? html`<p class="empty-hint" data-testid="estimate-nothing">${t('plans.NOTHING_TO_DO')}</p>` : null}
+          <section class="cards pl-cards" data-testid="reorg-stats">
+            <${Card} id="files" label=${t('reorg.files')} value=${fmtNum(stats.files || 0)} />
+            <${Card} id="inplace" label=${t('reorg.inPlace')} value=${fmtNum(stats.in_place || 0)} />
+            <${Card} id="moves" label=${t('reorg.moves')} value=${fmtNum(stats.moves !== undefined ? stats.moves : ops)} />
+            <${Card} id="renamed" label=${t('reorg.renamed')} value=${fmtNum(stats.renamed_for_collision || 0)} tone=${stats.renamed_for_collision > 0 ? 'warn' : ''} />
+          </section>
+          <${SkippedSummary} byReason=${stats.skipped_by_reason} /><${SkippedList} skipped=${data.skipped} />
+          <${Placements} sample=${data.sample} target=${remote} />
+        </div>`}
+        ${!data && !est.error && est.loading && html`<p class="empty-hint">${t('plans.estimating')}</p>`}
+      </section>
+    </div>
+  </main>`;
+}
+
 // ------------------------------------------------------------------ the route
 
 export function Plans({ route }) {
   if (route.page === 'review') return html`<${PlanReview} key=${route.id} id=${route.id} />`;
   if (route.page === 'new' && route.kind === 'dedupe') return html`<${Dedupe} route=${route} />`;
   if (route.page === 'new' && route.kind === 'consolidate') return html`<${Consolidate} route=${route} />`;
+  if (route.page === 'new' && route.kind === 'reorganize') return html`<${Reorganize} route=${route} />`;
   return html`<${PlanList} route=${route} />`;
 }
 
