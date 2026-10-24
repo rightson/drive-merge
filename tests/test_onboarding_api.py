@@ -858,6 +858,8 @@ def test_importable_and_import_over_http(browser, bearer, service, tmp_path, mon
     assert {r["name"]: r["imported"] for r in client.get("/v1/ui/connect/importable").json()["remotes"]}["work"] is True
     r = rec.call("POST", "/v1/ui/connect/import", json={"source": "work"})
     assert r.status_code == 409 and r.json()["code"] == "NAME_TAKEN"
+    r = rec.call("POST", "/v1/ui/connect/import", json={"source": "spare", "name": "work"})
+    assert r.status_code == 409 and r.json()["code"] == "NAME_TAKEN" and r.json()["params"] == {"suggested_name": "work-2"}
     r = rec.call("POST", "/v1/ui/connect/import", json={"source": "priv"})
     assert r.status_code == 400 and r.json()["code"] == "IMPORT_UNSUPPORTED" and r.json()["params"] == {"type": "crypt"}
     r = rec.call("POST", "/v1/ui/connect/import", json={"source": "ghost"})

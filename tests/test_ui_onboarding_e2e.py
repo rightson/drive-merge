@@ -460,6 +460,65 @@ def world3(tmp_path, monkeypatch):
     w.stop()
 
 
+@pytest.fixture
+def world_clash(tmp_path, monkeypatch):
+    """Two remotes in the person's own rclone config whose derived drive-merge names are both "work"."""
+    files = {name: {f"{name}/file-{i}.bin": bytes([i]) * (500 + 100 * i) for i in range(2)} for name in ("work", "other")}
+    monkeypatch.setenv("FAKE_RCLONE_LOG", str(tmp_path / "rclone.log"))
+    w = Onboarding(tmp_path, monkeypatch, files)
+    personal = w.home / ".config" / "rclone" / "rclone.conf"
+    personal.parent.mkdir(parents=True)
+    token = '{"access_token":"%s","token_type":"bearer","refresh_token":"%s","expiry":"2030-01-01T00:00:00Z"}'
+    personal.write_text(
+        f"[work]\ntype = dropbox\ntoken = {token % (PERSONAL_AT, PERSONAL_RT)}\nfake_root = {w.roots['work']}\n\n"
+        f"[WORK]\ntype = dropbox\ntoken = {token % (PASTED_AT, PASTED_RT)}\nfake_root = {w.roots['other']}\n", encoding="utf-8")
+    w.personal = personal
+    w.personal_before = personal.read_bytes()
+    yield w
+    w.stop()
+
+
+def test_an_import_whose_name_is_taken_is_renamed_end_to_end(browser, world_clash):
+    world = world_clash
+    ctx = browser.new_context(viewport={"width": 1440, "height": 900}, locale="en-US")
+    page = ctx.new_page()
+    page.set_default_timeout(30_000)
+    errors: list[str] = []
+    page.on("pageerror", lambda e: errors.append(str(e)))
+    page.on("console", lambda m: errors.append(m.text) if m.type == "error" and "409" not in m.text else None)
+
+    def tid(name: str):
+        return page.get_by_test_id(name)
+
+    page.goto(f"{world.url}/ui/#token={UI_TOKEN}")
+    expect(tid("import-list")).to_be_visible()
+    tid("import-add-work").click()
+    expect(tid("conn-card-work")).to_be_visible(timeout=30_000)
+    tid("import-add-WORK").click()                                              # "work" is a cloud already: the row asks for another name
+    expect(tid("import-rename-WORK")).to_be_visible()
+    expect(tid("import-rename-input-WORK")).to_have_value("work-2")             # the backend's suggestion (it sees rclone.conf too)
+    expect(tid("import-rename-input-WORK")).to_be_focused()
+    expect(tid("conn-card-work-2")).to_have_count(0)
+    tid("import-rename-input-WORK").fill("Work Two")
+    expect(tid("import-rename-error-WORK")).to_have_attribute("data-code", "BAD_NAME")
+    tid("import-rename-input-WORK").fill("work-2")
+    tid("import-rename-input-WORK").press("Enter")
+    expect(tid("conn-card-work-2")).to_be_visible(timeout=30_000)
+    expect(tid("conn-card-work-2")).to_have_attribute("data-state", "ro")
+    expect(tid("conn-unscoped-work-2")).to_be_visible()
+    expect(tid("import-rename-WORK")).to_have_count(0)
+    expect(tid("import-done-WORK")).to_be_visible()
+    conns = tomllib.loads((world.config_path.parent / "connections.toml").read_text(encoding="utf-8"))
+    entries = {e["name"]: e for e in conns["remotes"]}
+    assert set(entries) == {"work", "work-2"}
+    assert entries["work-2"]["imported_from"] == "WORK" and entries["work-2"]["read"] == "work-2-ro:"
+    conf_text = (world.config_path.parent / "rclone.conf").read_text(encoding="utf-8")
+    assert set(re.findall(r"^\[(.+)\]$", conf_text, re.M)) == {"work-ro", "work-2-ro"}
+    assert world.personal.read_bytes() == world.personal_before
+    assert not errors, errors
+    ctx.close()
+
+
 def test_icloud_an_imported_remote_and_a_pasted_token_end_to_end(browser, world3):
     world = world3
     SHOTS.mkdir(parents=True, exist_ok=True)

@@ -1007,6 +1007,24 @@ def test_import_names_and_refusals(cfg, tmp_path, monkeypatch):
     assert set(_sections(cfg)) == {"my-drive-2-ro"} and len(C._read_entries(cfg)) == 2
 
 
+def test_name_taken_on_import_suggests_the_first_free_numbered_name(cfg, tmp_path, monkeypatch):
+    _personal(tmp_path, monkeypatch, _personal_text(tmp_path))
+    C.import_remote(cfg, "work")
+    with pytest.raises(C.ConnectError) as e:                                           # bucket would be named "work" too
+        C.import_remote(cfg, "bucket", name="work")
+    assert e.value.code == "NAME_TAKEN" and e.value.params == {"suggested_name": "work-2"}
+    C.import_remote(cfg, "bucket", name="work-2")
+    with pytest.raises(C.ConnectError) as e:                                           # work-2 is taken now, and so is its rclone section
+        C.import_remote(cfg, "icl", name="work")
+    assert e.value.params == {"suggested_name": "work-3"}
+    long = "a" * 31                                                                    # the suffix must still fit the 31-character rule
+    assert C._suggest_locked(cfg, long) == "a" * 29 + "-2"
+    assert C.NAME_RE.match(C._suggest_locked(cfg, long))
+    with pytest.raises(C.ConnectError) as e:                                           # BAD_NAME has no suggestion
+        C.import_remote(cfg, "icl", name="Bad Name")
+    assert e.value.code == "BAD_NAME" and e.value.params == {}
+
+
 def test_unknown_types_are_imported_as_provider_other(cfg, tmp_path, monkeypatch):
     _personal(tmp_path, monkeypatch, _personal_text(tmp_path))
     conn = C.import_remote(cfg, "bucket")

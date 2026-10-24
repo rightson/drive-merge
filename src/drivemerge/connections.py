@@ -77,8 +77,9 @@ _ENCRYPTED_HEADER = "# Encrypted rclone configuration File"
 class ConnectError(ValueError):
     """A connection step failed. `code` is one of NO_RCLONE, RCLONE_TOO_OLD, FLOW_BUSY, FLOW_FAILED, FLOW_TIMEOUT,
     NAME_TAKEN, BAD_NAME, NEEDS_CLIENT, TEST_FAILED, NOT_FOUND, MISSING_FIELD {field}, NOT_WAITING,
-    TOKEN_UNREADABLE, CONFIG_WRITE, IMPORT_UNSUPPORTED {type}, IMPORT_ENCRYPTED, BAD_REQUEST. `params` are the
-    values the page needs to word the code (never a secret)."""
+    TOKEN_UNREADABLE, CONFIG_WRITE, IMPORT_UNSUPPORTED {type}, IMPORT_ENCRYPTED, BAD_REQUEST.
+    NAME_TAKEN for an explicit name carries `suggested_name` (a free name). `params` are the values the page
+    needs to word the code (never a secret)."""
 
     def __init__(self, code: str, message: str, **params: str):
         super().__init__(message)
@@ -910,13 +911,26 @@ def _taken_locked(config: Config, name: str, ignore: str | None = None) -> bool:
     return bool(name in names or name in reserved or mine & secs or {f"{name}-ro", f"{name}-rw"} & names)
 
 
+def _suggest_locked(config: Config, name: str, ignore: str | None = None) -> str:
+    """`name-2`, `name-3` ... : the first that passes NAME_RE and is free (connections, remotes of config.toml,
+    sections of rclone.conf, names reserved by waiting flows). Only the backend sees all of those."""
+    n = 2
+    while True:
+        suffix = f"-{n}"
+        cand = name[:31 - len(suffix)].rstrip("-") + suffix
+        if NAME_RE.match(cand) and not _taken_locked(config, cand, ignore):
+            return cand
+        n += 1
+
+
 def _pick_locked(config: Config, spec: ProviderSpec, name: str | None, ignore: str | None = None) -> str:
     if name:
         if not NAME_RE.match(name):
             raise ConnectError("BAD_NAME", "a name starts with a lowercase letter and uses lowercase letters, "
                                            "digits and '-' (at most 31 characters)")
         if _taken_locked(config, name, ignore):
-            raise ConnectError("NAME_TAKEN", f"{name!r} is already in use")
+            raise ConnectError("NAME_TAKEN", f"{name!r} is already in use",
+                               suggested_name=_suggest_locked(config, name, ignore))
         return name
     n = 1
     while True:

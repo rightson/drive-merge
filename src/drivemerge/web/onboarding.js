@@ -559,7 +559,62 @@ function ReadOnlyPanel({ onCopy }) {
 }
 
 /** "Already use rclone?": the remotes of the person's own rclone config that can be copied in (docs/ONBOARDING.md G4.4). */
-function ImportList({ info, canAct, busy, onImport }) {
+/** The name `import_remote` derives from a source (connections._import_name): lowercase, runs of anything but a-z 0-9 - become `-`. */
+export function importName(source) {
+  return String(source).toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '');
+}
+
+/** First `base-2`, `base-3` ... that passes the name rule and is not in `taken` (the fallback when the server sent no suggested_name). */
+function suggestFree(base, taken) {
+  for (let n = 2; n < 1000; n += 1) {
+    const suffix = `-${n}`;
+    const cand = base.slice(0, 31 - suffix.length).replace(/-+$/, '') + suffix;
+    if (NAME_RE.test(cand) && !taken.has(cand)) return cand;
+  }
+  return base;
+}
+
+/** The import row turned into a rename form: the derived name is taken (or unusable), so the person picks another one. */
+function ImportRenameForm({ row, initial, code, taken, busy, onSubmit, onCancel }) {
+  const [text, setText] = useState(initial);
+  const [serverCode, setServerCode] = useState(code);
+  const input = useRef(null);
+  useEffect(() => { if (input.current) { input.current.focus(); input.current.select(); } }, []);
+  const name = text.trim();
+  const clientCode = !NAME_RE.test(name) ? 'BAD_NAME' : taken.has(name) ? 'NAME_TAKEN' : '';
+  const reason = clientCode || serverCode;
+  const submit = async () => {
+    if (clientCode || busy) return;
+    const result = await onSubmit(name);
+    if (result) setServerCode(result);
+  };
+  const onKey = (e) => {
+    if (e.key === 'Enter') {
+      if (e.isComposing || e.keyCode === 229) return;
+      e.preventDefault();
+      submit();
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      if (!busy) onCancel();
+    }
+  };
+  return html`<form class="import-rename" data-testid=${'import-rename-' + row.name} onSubmit=${(e) => e.preventDefault()}>
+    <label class="field"><span>${t('conn.import.renameLabel', { name: row.name })}</span>
+      <input type="text" ref=${input} data-testid=${'import-rename-input-' + row.name} value=${text} autocomplete="off" spellcheck="false"
+        aria-invalid=${!!reason} aria-describedby=${reason ? 'import-rename-err-' + row.name : undefined}
+        onInput=${(e) => { setText(e.target.value); setServerCode(''); }} onKeyDown=${onKey} /></label>
+    ${reason && html`<p class="field-error" id=${'import-rename-err-' + row.name} role="alert" data-testid=${'import-rename-error-' + row.name}
+      data-code=${reason}>${reason === 'NAME_TAKEN' ? t('err.NAME_TAKEN') : t('err.BAD_NAME')}</p>`}
+    <div class="import-rename-actions">
+      <button type="button" class="btn btn-small btn-primary" data-testid=${'import-rename-ok-' + row.name} disabled=${!!clientCode || !!busy}
+        onClick=${submit}>${busy ? html`<span class="spinner" aria-hidden="true"></span>` : null} ${t('conn.import.renameOk')}</button>
+      <button type="button" class="btn btn-small" data-testid=${'import-rename-cancel-' + row.name} disabled=${!!busy}
+        onClick=${onCancel}>${t('common.cancel')}</button>
+    </div>
+  </form>`;
+}
+
+function ImportList({ info, canAct, busy, renaming, taken, onImport, onRename, onCancelRename }) {
   const remotes = (info && info.remotes) || [];
   if (!info || (!remotes.length && !info.encrypted)) return null;
   return html`<section aria-labelledby="clouds-import-h" data-testid="import-section">
@@ -572,7 +627,9 @@ function ImportList({ info, canAct, busy, onImport }) {
         <${ProviderMark} provider=${r.provider} />
         <span class="conn-name">${r.name}</span><span class="cloud-provider">${r.type}</span>
         <span class="spacer"></span>
-        ${r.imported ? html`<span class="muted" data-testid=${'import-done-' + r.name}><${Icon} name="check" size=${12} /> ${t('conn.import.done', { name: r.name })}</span>`
+        ${renaming && renaming.source === r.name ? html`<${ImportRenameForm} row=${r} initial=${renaming.suggestion} code=${renaming.code} taken=${taken}
+          busy=${busy === r.name} onSubmit=${(name) => onRename(r, name)} onCancel=${onCancelRename} />`
+    : r.imported ? html`<span class="muted" data-testid=${'import-done-' + r.name}><${Icon} name="check" size=${12} /> ${t('conn.import.done', { name: r.name })}</span>`
     : html`${!r.supported && html`<span class="muted" data-testid=${'import-unsupported-' + r.name}>${t('conn.import.unsupported')}</span>`}
           <button class="btn btn-small" data-testid=${'import-add-' + r.name} disabled=${!canAct || !r.supported || busy}
             onClick=${() => onImport(r)}>${busy === r.name ? html`<span class="spinner" aria-hidden="true"></span>` : null} ${t('conn.import.add')}</button>`}
@@ -594,6 +651,8 @@ export function Clouds() {
   const [dialog, setDialog] = useState(null);
   const [importable, setImportable] = useState(null);
   const [importing, setImporting] = useState('');
+  const [renaming, setRenaming] = useState(null);          // { source, suggestion, code }: the import row is a rename form
+  const [focusBack, setFocusBack] = useState('');          // the source whose Import button gets the focus after Cancel
   const alive = useRef(true);
   useEffect(() => () => { alive.current = false; }, []);
   const names = [...conns, ...manual].map((c) => c.name).join(',');
@@ -662,11 +721,13 @@ export function Clouds() {
     }
   }
 
-  async function importRemote(r) {
+  /** Import `r` (under `name` when the person chose one). Returns the NAME_TAKEN / BAD_NAME code that opened or kept the rename form. */
+  async function importRemote(r, name) {
     setImporting(r.name);
     try {
-      const res = await api.connectImport({ source: r.name });
-      if (!alive.current) return;
+      const res = await api.connectImport(name ? { source: r.name, name } : { source: r.name });
+      if (!alive.current) return '';
+      setRenaming(null);
       if (res && res.flow_id && res.status === 'question') {
         setDialog({ provider: { key: r.provider || 'other', label: r.name }, purpose: 'read', resume: res });
       } else {
@@ -674,11 +735,30 @@ export function Clouds() {
         loadImportable();
       }
     } catch (e) {
+      if (e.code === 'NAME_TAKEN' || e.code === 'BAD_NAME') {
+        if (alive.current) {
+          const base = importName(r.name);
+          const suggestion = (e.params && e.params.suggested_name) || (NAME_RE.test(base) ? suggestFree(base, taken) : base);
+          setRenaming((prev) => (prev && prev.source === r.name ? { ...prev, code: e.code } : { source: r.name, suggestion, code: e.code }));
+        }
+        return e.code;
+      }
       ctx.toast('error', errorText(e));
     } finally {
       if (alive.current) setImporting('');
     }
+    return '';
   }
+  const cancelRename = () => {
+    if (renaming) setFocusBack(renaming.source);
+    setRenaming(null);
+  };
+  useEffect(() => {
+    if (!focusBack || renaming) return;
+    const btn = document.querySelector(`[data-testid="import-add-${CSS.escape(focusBack)}"]`);
+    if (btn) btn.focus();
+    setFocusBack('');
+  }, [focusBack, renaming]);
 
   const copy = (text) => copyText(ctx, text);
 
@@ -713,7 +793,8 @@ export function Clouds() {
           ${providers.map((p) => html`<${ProviderTile} key=${p.key} spec=${p} connected=${conns.some((c) => c.provider === p.key)}
             disabled=${blocked || !canAct} onConnect=${() => setDialog({ provider: p, purpose: 'read' })} />`)}</div>
       </section>
-      <${ImportList} info=${importable} canAct=${canAct && !blocked} busy=${importing} onImport=${importRemote} />
+      <${ImportList} info=${importable} canAct=${canAct && !blocked} busy=${importing} renaming=${renaming} taken=${taken}
+        onImport=${(r) => importRemote(r)} onRename=${importRemote} onCancelRename=${cancelRename} />
       ${(conns.length > 0 || manual.length > 0) && html`<div class="welcome-actions">
         <button class="btn btn-primary" data-testid="welcome-sync" disabled=${!canAct || ctx.sync.running} onClick=${syncAndContinue}>
           ${ctx.sync.running ? html`<span class="spinner" aria-hidden="true"></span>` : html`<${Icon} name="refresh" size=${15} />`} ${t('welcome.sync')}</button>
