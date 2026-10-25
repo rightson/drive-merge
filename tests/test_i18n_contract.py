@@ -242,6 +242,75 @@ def test_the_jobs_and_staged_step_codes_have_sentences():
     assert {"SRC_NOT_FOUND", "DST_NOT_DIR"} <= codes
 
 
+# --------------------------------------------------------------------------- bulk actions from Explore (docs/BULK.md)
+
+def test_every_selection_code_has_a_sentence_that_uses_only_what_every_site_sends():
+    """A SelectionError is answered {error, code, params}; the page words err.<CODE> in both languages (docs/BULK.md section B)."""
+    from drivemerge import explore
+    sites: dict[str, list[set[str]]] = {}
+    for call in calls("explore.py", "SelectionError"):
+        sites.setdefault(const(call.args[0]), []).append(keyword_names(call))
+    assert set(sites) - {"BAD_QUERY"} == set(explore.SELECTION_CODES), sorted(sites)
+    for code in explore.SELECTION_CODES:
+        need(f"err.{code}")
+        usable = set.intersection(*sites[code])
+        for lang, d in DICTS.items():
+            assert placeholders(d[f"err.{code}"]) <= usable, f"{lang} err.{code}: {placeholders(d[f'err.{code}']) - usable}"
+    # the parameters the spec names, which the sentences may rely on
+    assert set.intersection(*sites["TOO_MANY_KEYS"]) >= {"param", "count", "limit"}
+    assert set.intersection(*sites["SELECTION_CHANGED"]) >= {"expected", "total"}
+    assert set.intersection(*sites["SELECTION_TOO_LARGE"]) >= {"total", "limit"}
+    assert set.intersection(*sites["SELECTION_TRUNCATED"]) >= {"scan_cap"}
+    assert set.intersection(*sites["BAD_KEY"]) >= {"key"}
+
+
+def test_every_gather_refusal_has_a_sentence_that_uses_only_what_every_site_sends():
+    """gather.py raises WorkspaceError (409) with CODES, besides the draft and destination refusals the workspace has."""
+    from drivemerge import gather
+    sites: dict[str, list[set[str]]] = {}
+    for call in calls("gather.py", "WorkspaceError"):
+        sites.setdefault(const(call.args[0]), []).append(keyword_names(call))
+    assert set(gather.CODES) <= set(sites), sorted(sites)
+    for code in sites:
+        need(f"err.{code}")
+        usable = set.intersection(*sites[code])
+        for lang, d in DICTS.items():
+            assert placeholders(d[f"err.{code}"]) <= usable, f"{lang} err.{code}: {placeholders(d[f'err.{code}']) - usable}"
+    assert set.intersection(*sites["GATHER_TOO_MANY"]) >= {"files", "limit"}
+    assert set.intersection(*sites["NOTHING_TO_GATHER"]) >= {"contents"}
+
+
+def test_every_gather_skip_code_has_a_sentence_and_a_heading_in_both_languages_that_use_only_its_params():
+    """`skipped.items[].params` of a gather (docs/BULK.md section D): the dialog words gather.skip.<CODE> from them, and
+    gather.skipHead.<CODE> (a heading over the contents skipped for that code) from the count the page makes."""
+    from drivemerge import gather
+    emitted: dict[str, list[set[str]]] = {}
+    for call in calls("gather.py", "skip"):
+        emitted.setdefault(const(call.args[2]), []).append(keyword_names(call))
+    assert set(emitted) == set(gather.SKIP_CODES), sorted(emitted)
+    spec = {"ALREADY_THERE": {"name"}, "NAME_TAKEN": {"name"}, "NAME_CLASH": {"name", "with"}, "NOT_ON_TARGET": {"remote"},
+            "READ_ONLY": {"remote"}, "NATIVE_DOC": set(), "AMBIGUOUS_PATH": {"remote", "path"}, "GONE": set()}
+    for code in gather.SKIP_CODES:
+        need(f"gather.skip.{code}")
+        need(f"gather.skipHead.{code}")
+        usable = set.intersection(*emitted[code])
+        assert usable == spec[code], (code, usable)
+        for lang, d in DICTS.items():
+            assert placeholders(d[f"gather.skip.{code}"]) <= usable, f"{lang} gather.skip.{code}"
+            assert placeholders(d[f"gather.skipHead.{code}"]) <= {"n"}, f"{lang} gather.skipHead.{code}"
+    assert keys_of(r"gather\.skip\.[A-Z_]+") == {f"gather.skip.{c}" for c in gather.SKIP_CODES}
+    assert keys_of(r"gather\.skipHead\.[A-Z_]+") == {f"gather.skipHead.{c}" for c in gather.SKIP_CODES}
+
+
+def test_the_bulk_wording_of_a_gather_step_and_a_selection_plan_is_in_both_languages():
+    for key in ("act.gather", "plans.sum.dedupeSelection", "gather.title", "gather.staged", "sel.count", "sel.limit",
+                "sel.cleared", "sel.useCurrent"):
+        need(key)
+    for lang, d in DICTS.items():
+        assert placeholders(d["act.gather"]) == {"n", "dst"}, lang           # what describeAction fills in
+        assert placeholders(d["plans.sum.dedupeSelection"]) == {"n"}, lang
+
+
 # --------------------------------------------------------------------------- the Plans view: build errors, skips
 
 def build_error_sites() -> dict[str, list[set[str]]]:

@@ -186,13 +186,16 @@ function Detail({ item, data, remotes, moving, onReveal, onMove }) {
 }
 
 // ---------------------------------------------------------------- the picker: a cloud and a folder path with autocomplete
-function PathPicker({ side, remotes, value, onChange, onSubmit, selectRef }) {
+// `draft` makes the folders those of the draft's after-view (a folder staged a moment ago is there); `version` is the
+// draft's version, so that a new folder shows up. `prefix`/`label` let another view (the gather dialog) reuse it.
+export function PathPicker({ side, remotes, value, onChange, onSubmit, selectRef, draft, version, prefix, label: labelText }) {
   const [focused, setFocused] = useState(false);
   const [options, setOptions] = useState([]);
   const [active, setActive] = useState(-1);
   const cache = useRef(new Map());
   const seq = useRef(0);
-  const listId = `cmp-${side}-list`;
+  const base = prefix || `cmp-${side}`;
+  const listId = `${base}-list`;
 
   useEffect(() => {
     if (!focused || !value.remote) { setOptions([]); return undefined; }
@@ -200,19 +203,19 @@ function PathPicker({ side, remotes, value, onChange, onSubmit, selectRef }) {
     const parent = slash < 0 ? '' : value.path.slice(0, slash);
     const prefix = value.path.slice(slash + 1).toLowerCase();
     const mine = (seq.current += 1);
-    const key = `${value.remote}:${parent}`;
+    const key = `${value.remote}:${parent}:${draft || ''}:${version || ''}`;
     const apply = (items) => {
       if (mine !== seq.current) return;
       setOptions(items.filter((i) => i.is_dir && !i.quarantine && i.name.toLowerCase().includes(prefix)).slice(0, 12));
       setActive(-1);
     };
     if (cache.current.has(key)) { apply(cache.current.get(key)); return undefined; }
-    api.tree({ remote: value.remote, path: parent, limit: 500 }).then(
+    api.tree({ remote: value.remote, path: parent, limit: 500, draft }).then(
       (r) => { cache.current.set(key, r.items || []); apply(r.items || []); },
       () => apply([]),
     );
     return undefined;
-  }, [focused, value.remote, value.path]);
+  }, [focused, value.remote, value.path, draft, version]);
 
   const choose = (o) => { onChange({ ...value, path: o.path }); setActive(-1); setOptions([]); };
   const onKeyDown = (e) => {
@@ -224,26 +227,26 @@ function PathPicker({ side, remotes, value, onChange, onSubmit, selectRef }) {
       if (active >= 0 && options[active]) choose(options[active]); else onSubmit();
     } else if (e.key === 'Escape') setOptions([]);
   };
-  const label = side === 'left' ? t('cmp.left') : t('cmp.right');
+  const label = labelText || (side === 'left' ? t('cmp.left') : t('cmp.right'));
   const shown = focused && options.length > 0;
   return html`<div class="picker" data-side=${side}>
-    <label class="visually-hidden" for=${`cmp-${side}-remote`}>${t('cmp.cloudOf', { side: label })}</label>
-    <select id=${`cmp-${side}-remote`} class="select" ref=${selectRef} data-testid=${`cmp-${side}-remote`} value=${value.remote}
+    <label class="visually-hidden" for=${`${base}-remote`}>${t('cmp.cloudOf', { side: label })}</label>
+    <select id=${`${base}-remote`} class="select" ref=${selectRef} data-testid=${`${base}-remote`} value=${value.remote}
       style=${value.remote ? { borderLeft: `4px solid ${cloudColor(remotes, value.remote)}` } : undefined}
       onChange=${(e) => onChange({ remote: e.target.value, path: '' })}>
       <option value="">${t('cmp.pickCloud')}</option>
       ${remotes.map((r) => html`<option value=${r.name}>${r.name}</option>`)}
     </select>
     <div class="picker-path">
-      <label class="visually-hidden" for=${`cmp-${side}-path`}>${t('cmp.pathOf', { side: label })}</label>
-      <input id=${`cmp-${side}-path`} type="text" role="combobox" aria-expanded=${shown} aria-controls=${listId} aria-autocomplete="list"
-        aria-activedescendant=${active >= 0 ? `${listId}-${active}` : undefined} data-testid=${`cmp-${side}-path`}
+      <label class="visually-hidden" for=${`${base}-path`}>${t('cmp.pathOf', { side: label })}</label>
+      <input id=${`${base}-path`} type="text" role="combobox" aria-expanded=${shown} aria-controls=${listId} aria-autocomplete="list"
+        aria-activedescendant=${active >= 0 ? `${listId}-${active}` : undefined} data-testid=${`${base}-path`}
         value=${value.path} disabled=${!value.remote} placeholder=${t('cmp.pathPlaceholder')} autocomplete="off" spellcheck="false"
         onInput=${(e) => onChange({ ...value, path: e.target.value.replace(/^\/+/, '') })} onKeyDown=${onKeyDown}
         onFocus=${() => setFocused(true)} onBlur=${() => setTimeout(() => setFocused(false), 120)} />
-      ${shown && html`<ul class="search-results picker-list" role="listbox" id=${listId} data-testid=${`cmp-${side}-options`}>
+      ${shown && html`<ul class="search-results picker-list" role="listbox" id=${listId} data-testid=${`${base}-options`}>
         ${options.map((o, i) => html`<li role="option" id=${`${listId}-${i}`} key=${o.path} aria-selected=${i === active}>
-          <button class=${'search-hit' + (i === active ? ' active' : '')} tabindex="-1" data-testid=${`cmp-${side}-option`}
+          <button class=${'search-hit' + (i === active ? ' active' : '')} tabindex="-1" data-testid=${`${base}-option`}
             onMouseDown=${(e) => { e.preventDefault(); choose(o); }}>
             <${Icon} name="folder" size=${15} class="cat-folder" /><span class="hit-name">${o.name}</span>
             <span class="hit-path">${parentOf(o.path)}</span></button></li>`)}

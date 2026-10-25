@@ -5,7 +5,7 @@ import * as api from './api.js';
 import { Icon } from './icons.js';
 import { AppCtx } from './ctx.js';
 import {
-  describeAction, errorText, fmtBytes, fmtLoc, fmtNum, rescanText, sleep, staleText, suggestionText,
+  GATHER_NOTE, describeAction, errorText, fmtBytes, fmtLoc, fmtNum, rescanText, sleep, staleText, suggestionText,
 } from './util.js';
 
 const SUGGESTION_NOTE = /^(related|duplicates):[0-9a-f]+$/i;
@@ -26,7 +26,7 @@ function Drawer({ title, count, testid, onClose, children, footer }) {
 function StagedItem({ a, undone }) {
   const ctx = useContext(AppCtx);
   const d = describeAction(a);
-  const note = a.note && !SUGGESTION_NOTE.test(a.note) ? a.note : a.note ? t('staged.fromSuggestion') : '';
+  const note = a.note === GATHER_NOTE ? '' : a.note && !SUGGESTION_NOTE.test(a.note) ? a.note : a.note ? t('staged.fromSuggestion') : '';
   const stale = !undone && !!a.stale;
   return html`<li class=${'staged-item' + (undone ? ' undone' : '') + (stale ? ' stale' : '')}
     data-testid=${undone ? 'staged-item-undone' : 'staged-item'}

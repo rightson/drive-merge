@@ -53,7 +53,8 @@ export function wordParams(ns, params) {
   const out = {};
   for (const [k, v] of Object.entries(params || {})) {
     if (v && typeof v === 'object' && !Array.isArray(v) && v.remote !== undefined) out[k] = fmtLoc({ remote: v.remote, path: v.path || '' });
-    else if (BYTE_PARAMS.has(k) && typeof v === 'number') out[k] = fmtBytes(v);
+    // `expected` of a refusal (SELECTION_CHANGED) counts contents; of a violation (EXPECT_MISMATCH) it is a size.
+    else if (BYTE_PARAMS.has(k) && typeof v === 'number' && !(ns === 'err' && k === 'expected')) out[k] = fmtBytes(v);
     else out[k] = v;
   }
   for (const k of KIND_PARAMS) {
@@ -69,6 +70,8 @@ export function wordParams(ns, params) {
   if (typeof out.version_status === 'string') out.version_status = t(`rstatus.${out.version_status}`, null, out.version_status);
   if (out.active_version === null) out.active_version = '?';
   if (typeof out.files === 'number') out.files = fmtNum(out.files);
+  // Counts of a selection (docs/BULK.md): thousands separated, as everywhere else.
+  for (const k of ['total', 'expected', 'scan_cap', 'contents']) if (typeof out[k] === 'number') out[k] = fmtNum(out[k]);
   if (typeof out.limit === 'number') out.limit = fmtNum(out.limit);
   return out;
 }
@@ -94,6 +97,9 @@ export function errorText(err) {
   return known || err.message || t('err.unknown');
 }
 
+/** The note a gather step carries (docs/BULK.md section D): the drawer words the step, it does not show the note. */
+export const GATHER_NOTE = 'explore:gather';
+
 /** Title and detail line of one staged action, for the drawer. */
 export function describeAction(a) {
   const dst = fmtLoc(a.dst);
@@ -108,6 +114,8 @@ export function describeAction(a) {
   if (a.new_name && items.length === 1 && first.remote === a.dst.remote && parentOf(first.path) === a.dst.path) {
     return { title: t('act.rename', { from: names[0], to: a.new_name }), detail: '' };
   }
+  // A move that Explore's "Gather into a folder" staged: one step for every picked file (docs/BULK.md section 4).
+  if (a.note === GATHER_NOTE) return { title: t('act.gather', { n: items.length, dst }), detail };
   return { title: t('act.move', { n: items.length, dst }), detail };
 }
 

@@ -126,6 +126,11 @@ export const explore = (params) => {
   return call('GET', '/v1/explore', { query });
 };
 
+/** Bulk actions (docs/BULK.md section F). `body`: {selection, draft?, with_keys?}; answers the counts of the selection. */
+export const selection = (body) => call('POST', '/v1/explore/selection', { body });
+/** Gather the selection into a folder of the draft. `body`: {selection, dst: {remote, path}, cross_cloud?, dry_run?, note?}. */
+export const gather = (draftId, body) => call('POST', `/v1/drafts/${draftId}/gather`, { body });
+
 // Plans (docs/PLANS.md section C).
 export const plan = (id) => call('GET', `/v1/plans/${id}`);
 export const planSummaries = async ({ status, limit = 100 } = {}) =>

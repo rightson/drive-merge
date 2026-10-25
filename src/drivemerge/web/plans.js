@@ -10,7 +10,8 @@ import { Icon } from './icons.js';
 import { AppCtx } from './ctx.js';
 import { CloudDot, CloudName } from './clouds.js';
 import { Modal, ViewHeader } from './ui.js';
-import { freeHash, parseSize, plansHash } from './query.js';
+import { exploreHash, freeHash, parseSize, plansHash } from './query.js';
+import { fromDedupeParams } from './selection.js';
 import {
   ApprovalFields, Card, CliBox, CloudTable, ExecNote, FailedHelp, ProgressBox, Problems, SimStatus, useRunner,
 } from './report.js';
@@ -52,6 +53,9 @@ function StatusPill({ status }) {
 /** One line about what a plan is for, worded from its kind and params. */
 export function planSummary(p) {
   const q = p.params || {};
+  if (p.kind === 'dedupe' && q.selection) {
+    return t('plans.sum.dedupeSelection', { n: q.groups_count !== undefined ? q.groups_count : (q.groups || []).length });
+  }
   if (p.kind === 'dedupe') {
     const parts = [];
     if (q.remote) parts.push(t('plans.scope.on', { cloud: q.remote }));
@@ -585,6 +589,8 @@ function parseDedupe(p) {
   return {
     remote: p.get('remote') || '', across: p.get('across') === '1', path: p.get('path') || '', min: p.get('min') || '',
     prefer: listParam(p.get('prefer')), keep, skip: listParam(p.get('skip')),
+    // The Explore selection this plan is limited to (docs/BULK.md section 5), as the address bar spells it.
+    selq: p.get('selq') || '', selx: p.get('selx') || '', seln: p.get('seln') || '', selk: p.get('selk') || '',
   };
 }
 
@@ -592,12 +598,14 @@ function serializeDedupe(f) {
   return {
     remote: f.remote, across: f.across ? '1' : '', path: f.path, min: f.min, prefer: f.prefer.join(','),
     keep: Object.entries(f.keep).map(([g, id]) => `${g}=${id}`).join(','), skip: f.skip.join(','),
+    selq: f.selq, selx: f.selx, seln: f.seln, selk: f.selk,
   };
 }
 
-function dedupeParams(f) {
+function dedupeParams(f, selection) {
   if (sizeError(f.min)) return null;
   const p = { cross_remote: f.across };
+  if (selection) p.selection = selection.body();
   if (f.remote) p.remote = f.remote;
   if (cleanPath(f.path)) p.path_prefix = cleanPath(f.path);
   if (f.min.trim()) p.min_size = parseSize(f.min);
@@ -645,7 +653,9 @@ function Dedupe({ route }) {
   const ctx = useContext(AppCtx);
   const remotes = ctx.config.remotes || [];
   const [form, update, setForm] = useUrlForm(ctx, route, 'dedupe', parseDedupe, serializeDedupe);
-  const params = dedupeParams(form);
+  const names = remotes.map((r) => r.name);
+  const selection = useMemo(() => fromDedupeParams(form, names), [form.selq, form.selx, form.seln, form.selk, names.join(',')]);
+  const params = dedupeParams(form, selection);
   const [more, setMore] = useState({ groups: [], busy: false, last: null });
   const extra = useRef({});
   const [est] = useEstimate('dedupe', params, extra);
@@ -663,6 +673,9 @@ function Dedupe({ route }) {
   const hasMore = !!data && lastFull && (total === undefined || groups.length < total);
   const keepCount = Object.keys(form.keep).length;
   const resetOverrides = () => update({ keep: {}, skip: [] });
+  const dropSelection = () => update({ selq: '', selx: '', seln: '', selk: '', keep: {}, skip: [] });
+  const useCurrent = (n) => update({ seln: String(n), keep: {}, skip: [] });
+  const changed = est.error && est.error.code === 'SELECTION_CHANGED';
   const scope = (patch) => update({ ...patch, keep: {}, skip: [] });  // overrides belong to the scope they were made in
 
   async function loadMore() {
@@ -700,6 +713,17 @@ function Dedupe({ route }) {
     <div class="pl-form-layout">
       <form class="pl-form" onSubmit=${(e) => e.preventDefault()} aria-label=${t('dedupe.scope')}>
         <h2>${t('dedupe.scope')}</h2>
+        ${selection && html`<div class="dd-selection" data-testid="dd-selection" data-mode=${selection.mode}>
+          <div class="dd-selection-head"><strong>${t('sel.banner')}</strong>
+            <span data-testid="dd-selection-count">${t(selection.mode === 'query' ? 'sel.bannerQuery' : 'sel.bannerKeys', { n: fmtNum(selection.count) })}</span></div>
+          ${selection.mode === 'query' && html`<p class="dd-selection-query mono" data-testid="dd-selection-query">${selection.text ? `\u201c${selection.text}\u201d` : t('sel.bannerEverything')}
+            ${selection.except.size > 0 && html` <span class="muted">${t('sel.excluded', { n: fmtNum(selection.except.size) })}</span>`}</p>`}
+          <p class="pl-help">${t('sel.bannerHelp')}</p>
+          <div class="dd-selection-actions">
+            <button type="button" class="btn btn-small" data-testid="dd-selection-back"
+              onClick=${() => ctx.nav(exploreHash(selection.text))}>${t('sel.back')}</button>
+            <button type="button" class="btn btn-small" data-testid="dd-selection-remove" onClick=${dropSelection}>${t('sel.remove')}</button></div>
+        </div>`}
         <label class="field"><span>${t('dedupe.clouds')}</span>
           <select class="select" data-testid="dd-remote" value=${form.remote} onChange=${(e) => scope({ remote: e.target.value })}>
             <option value="">${t('dedupe.allClouds')}</option>
@@ -734,7 +758,13 @@ function Dedupe({ route }) {
       </form>
       <section class="pl-estimate" aria-live="polite" aria-label=${t('plans.estimate')} data-testid="estimate">
         <h2>${t('plans.estimate')} ${est.loading && html`<span class="pl-working" data-testid="estimating"><span class="spinner" aria-hidden="true"></span> ${t('plans.estimating')}</span>`}</h2>
-        ${est.error && html`<p class="view-error pl-est-error" role="alert" data-testid="estimate-error">${buildText(est.error)}
+        ${changed && html`<div class="view-error pl-est-error" role="alert" data-testid="dd-selection-changed">
+          <p>${buildText(est.error)}</p>
+          <div class="dd-selection-actions">
+            <button class="btn btn-small btn-primary" data-testid="dd-selection-update" onClick=${() => useCurrent((est.error.params || {}).total)}>
+              ${t('sel.useCurrent', { n: fmtNum((est.error.params || {}).total) })}</button>
+            <button class="btn btn-small" data-testid="dd-selection-changed-back" onClick=${() => ctx.nav(exploreHash(selection ? selection.text : ''))}>${t('sel.back')}</button></div></div>`}
+        ${est.error && !changed && html`<p class="view-error pl-est-error" role="alert" data-testid="estimate-error">${buildText(est.error)}
           ${(est.error.code === 'BAD_KEEPER' || est.error.code === 'BAD_GROUP') && html` <button class="link" onClick=${resetOverrides}>${t('plans.reset')}</button>`}</p>`}
         ${!params && html`<p class="empty-hint">${t('dedupe.fixForm')}</p>`}
         ${data && html`<div class=${est.loading ? 'pl-stale' : ''}>
@@ -742,6 +772,10 @@ function Dedupe({ route }) {
     : html`<p class="pl-headline" data-testid="estimate-headline">${t('dedupe.headline', {
       copies: fmtNum(stats.deletes !== undefined ? stats.deletes : ops), groups: fmtNum(stats.groups || 0), bytes: fmtBytes(stats.bytes_reclaimed || 0),
     })}</p>`}
+          ${selection && stats.selection && html`<p class="pl-help" data-testid="dd-selection-stats">
+            ${t('sel.stats', { n: fmtNum(stats.selection.contents) })}
+            ${stats.selection.ungrouped > 0 && ` ${t('sel.statsUngrouped', { n: fmtNum(stats.selection.ungrouped) })}`}
+            ${stats.selection.gone > 0 && ` ${t('sel.statsGone', { n: fmtNum(stats.selection.gone) })}`}</p>`}
           <${SkippedSummary} byReason=${stats.skipped_by_reason} /><${SkippedList} skipped=${data.skipped} />
           ${groups.length > 0 && html`<div class="dd-groups" data-testid="dd-groups">
             ${groups.map((g) => html`<${GroupCard} key=${g.key} g=${g} remotes=${remotes} form=${form}
