@@ -358,3 +358,11 @@ def test_stored_simulations_come_back_with_their_totals(conn, catalog):
     plans.record_simulation(conn, pid, rep, snap)
     got = plans.latest_simulation(conn, pid)
     assert got.violations_total == 9 and got.violations_by_code == {"SRC_MISSING": 9} and len(got.violations) == 2
+
+
+def test_a_plan_keeps_its_selection_and_resolved_groups_in_params(conn, catalog):
+    g = catalog.remote("g", "drive")
+    params = {"selection": {"query": {"q": "x"}, "except": ["g:2"], "expect_total": 3}, "groups": ["g:1", "g:3"]}
+    pid = plans.create_plan(conn, "t", "dedupe", [Op("copy", g, "x", dst_remote_id=g, dst_path="y")],
+                            created_by="test", params=params)
+    assert plans.get_plan(conn, pid).params == params

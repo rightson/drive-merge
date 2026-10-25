@@ -361,3 +361,153 @@ def test_a_missing_configured_file_stops_rule_plans_but_not_the_others(conn, cat
     with pytest.raises(rulestore.RulesError):
         svc.profiles()
     assert classify.default_rules().rules                                       # the packaged rules are still there to ask for
+
+
+# --------------------------------------------------------------------------- bulk actions (docs/BULK.md §C, §E)
+
+from drivemerge import explore as explore_mod
+from drivemerge.config import Config
+from drivemerge.workspace import WorkspaceError
+
+
+@pytest.fixture
+def bulk(conn, catalog):
+    g = catalog.remote("gdrive", "drive")
+    d = catalog.remote("dropbox", "dropbox")
+    ids = {}
+    for tag, size in (("A", 100), ("B", 200), ("C", 300)):
+        for rid, path, h in ((g, f"Orig/{tag}.bin", "sha256"), (g, f"Dup/{tag} (1).bin", "sha256"),
+                             (d, f"Mirror/{tag}.bin", "dropbox")):
+            eid = catalog.file(rid, path, size=size, **{h: f"{h}-{tag}"})
+            ids[(tag, path)] = eid
+        conn.execute("UPDATE entries SET content_group = ? WHERE path LIKE ?",
+                     ("ABC".index(tag) + 1, f"%/{tag}%.bin"))
+    catalog.file(g, "Solo/one.txt", size=5)
+    catalog.dir(g, "Dest")
+    svc = Service(Config(), conn=conn)
+    return svc, ids
+
+
+def _total(conn, sql="SELECT COUNT(*) FROM plans"):
+    return conn.execute(sql).fetchone()[0]
+
+
+def test_service_select_numbers_and_staged_copies(bulk):
+    svc, _ = bulk
+    out = svc.select({"query": {"q": "bin"}})
+    assert out["total"] == 3 and out["copies"] == 9 and out["staged"] is None and "keys" not in out
+    d = svc.create_draft("t")["id"]
+    assert svc.select({"keys": ["g:1"]}, draft_id=d)["staged"] == {"copies": 0}
+    svc.stage_action(d, {"kind": "move", "items": [{"remote": "gdrive", "path": "Orig/A.bin"}],
+                         "dst": {"remote": "gdrive", "path": "Dest"}}, created_by="test")
+    assert svc.select({"keys": ["g:1", "g:2"]}, draft_id=d, with_keys=True)["staged"] == {"copies": 1}
+    svc.discard_draft(d)
+    assert svc.select({"keys": ["g:1"]}, draft_id=d)["staged"] is None          # a closed draft marks nothing
+    with pytest.raises(WorkspaceError) as e:
+        svc.select({"keys": ["g:1"]}, draft_id=999)
+    assert e.value.code == "NOT_FOUND"
+
+
+def test_service_explore_with_a_draft_marks_moved_copies(bulk):
+    svc, _ = bulk
+    d = svc.create_draft("t")["id"]
+    svc.stage_action(d, {"kind": "move", "items": [{"remote": "gdrive", "path": "Orig/A.bin"}],
+                         "dst": {"remote": "gdrive", "path": "Dest"}}, created_by="test")
+    plain = svc.explore("A.bin")
+    marked = svc.explore("A.bin", draft_id=d)
+    assert "staged" not in plain["results"][0] and marked["results"][0]["staged"] == 1
+    staged = {c["path"]: c["staged"] for c in marked["results"][0]["copies"]}
+    assert staged["Orig/A.bin"] == {"remote": "gdrive", "path": "Dest/A.bin"} and staged["Mirror/A.bin"] is None
+    with pytest.raises(WorkspaceError):
+        svc.explore("A.bin", draft_id=999)
+
+
+def test_service_gather_dry_run_persists_nothing(bulk):
+    svc, _ = bulk
+    d = svc.create_draft("t")["id"]
+    before = (svc.conn.total_changes, svc.get_draft(d)["version"])
+    out = svc.gather(d, {"keys": ["g:1", "g:2"]}, {"remote": "gdrive", "path": "Dest"}, dry_run=True, created_by="ui")
+    assert out["files"] == 2 and out["selection"] == {"total": 2, "gone": 0} and "items" not in out
+    assert "action" not in out
+    assert (svc.conn.total_changes, svc.get_draft(d)["version"]) == before
+    assert svc.get_draft(d)["actions"] == []
+
+
+def test_service_gather_stages_one_action_with_the_creator(bulk):
+    svc, _ = bulk
+    d = svc.create_draft("t")["id"]
+    out = svc.gather(d, {"query": {"q": "bin"}, "expect_total": 3}, {"remote": "gdrive", "path": "Dest"},
+                     created_by="mcp")
+    assert out["files"] == 3 and out["selection"]["total"] == 3
+    actions = svc.get_draft(d)["actions"]
+    assert len(actions) == 1 and actions[0]["created_by"] == "mcp" and actions[0]["note"] == "explore:gather"
+    assert len(actions[0]["items"]) == 3
+
+
+def test_service_gather_refusal_order(bulk):
+    svc, _ = bulk
+    dst = {"remote": "gdrive", "path": "Dest"}
+    with pytest.raises(WorkspaceError) as e:
+        svc.gather(999, {"keys": ["bogus"]}, {"remote": "nope", "path": ""}, created_by="ui")
+    assert e.value.code == "NOT_FOUND" and e.value.params == {"draft": 999}
+    d = svc.create_draft("t")["id"]
+    with pytest.raises(explore_mod.SelectionError) as e:
+        svc.gather(d, {"keys": ["bogus"]}, {"remote": "nope", "path": ""}, created_by="ui")
+    assert e.value.code == "BAD_KEY"                                          # selection before destination
+    with pytest.raises(WorkspaceError) as e:
+        svc.gather(d, {"keys": ["g:1"]}, {"remote": "nope", "path": ""}, created_by="ui")
+    assert e.value.code == "NOT_FOUND" and e.value.params == {"remote": "nope"}
+    svc.discard_draft(d)
+    with pytest.raises(WorkspaceError) as e:
+        svc.gather(d, {"keys": ["g:1"]}, dst, created_by="ui")
+    assert e.value.code == "NOT_OPEN"
+
+
+def test_propose_plan_with_a_selection_records_selection_and_groups(bulk):
+    svc, _ = bulk
+    sel = {"keys": ["g:1", "g:3", "e:424242"]}
+    out = svc.propose_plan("dedupe", {"selection": sel, "remote": "gdrive"}, created_by="api")
+    assert out["stats"]["selection"] == {"contents": 2, "grouped": 2, "ungrouped": 0, "gone": 1}
+    assert out["stats"]["groups"] == 2 and out["stats"]["groups_missing"] == 0 and out["ops"] == 2
+    plan = plans.get_plan(svc.conn, out["plan_id"])
+    assert plan.params["selection"] == sel and plan.params["groups"] == ["g:1", "g:3"]
+    assert {o.src_path for o in plan.ops} == {"Dup/A (1).bin", "Dup/C (1).bin"}        # B is untouched
+    est = svc.estimate_plan("dedupe", {"selection": sel, "remote": "gdrive"})
+    assert est["stats"]["selection"]["contents"] == 2 and est["ops"] == 2 and est["groups_total"] == 2
+
+
+def test_a_selection_dedupe_is_the_same_dedupe_over_fewer_groups(bulk):
+    svc, _ = bulk
+    full = svc.estimate_plan("dedupe", {"cross_remote": True}, sample=100)
+    some = svc.estimate_plan("dedupe", {"cross_remote": True, "selection": {"keys": ["g:2"]}}, sample=100)
+    assert some["ops"] == 2 and full["ops"] == 6
+    assert [s for s in full["sample"] if "B" in (s["src"]["path"])] == some["sample"]
+
+
+def test_selection_with_groups_is_a_bad_param_and_selection_errors_propagate(bulk):
+    svc, _ = bulk
+    with pytest.raises(builders.BuildError) as e:
+        svc.propose_plan("dedupe", {"selection": {"keys": ["g:1"]}, "groups": ["g:1"]}, created_by="api")
+    assert (e.value.code, e.value.params) == ("BAD_PARAM", {"param": "selection"})
+    with pytest.raises(explore_mod.SelectionError) as e:
+        svc.estimate_plan("dedupe", {"selection": {"query": {"q": "bin"}, "expect_total": 99}})
+    assert e.value.code == "SELECTION_CHANGED"
+    assert svc.conn.execute("SELECT COUNT(*) FROM plans").fetchone()[0] == 0
+
+
+def test_a_selection_of_ungrouped_files_builds_nothing(bulk):
+    svc, _ = bulk
+    solo = svc.select({"query": {"q": "one.txt"}}, with_keys=True)["keys"]
+    out = svc.propose_plan("dedupe", {"selection": {"keys": solo}}, created_by="api")
+    assert out["plan_id"] is None and out["stats"]["selection"]["ungrouped"] == 1
+
+
+def test_plan_summaries_replace_groups_by_groups_count_but_the_plan_keeps_them(bulk):
+    svc, _ = bulk
+    out = svc.propose_plan("dedupe", {"selection": {"keys": ["g:1", "g:2", "g:3"]}, "remote": "gdrive"},
+                           created_by="api")
+    row = next(r for r in svc.plan_summaries() if r["id"] == out["plan_id"])
+    assert "groups" not in row["params"] and row["params"]["groups_count"] == 3
+    assert row["params"]["selection"] == {"keys": ["g:1", "g:2", "g:3"]}
+    assert svc.plan(out["plan_id"])["params"]["groups"] == ["g:1", "g:2", "g:3"]
+    assert next(p for p in svc.plans() if p["id"] == out["plan_id"])["params"]["groups"] == ["g:1", "g:2", "g:3"]

@@ -834,7 +834,7 @@ def cmd_plan_dedupe(ctx: Ctx) -> int:
     a = ctx.args
     return _propose(ctx, "dedupe", _params(
         remote=a.remote, cross_remote=a.cross_remote, path_prefix=a.prefix, min_size=a.min_size,
-        prefer_remotes=a.prefer))
+        prefer_remotes=a.prefer, groups=a.group))
 
 
 def cmd_plan_consolidate(ctx: Ctx) -> int:
@@ -1482,6 +1482,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--prefix", metavar="P")
     p.add_argument("--min-size", type=size_arg, metavar="SIZE")
     p.add_argument("--prefer", action="append", metavar="R", help="keep copies on this remote first (repeatable)")
+    p.add_argument("--group", action="append", metavar="KEY",
+                   help="only this duplicate group, as 'g:<number>' (repeatable)")
     p.add_argument("--title", metavar="T")
 
     p = add(plan, "consolidate", cmd_plan_consolidate, "propose gathering content into one remote")

@@ -242,3 +242,22 @@ def test_explore_does_not_write(world):
     before = world.total_changes
     explore(world, "thesis")
     assert world.total_changes == before
+
+
+def test_draft_locate_marks_copies_and_leaves_everything_else_alone(world, ids):
+    plain = explore(world, "thesis_final")
+    seen = []
+
+    def locate(locs):
+        seen.append(list(locs))
+        return [(r, "Gathered/" + p.rpartition("/")[2]) if r == 1 else (r, p) for r, p in locs]
+
+    marked = explore(world, "thesis_final", draft_locate=locate)
+    assert len(seen) == 1 and len(seen[0]) == plain["results"][0]["copies_count"]      # one call for the whole page
+    r = marked["results"][0]
+    assert r["staged"] == 1
+    assert [c["staged"] for c in r["copies"]] == [
+        {"remote": "gdrive", "path": "Gathered/thesis_final.pdf"}, None, None]
+    for key in ("total", "truncated", "facets"):
+        assert marked[key] == plain[key]
+    assert explore(world, "zzzzzz", draft_locate=locate)["results"] == []
