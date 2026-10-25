@@ -6,7 +6,7 @@
 // Nothing here changes a cloud. Rules only shape the plans built later; making a version active is a human act (approvals
 // on the page, or `drivemerge rules activate <id>` in a terminal) and writes one file after showing the diff.
 import {
-  html, useContext, useEffect, useRef, useState,
+  html, useContext, useEffect, useLayoutEffect, useRef, useState,
 } from './vendor/htm-preact-standalone.mjs';
 import { t } from './i18n.js';
 import * as api from './api.js';
@@ -512,7 +512,8 @@ function ActivateDialog({ id, onClose, onDone }) {
   // An Escape that cancels an IME composition belongs to the composition. Busy blocks it like `dismissable` does.
   const keyRef = useRef(null);
   keyRef.current = { busy, onClose };
-  useEffect(() => {
+  // A layout effect: attached as the dialog is put on the page, not a frame later, so an Escape right away is not lost.
+  useLayoutEffect(() => {
     const onKey = (e) => {
       if (e.key !== 'Escape' || e.isComposing || e.keyCode === 229 || e.defaultPrevented) return;
       const k = keyRef.current;
