@@ -493,7 +493,7 @@ def build_dedupe(conn: sqlite3.Connection, *, remote: str | None = None, cross_r
                  path_prefix: str | None = None, min_size: int = 1, prefer_remotes: Sequence[str] = (),
                  limit_groups: int | None = None, quarantine_dir: str = DEFAULT_QUARANTINE,
                  keep: Mapping[str, int] | None = None, skip_groups: Sequence[str] = (),
-                 group_window: tuple[int, int] | None = None) -> BuildResult:
+                 group_window: tuple[int, int] | None = None, groups: Sequence[str] | None = None) -> BuildResult:
     """Delete redundant exact copies, always keeping one per content (and per remote, unless cross_remote).
 
     Without cross_remote each remote is thinned on its own: the keeper (choose_keeper) stays and the
@@ -512,7 +512,13 @@ def build_dedupe(conn: sqlite3.Connection, *, remote: str | None = None, cross_r
     ambiguous path). `skip_groups` lists group keys that produce no ops. A key that names no group of this
     build is BAD_GROUP {group}. `group_window` = (offset, count) fills `BuildResult.groups` with the details
     of that slice of the examined groups, in build order (Service.estimate_plan pages them).
+
+    `groups` (a list of 'g:<int>' keys, at most SELECT_LIMIT) narrows the build to those exact groups; every other
+    parameter behaves as without it, over that subset. A key that names no exact group is ignored and counted in
+    `stats["groups_missing"]`; a `keep` / `skip_groups` key outside `groups` is BAD_GROUP, as any key that names
+    no group of the build. Without `groups` the result is unchanged.
     """
+    wanted = _group_filter(groups)
     remotes = _remote_map(conn)
     only = _named(remotes, remote) if remote is not None else None
     prefer = [r.name for r in _names(remotes, prefer_remotes)]
@@ -536,6 +542,8 @@ def build_dedupe(conn: sqlite3.Connection, *, remote: str | None = None, cross_r
         offset += len(groups)
         rows = _rows_by_id(conn, (c.entry_id for g in groups for c in g.copies))
         for g in groups:
+            if wanted is not None and g.key not in wanted:
+                continue
             if limit_groups is not None and made >= limit_groups:
                 stopped = True
                 break
@@ -589,7 +597,39 @@ def build_dedupe(conn: sqlite3.Connection, *, remote: str | None = None, cross_r
     result.stats = {"groups_examined": examined, "groups": made, "deletes": len(result.ops),
                     "bytes_reclaimed": reclaimed, "skipped": len(result.skipped), "copies_considered": considered,
                     "skipped_by_reason": _skipped_by_reason(result)}
+    if wanted is not None:
+        result.stats["groups_missing"] = _groups_missing(conn, wanted, min_size)
     return result
+
+
+# Selections are capped at explore.SELECT_LIMIT contents; the builder takes the same number of group keys.
+_GROUPS_LIMIT = 5000
+_GROUP_KEY = re.compile(r"^g:[0-9]{1,18}$")
+
+
+def _group_filter(groups: Sequence[str] | None) -> set[str] | None:
+    """The validated `groups` argument of build_dedupe (it arrives from JSON)."""
+    if groups is None:
+        return None
+    if isinstance(groups, (str, bytes)) or not isinstance(groups, (list, tuple)) \
+            or len(groups) > _GROUPS_LIMIT \
+            or not all(isinstance(k, str) and _GROUP_KEY.match(k) for k in groups):
+        raise BuildError("groups must be a list of 'g:<number>' group keys", "BAD_PARAM", param="groups")
+    return set(groups)
+
+
+def _groups_missing(conn: sqlite3.Connection, wanted: set[str], min_size: int) -> int:
+    """How many of the requested group keys are no exact duplicate group at all (fewer than two usable copies)."""
+    ids = sorted(int(k[2:]) for k in wanted)
+    found = 0
+    live = identity._live(conn, "e.")
+    for i in range(0, len(ids), 500):
+        part = ids[i:i + 500]
+        found += conn.execute(
+            f"SELECT COUNT(*) FROM (SELECT 1 FROM entries e WHERE {live} AND e.size >= ? "
+            f"AND e.content_group IN ({','.join('?' * len(part))}) GROUP BY e.content_group HAVING COUNT(*) >= 2)",
+            [min_size, *part]).fetchone()[0]
+    return len(ids) - found
 
 
 def _group_overrides(keep: Mapping[str, int] | None, skip_groups: Sequence[str]) -> tuple[dict[str, int], set[str]]:

@@ -35,12 +35,13 @@ ALLOWED_TOOLS = {
     "list_drafts", "get_draft", "create_draft", "browse_tree", "suggest_reorganization", "stage_moves",
     "undo_last", "remove_staged", "preview_draft", "compare_folders", "coverage",
     "free_space_report", "quarantine_report", "quarantine_items", "get_rules", "propose_rules",
+    "explore_contents", "select_contents", "gather_into_draft",
 }
 WRITING_TOOLS = {"propose_plan", "simulate_plan", "create_draft", "stage_moves", "undo_last", "remove_staged",
-                 "preview_draft", "propose_rules"}
+                 "preview_draft", "propose_rules", "gather_into_draft"}
 # Tools whose description must say where staged moves show up and who decides.
 WORKSPACE_TOOLS = {"list_drafts", "get_draft", "create_draft", "suggest_reorganization", "stage_moves",
-                   "undo_last", "remove_staged", "preview_draft"}
+                   "undo_last", "remove_staged", "preview_draft", "gather_into_draft"}
 HUMAN_ONLY = ("approve", "execute", "restore", "purge", "purge_due", "cancel", "scan", "bridge", "rebuild_identity",
               "sync", "start_connect", "finish_connect", "cancel_connect", "test_connection", "disconnect",
               "enable_writes", "reload_config", "list_connections", "setup_status", "activate_rules")
@@ -175,7 +176,8 @@ def test_source_never_references_human_only_service_methods():
                     "preview_layout", "propose_plan", "simulate", "plan", "plans", "release_report",
                     "list_drafts", "get_draft", "create_draft", "list_dir", "tree_roots", "stage_action",
                     "undo_action", "remove_action", "preview_draft", "suggestions", "compare", "coverage",
-                    "quarantine_report", "quarantine_items", "rules_overview", "save_rule_version"}
+                    "quarantine_report", "quarantine_items", "rules_overview", "save_rule_version",
+                    "explore", "select", "gather"}
     for name in NOT_EXPOSED:
         assert not re.search(rf"service\.{name}\b", source), name
 
@@ -216,6 +218,9 @@ def test_human_only_service_methods_are_never_called(fx, server, monkeypatch):
     patch(monkeypatch, fx.service, "rules_overview", {"source": "default", "path": None, "version": None,
                                                       "sha256": "x", "text": "", "error": None, "proposals": []})
     patch(monkeypatch, fx.service, "save_rule_version", {"id": 1, "changes": []})
+    patch(monkeypatch, fx.service, "explore", {"total": 0, "truncated": False, "facets": {}, "results": []})
+    patch(monkeypatch, fx.service, "select", {"total": 0})
+    patch(monkeypatch, fx.service, "gather", {"picked": [], "skipped": {"by_code": {}, "items": []}, "files": 0})
     move = {"items": [{"remote": "gdrive", "path": "Docs"}], "dst": {"remote": "dropbox", "path": ""}}
     args = {"compare_folders": {"left_remote": "gdrive", "left_path": "", "right_remote": "dropbox", "right_path": ""},
             "file_locations": {"entry_id": fx.photo_g}, "validate_rules": {"rules_toml": ""},
@@ -224,7 +229,10 @@ def test_human_only_service_methods_are_never_called(fx, server, monkeypatch):
             "stage_moves": {"draft_id": 1, "moves": [move]}, "undo_last": {"draft_id": 1},
             "remove_staged": {"draft_id": 1, "action_id": 1}, "preview_draft": {"draft_id": 1},
             "free_space_report": {"remote": "gdrive"}, "quarantine_items": {"plan_id": 1},
-            "propose_rules": {"rules_toml": "", "title": "t"}}
+            "propose_rules": {"rules_toml": "", "title": "t"},
+            "select_contents": {"selection": {"keys": ["g:1"]}},
+            "gather_into_draft": {"draft_id": 1, "selection": {"keys": ["g:1"]}, "dst_remote": "gdrive",
+                                  "dst_path": ""}}
     for name in sorted(ALLOWED_TOOLS):
         ok(server, name, **args.get(name, {}))
 
@@ -1458,7 +1466,7 @@ def test_the_quarantine_view_adds_only_its_two_read_tools():
                              "validate_rules", "preview_layout", "propose_plan", "simulate_plan", "get_plan",
                              "list_plans", "list_drafts", "get_draft", "create_draft", "browse_tree",
                              "suggest_reorganization", "stage_moves", "undo_last", "remove_staged", "preview_draft",
-                             "compare_folders", "coverage", "free_space_report"}
+                             "compare_folders", "coverage", "free_space_report", "explore_contents", "select_contents", "gather_into_draft"}
 
 
 # --------------------------------------------------------------------------- free space
@@ -1676,3 +1684,123 @@ def test_the_instructions_tell_claude_to_propose_never_to_claim_activation(serve
     descriptions = {t.name: t.description for t in list_tools(server)}
     assert "rules_version" in descriptions["propose_plan"] and "rules_version" in descriptions["preview_layout"]
     assert "cannot activate" in descriptions["propose_rules"] and "rules activate" in descriptions["propose_rules"]
+
+
+# --------------------------------------------------------------------------- explore by content and gathering
+
+def test_explore_contents_is_read_only_english_and_wrapped(world, wserver):
+    out = ok(wserver, "explore_contents", query="thesis_chapter0")
+    assert out["note"] == UNTRUSTED_NOTE
+    data = out["data"]
+    assert data["total"] == 1 and data["count"] == 1 and data["maybe_more"] is False and data["truncated"] is False
+    r = data["results"][0]
+    assert r["key"].startswith("g:") and r["verified"] is True and r["copies_count"] == 2
+    assert {(c["remote"], c["path"]) for c in r["copies"]} == {
+        ("dropbox", "School/Thesis/thesis_chapter0.docx"), ("gdrive", "Research/thesis-drafts/thesis_chapter0.docx")}
+    assert set(r["copies"][0]) == {"entry_id", "remote", "path", "mtime", "matched"}
+    assert "copies_truncated" not in r
+    tool = {t.name: t for t in list_tools(wserver)}["explore_contents"]
+    assert tool.annotations.read_only_hint is True
+    assert not re.search(r"[^\x00-\x7f]", tool.description)                       # English only
+
+
+def test_explore_contents_filters_cap_and_paging(world, wserver):
+    only = ok(wserver, "explore_contents", only_on=["dropbox"], category="document")["data"]
+    assert only["total"] >= 1 and all(r["remotes"] == ["dropbox"] for r in only["results"])
+    both = ok(wserver, "explore_contents", on=["gdrive", "dropbox"], copies_min=2, sort="name", limit=1)["data"]
+    assert both["count"] == 1 and both["maybe_more"] is True and both["total"] > 1
+    nxt = ok(wserver, "explore_contents", on=["gdrive", "dropbox"], copies_min=2, sort="name", limit=1, offset=1)["data"]
+    assert nxt["results"][0]["key"] != both["results"][0]["key"]
+    big = ok(wserver, "explore_contents", limit=100000)["data"]
+    assert big["count"] <= mcp_server.MAX_EXPLORE
+    assert "sort" in err(wserver, "explore_contents", sort="bogus").lower()
+    assert "nowhere" in err(wserver, "explore_contents", in_remote="nowhere")
+
+
+def test_explore_contents_caps_the_copies_of_a_result(world, wserver):
+    for i in range(14):
+        world.cat.file(world.g, f"Many/m{i}.bin", size=77, sha256="many")
+    identity.rebuild_groups(world.conn)
+    r = ok(wserver, "explore_contents", query="Many/m")["data"]["results"][0]
+    assert r["copies_count"] == 14 and len(r["copies"]) == mcp_server.MAX_COPIES and r["copies_truncated"] is True
+
+
+def test_select_contents_is_read_only(world, wserver):
+    tool = {t.name: t for t in list_tools(wserver)}["select_contents"]
+    assert tool.annotations.read_only_hint is True
+    before = world.conn.total_changes
+    out = ok(wserver, "select_contents", selection={"query": {"q": "thesis_chapter"}})
+    data = out["data"]
+    assert data["total"] == 4 and data["copies"] == 6 and "keys" not in data and out["note"] == UNTRUSTED_NOTE
+    assert world.conn.total_changes == before
+    text = err(wserver, "select_contents", selection={"keys": ["nope"]})
+    assert "BAD_KEY" in text
+    assert "SELECTION_EMPTY" in err(wserver, "select_contents", selection={"query": {"q": "zzzzzzzz"}})
+    assert "SELECTION_CHANGED" in err(wserver, "select_contents",
+                                      selection={"query": {"q": "thesis_chapter"}, "expect_total": 1})
+
+
+def test_gather_into_draft_stages_as_mcp_with_the_reminder(world, wserver, draft):
+    tool = {t.name: t for t in list_tools(wserver)}["gather_into_draft"]
+    assert tool.annotations.read_only_hint is False and tool.annotations.destructive_hint is False
+    text = " ".join(tool.description.split())
+    for word in ("only PROPOSES", "drivemerge plan approve", "ALREADY_THERE", "NOT_ON_TARGET", "NAME_CLASH",
+                 "cannot approve or execute"):
+        assert word in text, word
+    out = ok(wserver, "gather_into_draft", draft_id=draft, selection={"query": {"q": "thesis_chapter"}},
+             dst_remote="gdrive", dst_path="Research", note="chapters")
+    data = out["data"]
+    assert out["note"] == UNTRUSTED_NOTE and "browser workspace" in out["reminder"]
+    assert data["files"] == 2 and data["skipped"]["by_code"] == {"NOT_ON_TARGET": 2}
+    assert data["action"]["created_by"] == "mcp" and data["action"]["note"] == "chapters"
+    actions = workspace.get_draft(world.conn, draft)["actions"]
+    assert len(actions) == 1 and actions[0]["created_by"] == "mcp" and len(actions[0]["items"]) == 2
+    assert not any(k in json.dumps(out) for k in ("approval_code", "digest"))
+
+
+def test_gather_into_draft_dry_run_stages_nothing_and_cross_cloud_is_opt_in(world, wserver, draft):
+    out = ok(wserver, "gather_into_draft", draft_id=draft, selection={"query": {"q": "thesis_chapter"}},
+             dst_remote="gdrive", dst_path="Research", dry_run=True, cross_cloud=True)
+    assert out["data"]["files"] == 4 and out["data"]["cross_cloud"]["files"] == 2 and "reminder" not in out
+    assert "action" not in out["data"]
+    assert workspace.get_draft(world.conn, draft)["actions"] == []
+
+
+def test_gather_into_draft_refusals_are_coded_errors(world, wserver, draft):
+    sel = {"query": {"q": "thesis_chapter0"}}
+    assert "DST_NOT_DIR" in err(wserver, "gather_into_draft", draft_id=draft, selection=sel,
+                                dst_remote="gdrive", dst_path="Nope")
+    assert "NOT_FOUND" in err(wserver, "gather_into_draft", draft_id=999, selection=sel,
+                              dst_remote="gdrive", dst_path="")
+    assert "BAD_KEY" in err(wserver, "gather_into_draft", draft_id=draft, selection={"keys": ["x"]},
+                            dst_remote="gdrive", dst_path="")
+    world.service.discard_draft(draft)
+    assert "NOT_OPEN" in err(wserver, "gather_into_draft", draft_id=draft, selection=sel,
+                             dst_remote="gdrive", dst_path="")
+
+
+def test_gather_into_draft_caps_what_it_lists(world, wserver, draft):
+    for i in range(70):
+        world.cat.file(world.g, f"Bulk/b{i}.bin", size=11 + i)
+    world.cat.dir(world.g, "Into")
+    out = ok(wserver, "gather_into_draft", draft_id=draft, selection={"query": {"q": "Bulk/b"}},
+             dst_remote="gdrive", dst_path="Into", dry_run=True)["data"]
+    assert out["files"] == 70 and len(out["picked"]) == mcp_server.MAX_GATHER_SHOWN and out["picked_total"] == 70
+
+
+def test_propose_plan_describes_the_selection_param_and_accepts_it(world, wserver):
+    text = {t.name: t.description for t in list_tools(wserver)}["propose_plan"]
+    assert "selection" in text and "explore_contents" in text
+    keys = ok(wserver, "select_contents", selection={"query": {"q": "IMG_"}})["data"]
+    assert keys["total"] == 3
+    out = ok(wserver, "propose_plan", kind="dedupe",
+             params={"selection": {"query": {"q": "IMG_"}}, "cross_remote": True})["data"]
+    assert out["plan_id"] and out["stats"]["selection"]["contents"] == 3
+    plan = plans.get_plan(world.conn, out["plan_id"], with_ops=False)
+    assert plan.created_by == "mcp" and len(plan.params["groups"]) == 3 and plan.params["selection"]["query"]
+
+
+def test_the_bulk_tools_add_no_approval_path(wserver):
+    names = {t.name for t in list_tools(wserver)}
+    assert not any(word in n for n in names for word in ("approve", "execute", "purge", "restore"))
+    assert {"explore_contents", "select_contents", "gather_into_draft"} <= names

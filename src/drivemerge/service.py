@@ -13,13 +13,14 @@ Everything returns JSON-serialisable values. Methods are grouped by trust level:
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Sequence
 from datetime import datetime, timezone
 import sqlite3
 import tempfile
 from pathlib import Path
 
 from . import (
-    builders, classify, compare, coverage, db, dirstats, executor, explore, identity, plans, quarantine,
+    builders, classify, compare, coverage, db, dirstats, executor, explore, gather, identity, plans, quarantine,
     rulepreview, rulestore, search, simulate, suggest, workspace,
 )
 from .config import DEFAULT_CONFIG_PATH, Config, load_config, sync_remotes
@@ -62,6 +63,14 @@ def _plain(obj):
 
 class ServiceError(ValueError):
     pass
+
+
+def _listed_params(params: dict) -> dict:
+    """A plan's params for a list: without the rules text, and a long `groups` list reduced to `groups_count`."""
+    out = {k: v for k, v in params.items() if k != "rules"}
+    if isinstance(out.get("groups"), list):
+        out["groups_count"] = len(out.pop("groups"))
+    return out
 
 
 def draft_of(plan: Plan) -> int | None:
@@ -180,9 +189,43 @@ class Service:
                                        param="max_bars")
         return coverage.coverage(self.conn, category=category or None, max_bars=max_bars)
 
-    def explore(self, q: str | None = None, **params) -> dict:
-        """Search results grouped by content with one presence column per cloud (explore.py)."""
-        return explore.explore(self.conn, q, **params)
+    def explore(self, q: str | None = None, *, draft_id: int | None = None, **params) -> dict:
+        """Search results grouped by content with one presence column per cloud (explore.py).
+
+        With `draft_id` each copy the open draft moves carries where the draft puts it (`staged`); an unknown draft
+        is NOT_FOUND, a draft that is not open marks nothing."""
+        locate = None
+        if draft_id is not None:
+            if workspace._draft_row(self.conn, draft_id)["status"] == "open":
+                locate = lambda locs: workspace.locate(self.conn, draft_id, locs)      # noqa: E731
+        return explore.explore(self.conn, q, draft_locate=locate, **params)
+
+    def select(self, selection: dict, *, draft_id: int | None = None, with_keys: bool = False) -> dict:
+        """What a selection of Explore results holds (explore.select), with `staged.copies`, the selected copies the
+        open draft `draft_id` moves, when a draft is given (null otherwise or when it is not open)."""
+        out = explore.select(self.conn, selection, with_keys=True)
+        if draft_id is not None and workspace._draft_row(self.conn, draft_id)["status"] == "open":
+            rows = [r for rs in explore._resolve_keys(self.conn, out["keys"]).values() for r in rs]
+            where = workspace.locate(self.conn, draft_id, [(r["remote_id"], r["path"]) for r in rows])
+            out["staged"] = {"copies": sum(1 for r, w in zip(rows, where) if w != (r["remote_id"], r["path"]))}
+        if not with_keys:
+            del out["keys"]
+        return out
+
+    def gather(self, draft_id: int, selection: dict, dst: dict, *, cross_cloud: bool = False,
+               prefer_remotes: Sequence[str] = (), dry_run: bool = False, note: str | None = None,
+               created_by: str) -> dict:
+        """Gather one copy of each selected content into the folder `dst` of the open draft (gather.py): a dry run
+        answers what would move and what is skipped; otherwise one move action is staged. Never writes a cloud."""
+        workspace._open_draft(self.conn, draft_id)
+        picked = explore.select(self.conn, selection, with_keys=True)
+        args = dict(cross_cloud=cross_cloud, prefer_remotes=prefer_remotes)
+        if dry_run:
+            out = gather.plan_gather(self.conn, draft_id, picked["keys"], dst, **args)
+            out.pop("items")
+        else:
+            out = gather.gather(self.conn, draft_id, picked["keys"], dst, note=note, created_by=created_by, **args)
+        return {**out, "selection": {"total": picked["total"], "gone": picked["gone"]}}
 
     def ruleset(self, rules_text: str | None = None, *, rules_version: int | None = None) -> classify.RuleSet:
         """The rules to use: version `rules_version` (any status), else `rules_text`, else the active rules
@@ -478,8 +521,19 @@ class Service:
         quarantine = {"quarantine_dir": self.config.safety.quarantine_dir}
         if kind in RULES_KINDS:
             ruleset, rules_text, ref = self._resolve_rules(rules_text, rules_version)
+        selected = None
+        if kind == "dedupe" and "selection" in params:
+            if "groups" in params:
+                raise builders.BuildError("a dedupe takes a selection or groups, not both", "BAD_PARAM",
+                                          param="selection")
+            selected = explore.select(self.conn, params["selection"], with_keys=True)
+            params["groups"] = [k for k in selected["keys"] if k[0] == "g"]
         if kind == "dedupe":
-            result = builders.build_dedupe(self.conn, **{**quarantine, **params})
+            build = {k: v for k, v in params.items() if k != "selection"}
+            result = builders.build_dedupe(self.conn, **{**quarantine, **build})
+            if selected is not None:
+                result.stats["selection"] = {k: selected[k] for k in ("total", "grouped", "ungrouped", "gone")}
+                result.stats["selection"]["contents"] = result.stats["selection"].pop("total")
         elif kind == "consolidate":
             result = builders.build_consolidate(self.conn, ruleset=ruleset, **{**quarantine, **params})
         elif kind == "reorganize":
@@ -630,7 +684,7 @@ class Service:
                 "problems": 0 if sim is None else sim.violations_total,
                 # The rules text can be tens of KB per plan; a list carries `rules_ref` (where it came from) and the
                 # full plan (`plan`, the review) carries the text.
-                "params": scrub_secrets({k: v for k, v in p.params.items() if k != "rules"}), "draft_id": draft_of(p),
+                "params": scrub_secrets(_listed_params(p.params)), "draft_id": draft_of(p),
                 "outdated": p.status in ("draft", "simulated", "approved") and p.snapshot is not None
                             and p.snapshot != current,
             })

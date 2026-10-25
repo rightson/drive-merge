@@ -38,7 +38,7 @@ import re
 import sqlite3
 import unicodedata
 from dataclasses import asdict, dataclass
-from typing import Any, Collection, Iterator, NamedTuple
+from typing import Any, Collection, Iterator, NamedTuple, Sequence
 
 from . import builders, db, identity, plans, simulate
 from .models import Op
@@ -864,6 +864,18 @@ def _space_for(cat: _Cat, acts: list[_Act]) -> _Space:
         if a.state == "active":
             space.apply(a)
     return space
+
+
+def locate(conn: sqlite3.Connection, draft_id: int, locs: Sequence[tuple[int, str]]) -> list[tuple[int, str]]:
+    """Where the draft's active steps put catalog locations (remote id, path): the after-view location of each.
+
+    A location no step touches is returned unchanged. The draft may be in any status. Read-only.
+    """
+    _draft_row(conn, draft_id)
+    space = _space_for(_Cat(conn), _acts(conn, draft_id, "active"))
+    if not space.moves:
+        return [(r, p) for r, p in locs]
+    return [space.fwd(r, p) for r, p in locs]
 
 
 def _action_dict(a: _Act, rem: dict[int, _Remote], stale: dict | None = None) -> dict:

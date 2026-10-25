@@ -2268,3 +2268,44 @@ def test_refusals_carry_params(world):
         ws.remove_action(conn, new_draft(conn), 7)
     assert e.value.code == "NOT_FOUND" and set(e.value.params) == {"draft", "action"}
     assert WorkspaceError("X", "message").params == {}
+
+
+# ----------------------------------------------------------------- locate (docs/BULK.md §D)
+
+
+def test_locate_gives_the_after_view_location_and_writes_nothing(world):
+    conn, cat, g, x = world
+    a = put(cat, g, "A/f.txt")
+    put(cat, g, "B/keep.txt")
+    cat.dir(x, "Inbox")
+    d = new_draft(conn)
+    where = [(g, "A/f.txt"), (g, "B/keep.txt"), (g, "A"), (x, "Inbox")]
+    assert ws.locate(conn, d, where) == where                                  # an empty draft moves nothing
+    mv(conn, d, "gdrive:A/f.txt", "dropbox:Inbox")
+    mv(conn, d, "gdrive:B", "gdrive:A")
+    before = conn.total_changes
+    assert ws.locate(conn, d, where + [(g, "B/deep/none.txt")]) == [
+        (x, "Inbox/f.txt"), (g, "A/B/keep.txt"), (g, "A"), (x, "Inbox"), (g, "A/B/deep/none.txt")]
+    assert ws.locate(conn, d, []) == []
+    assert conn.total_changes == before
+    assert a
+
+
+def test_locate_ignores_undone_steps_and_works_on_any_status(world):
+    conn, cat, g, x = world
+    put(cat, g, "A/f.txt")
+    cat.dir(x, "Inbox")
+    d = new_draft(conn)
+    mv(conn, d, "gdrive:A/f.txt", "dropbox:Inbox")
+    ws.undo(conn, d)
+    assert ws.locate(conn, d, [(g, "A/f.txt")]) == [(g, "A/f.txt")]
+    ws.redo(conn, d)
+    ws.discard_draft(conn, d)
+    assert ws.locate(conn, d, [(g, "A/f.txt")]) == [(x, "Inbox/f.txt")]
+
+
+def test_locate_of_an_unknown_draft_is_not_found(world):
+    conn, *_ = world
+    with pytest.raises(WorkspaceError) as e:
+        ws.locate(conn, 99, [])
+    assert e.value.code == "NOT_FOUND"

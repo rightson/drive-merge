@@ -148,6 +148,15 @@ class RestoreBody(_Body):
     op_ids: list[int] | None = Field(default=None, max_length=5000)   # only these quarantined items
 
 
+class GatherBody(_Body):
+    selection: dict[str, Any]
+    dst: dict[str, Any]
+    cross_cloud: bool = False
+    prefer_remotes: list[str] = Field(default_factory=list)
+    dry_run: bool = False
+    note: str | None = Field(default=None, max_length=500)
+
+
 class PurgeDueBody(_Body):
     confirm: str = ""
     remote: str | None = None             # only the items on this cloud
@@ -608,6 +617,17 @@ def create_ui_app(service: Service, *, config: Config, api_token: str, ui_token:
         with lock:
             return workspace.add_action(service.conn, draft_id, action,
                                         created_by="ui" if auth.session else "api")
+
+    @router.post("/v1/drafts/{draft_id}/gather")
+    def gather(draft_id: int, body: GatherBody, response: Response, auth: _Auth = Depends(require_auth)) -> dict:
+        """Stage one move of one copy of each selected content into a folder of the open draft (or, with `dry_run`,
+        say what would move and what is skipped). A proposal like any drag: nothing here writes a cloud."""
+        with lock:
+            result = service.gather(draft_id, body.selection, body.dst, cross_cloud=body.cross_cloud,
+                                    prefer_remotes=body.prefer_remotes, dry_run=body.dry_run, note=body.note,
+                                    created_by="ui" if auth.session else "api")
+        response.status_code = 200 if body.dry_run else 201
+        return result
 
     @router.post("/v1/drafts/{draft_id}/undo")
     def undo(draft_id: int) -> dict:

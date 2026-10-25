@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from . import __version__, builders, classify, connections, plans, quarantine, rulestore
+from . import __version__, builders, classify, connections, plans, quarantine, rulestore, workspace
 from .compare import CompareError
 from .config import Config
 from .quota import QUOTA_FAIL_TTL, QUOTA_TTL, QuotaCache  # noqa: F401 - re-exported
@@ -100,6 +100,12 @@ class QuarantineCheckBody(_Body):
     action: str
     op_ids: list[int] | None = Field(default=None, max_length=5000)
     older_than_days: int = Field(default=0, le=36500)
+
+
+class SelectionBody(_Body):
+    selection: dict[str, Any]
+    draft: int | None = None
+    with_keys: bool = False
 
 
 class EstimateBody(_Body):
@@ -191,11 +197,17 @@ def install_error_handlers(app: FastAPI, *, coded: bool = False) -> None:
         status = 404 if exc.code == "NOT_FOUND" else 400 if exc.code in ("BAD_OPS", "BAD_QUERY") else 409
         return _error(status, _message(exc), code=exc.code, params=exc.params)
 
+    def workspace_error(_: Request, exc: workspace.WorkspaceError) -> JSONResponse:
+        # Always coded: a draft refusal (an unknown draft behind `explore?draft=`) is the same fact everywhere.
+        status = 404 if exc.code == "NOT_FOUND" else 400 if exc.code == "BAD_REQUEST" else 409
+        return _error(status, str(exc), code=exc.code, params=exc.params)
+
     app.add_exception_handler(StarletteHTTPException, http_error)
     for exc_type in (ValueError, ServiceError):  # ServiceError subclasses ValueError
         app.add_exception_handler(exc_type, bad_request)
     app.add_exception_handler(builders.BuildError, build_error)
     app.add_exception_handler(CompareError, compare_error)
+    app.add_exception_handler(workspace.WorkspaceError, workspace_error)
     app.add_exception_handler(connections.ConnectError, connect_error)
     app.add_exception_handler(plans.PlanError, plan_error)
     app.add_exception_handler(quarantine.QuarantineError, quarantine_error)
@@ -291,14 +303,21 @@ def build_router(service: Service, lock: threading.Lock, *, dependencies: list[A
                 modified_before: str | None = None, path_prefix: str | None = None,
                 on: str | None = None, not_on: str | None = None, only_on: str | None = None,
                 copies_min: int | None = None, copies_max: int | None = None, sort: str = "relevance",
-                limit: int = 50, offset: int = 0) -> dict:
+                limit: int = 50, offset: int = 0, draft: int | None = None) -> dict:
         with lock:
             return service.explore(
                 q, in_remote=in_ or None, category=category or None, ext=ext or None, min_size=min_size,
                 max_size=max_size, modified_after=modified_after or None, modified_before=modified_before or None,
                 path_prefix=path_prefix or None, on=_csv(on), not_on=_csv(not_on),
                 only_on=_csv(only_on) if only_on else None, copies_min=copies_min, copies_max=copies_max,
-                sort=sort, limit=limit, offset=offset)
+                sort=sort, limit=limit, offset=offset, draft_id=draft)
+
+    @api.post("/v1/explore/selection")
+    def explore_selection(body: SelectionBody) -> dict:
+        """What a selection of Explore results holds: contents, copies, bytes, per cloud, the redundant copies and,
+        with `draft`, how many selected copies that open draft moves. Read-only."""
+        with lock:
+            return service.select(body.selection, draft_id=body.draft, with_keys=body.with_keys)
 
     @api.get("/v1/entries/{entry_id}")
     def get_entry(entry_id: int) -> dict:

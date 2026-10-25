@@ -500,6 +500,91 @@ def test_dedupe_errors(w):
         build_dedupe(w.conn, prefer_remotes=["nope"])
 
 
+# ----------------------------------------------------------------------------- dedupe over `groups`
+
+def _group_key(w, content):
+    return f"g:{w.groups[content]}"
+
+
+@pytest.fixture
+def several(w):
+    for i, tag in enumerate("ABCD"):
+        w.put("gdrive", f"keep/{tag}.bin", tag, size=100 + i)
+        w.put("gdrive", f"copies/{tag} (1).bin", tag, size=100 + i)
+        w.put("dropbox", f"d/{tag}.bin", tag, size=100 + i)
+    return w
+
+
+def test_groups_restricts_to_exactly_those_groups(several):
+    w = several
+    full = build_dedupe(w.conn)
+    some = build_dedupe(w.conn, groups=[_group_key(w, "A"), _group_key(w, "C")])
+    assert some.stats["groups"] == 2 and some.stats["groups_examined"] == 2
+    assert {o.src_path for o in some.ops} == {"copies/A (1).bin", "copies/C (1).bin"}
+    mine = {x.src_path for x in some.ops}
+    assert sorted((o.src_path, o.witness_path) for o in some.ops) == sorted(
+        (o.src_path, o.witness_path) for o in full.ops if o.src_path in mine)       # the same choices, fewer groups
+    run(w, some)
+
+
+def test_groups_keeps_every_other_parameter(several):
+    w = several
+    keys = [_group_key(w, t) for t in "ABCD"]
+    assert len(build_dedupe(w.conn, cross_remote=True, groups=keys).ops) == 8
+    assert len(build_dedupe(w.conn, cross_remote=True, groups=keys[:1]).ops) == 2
+    only = build_dedupe(w.conn, remote="dropbox", groups=keys)             # dropbox has one copy per group: no pool
+    assert only.ops == []
+    assert len(build_dedupe(w.conn, remote="gdrive", groups=keys, limit_groups=2).ops) == 2
+    assert len(build_dedupe(w.conn, remote="gdrive", groups=keys, path_prefix="copies/A").ops) == 0
+    assert {o.src_path for o in build_dedupe(w.conn, groups=keys, path_prefix="copies").ops} == {
+        f"copies/{t} (1).bin" for t in "ABCD"}
+    assert build_dedupe(w.conn, groups=keys, min_size=102).stats["groups_examined"] == 2
+    forced = build_dedupe(w.conn, groups=keys[:1], keep={keys[0]: w.conn.execute(
+        "SELECT id FROM entries WHERE path = 'copies/A (1).bin'").fetchone()[0]})
+    assert [o.src_path for o in forced.ops] == ["keep/A.bin"]
+    skipped = build_dedupe(w.conn, groups=keys, skip_groups=[keys[1]])
+    assert skipped.stats["groups"] == 3
+
+
+def test_groups_empty_list_builds_nothing_and_none_is_unchanged(several):
+    w = several
+    assert build_dedupe(w.conn, groups=[]).ops == []
+    a, b = build_dedupe(w.conn), build_dedupe(w.conn, groups=None)
+    assert (a.ops, a.skipped, a.stats) == (b.ops, b.skipped, b.stats)
+    assert "groups_missing" not in a.stats
+
+
+def test_groups_missing_counts_keys_that_are_no_group(several):
+    w = several
+    single = w.put("gdrive", "solo.bin", "S")                                # one copy: not a duplicate group
+    r = build_dedupe(w.conn, groups=[_group_key(w, "A"), "g:424242", _group_key(w, "S"), "g:424243"])
+    assert r.stats["groups_missing"] == 3 and r.stats["groups"] == 1
+    assert build_dedupe(w.conn, groups=[_group_key(w, "A")]).stats["groups_missing"] == 0
+    assert single
+
+
+@pytest.mark.parametrize("bad", ["g:1", "x", ["e:5"], ["g:x"], ["g:"], [5], [None], "g:1,g:2", {"g:1": 1},
+                                 [f"g:{i}" for i in range(1, 5002)]])
+def test_groups_must_be_a_list_of_group_keys(w, bad):
+    with pytest.raises(BuildError) as e:
+        build_dedupe(w.conn, groups=bad)
+    assert e.value.code == "BAD_PARAM" and e.value.params == {"param": "groups"}
+
+
+def test_keep_and_skip_outside_groups_are_bad_group(several):
+    w = several
+    a, b = _group_key(w, "A"), _group_key(w, "B")
+    with pytest.raises(BuildError) as e:
+        build_dedupe(w.conn, groups=[a], skip_groups=[b])
+    assert (e.value.code, e.value.params) == ("BAD_GROUP", {"group": b})
+    with pytest.raises(BuildError) as e:
+        build_dedupe(w.conn, groups=[a], keep={b: 1})
+    assert e.value.code in ("BAD_GROUP", "BAD_KEEPER")
+    with pytest.raises(BuildError) as e:
+        build_dedupe(w.conn, groups=[a], skip_groups=["g:424242"])
+    assert e.value.code == "BAD_GROUP"
+
+
 # =============================================================================
 # consolidate
 # =============================================================================

@@ -34,6 +34,7 @@ from mcp_types import ToolAnnotations
 from .builders import BuildError
 from .classify import RuleError
 from .compare import CompareError
+from .explore import SelectionError
 from .config import load_config
 from .plans import PlanError
 from .quarantine import QuarantineError
@@ -103,6 +104,11 @@ claim that proposed rules are active. get_rules shows the rules in force and the
 - Plans use the active rules unless you pass rules_version (a proposal's id) to preview_layout or propose_plan; \
 the plan's review then shows that it was built with rules that are not the active ones.
 
+Explore by content: explore_contents lists what a query finds as contents with all their copies (one row per \
+content); select_contents says what a selection of them holds. gather_into_draft stages one move of one copy of each \
+selected content into a folder of an open draft (it only proposes, like stage_moves); for a dedupe of exactly those \
+contents pass params.selection to propose_plan.
+
 Workspace drafts (the user's drag-and-drop browser workspace):
 - stage_moves puts proposed moves into a draft. They show up in the user's browser at once, marked "proposed by \
 Claude", and nothing changes in any cloud. Call list_drafts first and stage into the draft the user already has \
@@ -146,6 +152,8 @@ MAX_ORIGINS = 5
 MAX_COMPARE_ROWS = 300
 MAX_SUGGESTIONS = 50
 MAX_MOVES = 50
+MAX_EXPLORE = 100
+MAX_GATHER_SHOWN = 50
 MAX_MOVE_ITEMS = 200
 MAX_NOTE = 200
 MAX_CHANGES = 50
@@ -161,7 +169,7 @@ _HIDDEN_KEYS = ("digest", "approval_code", "snapshot")
 _DRAFT_CODES = ("NOT_FOUND", "NOT_OPEN")
 
 # Errors the model can act on; anything else is reported by the SDK as a generic failure.
-_USER_ERRORS = (ValueError, KeyError, PlanError, RulesError, sqlite3.Error)
+_USER_ERRORS = (ValueError, KeyError, PlanError, RulesError, SelectionError, sqlite3.Error)
 
 
 def _clamp(value: int, lo: int, hi: int) -> int:
@@ -181,7 +189,7 @@ def _pick(row: dict, keys: tuple[str, ...]) -> dict:
 
 
 def _error_message(exc: Exception) -> str:
-    if isinstance(exc, (WorkspaceError, CompareError, BuildError, QuarantineError, RulesError, RuleError)):
+    if isinstance(exc, (WorkspaceError, CompareError, SelectionError, BuildError, QuarantineError, RulesError, RuleError)):
         text = f"{exc.code}: {exc}"
     elif isinstance(exc, sqlite3.Error):
         text = f"catalog database error (try again if a scan or execution is running): {exc}"
@@ -411,6 +419,70 @@ def build_server(service: Service) -> MCPServer:
         return _wrap({"count": len(rows), "maybe_more": len(rows) >= limit, "files": [_file(r) for r in rows]})
 
     @tool()
+    def explore_contents(query: str = "", in_remote: str | None = None, on: list[str] | None = None,
+                         not_on: list[str] | None = None, only_on: list[str] | None = None,
+                         copies_min: int | None = None, copies_max: int | None = None,
+                         category: str | None = None, ext: str | None = None, min_size: int | None = None,
+                         max_size: int | None = None, modified_after: str | None = None,
+                         modified_before: str | None = None, path_prefix: str | None = None,
+                         sort: Literal["relevance", "size", "mtime", "name", "copies"] = "relevance",
+                         limit: int = 25, offset: int = 0) -> dict:
+        """Search live files and answer one row per CONTENT with all its copies on every cloud (hash-proven
+        identical files are one content; a file without proof is its own content). Read-only.
+
+        Args:
+            query: words to find in the file name or path; empty means filters only.
+            in_remote: only hits on this cloud (the other copies of a matching content are still listed).
+            on: clouds that must all hold a copy. not_on: clouds that must hold none. only_on: exactly these clouds.
+            copies_min, copies_max: bounds on the number of live copies of the content.
+            category, ext, min_size, max_size, modified_after, modified_before, path_prefix: as search_files
+                (dates as ISO text, modified_after inclusive, modified_before exclusive).
+            sort: relevance, size, mtime, name or copies. limit: contents per page, default 25, at most 100.
+            offset: contents to skip.
+        Each result: key (use it in a selection: {"keys": [...]}), name, size, category, ext, mtime, verified
+        (true when the copies are hash-proven identical), remotes, copies_count and copies (at most 10, each with
+        entry_id, remote, path, mtime and matched; copies_truncated=true when there are more). Also total (matching
+        contents), truncated (the query matched too many files; narrow it) and facets.
+        """
+        limit = _clamp(limit, 1, MAX_EXPLORE)
+        offset = max(int(offset), 0)
+        found = service.explore(
+            query or None, in_remote=in_remote or None, category=category or None, ext=ext or None,
+            min_size=min_size, max_size=max_size, modified_after=modified_after or None,
+            modified_before=modified_before or None, path_prefix=path_prefix or None, on=on or [],
+            not_on=not_on or [], only_on=only_on or None, copies_min=copies_min, copies_max=copies_max,
+            sort=sort, limit=limit, offset=offset)
+        results = []
+        for r in found["results"]:
+            copies = r["copies"]
+            row = {**r, "copies": [_pick(c, ("entry_id", "remote", "path", "mtime")) | {"matched": c["matched"]}
+                                   for c in copies[:MAX_COPIES]]}
+            if len(copies) > MAX_COPIES:
+                row["copies_truncated"] = True
+            results.append(row)
+        return _wrap({"total": found["total"], "truncated": found["truncated"], "count": len(results),
+                      "maybe_more": offset + len(results) < found["total"], "facets": found["facets"],
+                      "results": results})
+
+    @tool()
+    def select_contents(selection: dict[str, Any]) -> dict:
+        """What a selection of explore_contents results holds, before you act on it. Read-only.
+
+        Args:
+            selection: either {"keys": ["g:7", "e:31"]} (the `key` of results; at most 500) or
+                {"query": {"q": ..., "in": ..., "category": ..., "ext": ..., "min_size": ..., "max_size": ...,
+                "modified_after": ..., "modified_before": ..., "path_prefix": ..., "on": [...], "not_on": [...],
+                "only_on": [...], "copies_min": ..., "copies_max": ...}, "except": [keys], "expect_total": n}
+                for every content the query matches (at most 5,000; `except` at most 500 keys; `expect_total` makes
+                the call fail with SELECTION_CHANGED when the catalog no longer holds n contents).
+        Returns total (contents), grouped, ungrouped, gone (keys with no live copy), copies, bytes (each content
+        once), by_remote (contents, copies, bytes per cloud) and redundant (copies and bytes beyond the first of
+        each content). Refusals carry a code: BAD_SELECTION, BAD_KEY, TOO_MANY_KEYS, SELECTION_EMPTY,
+        SELECTION_TOO_LARGE, SELECTION_TRUNCATED, SELECTION_CHANGED.
+        """
+        return _wrap(service.select(selection, with_keys=False))
+
+    @tool()
     def file_locations(entry_id: int) -> dict:
         """Every cloud location that holds exactly the same content as this file (hash-proven, itself included).
 
@@ -613,7 +685,9 @@ def build_server(service: Service) -> MCPServer:
 
         kind and params (remotes are catalog remote names; paths are relative to the remote root):
         - dedupe: remove redundant exact copies, always keeping one. params: remote, cross_remote, path_prefix,
-          min_size (bytes), prefer_remotes (remotes whose copy is kept first).
+          min_size (bytes), prefer_remotes (remotes whose copy is kept first), selection (only the contents of an
+          explore_contents selection, as for select_contents; the other params still restrict the plan, and the
+          result's stats.selection says what it covered).
         - consolidate: gather everything onto one remote in the rule-based layout. params: target (remote name),
           target_root (folder on the target), sources (remotes to take from), delete_sources (default false:
           copy only), reorganize_target (also move files already on the target into the layout), path_prefix,
@@ -896,6 +970,47 @@ def build_server(service: Service) -> MCPServer:
         except (WorkspaceError, sqlite3.Error):
             pass                               # the moves are staged; a missing summary must not hide that
         return _workspace(data, reminder=WORKSPACE_STEPS)
+
+    @tool(writes=True)
+    def gather_into_draft(draft_id: int, selection: dict[str, Any], dst_remote: str, dst_path: str,
+                          cross_cloud: bool = False, dry_run: bool = False, note: str | None = None) -> dict:
+        """Gather one copy of each selected content into ONE folder of a draft of the user's browser workspace, as a
+        single staged move (one undo step), marked as proposed by Claude. This only PROPOSES: nothing changes in any
+        cloud until the human previews, approves and executes in the browser workspace, or approves the previewed
+        plan with `drivemerge plan approve <id>` and `drivemerge plan execute <id>` in their own terminal. You cannot
+        approve or execute, so never say the gather happened.
+
+        Per content it moves the copy that is already on the destination cloud (the keeper policy picks among
+        several) and never touches the other copies. With cross_cloud=true a content with no copy there is moved
+        over from another cloud (copied through this machine, the original then quarantined). Files land directly in
+        the folder; names are never changed, so a clashing name is skipped.
+
+        Args:
+            draft_id: an open draft (list_drafts, create_draft).
+            selection: as for select_contents ({"keys": [...]} or {"query": {...}, "except": [...], "expect_total": n}).
+            dst_remote, dst_path: the existing folder in the draft's after view ("" path = remote root); make a new
+                one with stage_moves {"kind": "mkdir", ...} first.
+            cross_cloud: also bring contents that have no copy on dst_remote (default false).
+            dry_run: only report what would move and what is skipped; stage nothing.
+            note: short reason the user will see.
+        Returns contents, files, bytes, cross_cloud {files, bytes}, picked (from, to, size), skipped {by_code, items}
+        with a code per skipped content: ALREADY_THERE (a copy is already in the folder), NAME_TAKEN, NAME_CLASH
+        (two contents with one name), NOT_ON_TARGET (no copy on that cloud), READ_ONLY, NATIVE_DOC, AMBIGUOUS_PATH,
+        GONE; unless dry_run also action, draft_version and warnings (CROSS_REMOTE, READ_ONLY, CASE_COLLISION).
+        Tell the human about every warning and skip. Refusals carry a code: NOT_FOUND, NOT_OPEN, DST_NOT_DIR,
+        QUARANTINE, NOTHING_TO_GATHER, GATHER_TOO_MANY or a selection code.
+        """
+        data = service.gather(draft_id, selection, {"remote": dst_remote, "path": dst_path}, cross_cloud=cross_cloud,
+                              dry_run=dry_run, note=note[:MAX_NOTE] if note else None, created_by="mcp")
+        picked, skipped = data["picked"], data["skipped"]["items"]
+        if len(picked) > MAX_GATHER_SHOWN:
+            data["picked"], data["picked_total"] = picked[:MAX_GATHER_SHOWN], data["files"]
+        if len(skipped) > MAX_GATHER_SHOWN:
+            data["skipped_total"] = sum(data["skipped"]["by_code"].values())
+            data["skipped"] = {**data["skipped"], "items": skipped[:MAX_GATHER_SHOWN]}
+        if "action" in data:
+            data["action"] = _draft_action(data["action"])
+        return _workspace(data, **({} if dry_run else {"reminder": WORKSPACE_STEPS}))
 
     @tool(writes=True)
     def undo_last(draft_id: int) -> dict:

@@ -549,6 +549,15 @@ def test_plan_consolidate_requires_target(run):
     assert rc == 2 and "--target" in err
 
 
+def test_plan_dedupe_group_is_repeatable_and_passed_as_groups(env, run, monkeypatch):
+    calls = record(monkeypatch, "propose_plan", proposed())
+    rc, _, _ = run("plan", "dedupe", "--group", "g:7", "--group", "g:31", "--remote", "alpha")
+    assert rc == 0
+    assert calls[0][0] == ("dedupe", {"remote": "alpha", "cross_remote": False, "groups": ["g:7", "g:31"]})
+    run("plan", "dedupe")
+    assert "groups" not in calls[1][0][1]                      # without --group the build is unchanged
+
+
 def test_plan_dedupe_reorganize_and_manual_mapping(env, run, monkeypatch):
     calls = record(monkeypatch, "propose_plan", proposed())
     run("plan", "dedupe", "--remote", "alpha", "--cross-remote", "--prefix", "Docs", "--min-size", "1M",

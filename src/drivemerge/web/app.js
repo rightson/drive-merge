@@ -232,6 +232,26 @@ function App() {
     }
   });
 
+  /**
+   * Gather the Explore selection into a folder of the open draft (docs/BULK.md section 4): one `move` step, in the
+   * same queue as a drag. Answers {result} when staged, {error} when the server refused (the dialog words it).
+   */
+  const stageGather = (body) => enqueue(async () => {
+    if (!draftRef.current) return { error: null };
+    const dst = body.dst;
+    try {
+      const r = await api.gather(draftRef.current.id, { ...body, dry_run: undefined });
+      showWarnings(r.warnings, dst);
+      await syncDraft();
+      toast('success', t('gather.staged', { n: r.files, dst: `${dst.remote}:${dst.path}` }),
+        { label: t('gather.openWorkspace'), run: () => navigate('#/workspace') });
+      return { result: r };
+    } catch (e) {
+      if (e.code === 'NOT_OPEN') await replaceDraft(t('draft.closed'));
+      return { error: e };
+    }
+  });
+
   const stageMany = (actions) => enqueue(async () => {
     let staged = 0;
     for (const a of actions) {
@@ -584,7 +604,7 @@ function App() {
   const sum = draft.summary || {};
   const ctx = {
     config, draft, toast, confirm: confirmDialog, prompt: promptDialog, reveal,
-    stageMove, stageMkdir, stageMany, rename: renameItem, afterExecution, resolveClash,
+    stageMove, stageMkdir, stageMany, stageGather, rename: renameItem, afterExecution, resolveClash,
     outdated, markOutdated, catalogRefreshed,
     setup, refreshSetup, sync, syncEpoch,
     plans: plansState, refreshPlans, openWorkspacePreview,

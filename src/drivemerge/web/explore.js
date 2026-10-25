@@ -15,6 +15,8 @@ import {
 import {
   errorText, fmtBytes, fmtDay, fmtNum, parentOf,
 } from './util.js';
+import { PICK_LIMIT, recall, remember } from './selection.js';
+import { GatherDialog } from './gather.js';
 
 const PAGE = 50;
 const DEBOUNCE_MS = 250;
@@ -85,7 +87,9 @@ function Copies({ r, remotes, onReveal, onCompare, onDedupe, onRules }) {
     ${r.copies.map((c) => html`<div class=${'ex-copy' + (c.matched ? '' : ' unmatched')} role="row" key=${c.entry_id} data-testid="ex-copy" data-matched=${c.matched ? 'true' : 'false'}>
       <span class="ex-copy-path" role="cell"><${CloudDot} remotes=${remotes} name=${c.remote} size=${8} />
         <span class="mono" title=${`${c.remote}:${c.path}`}>${c.remote}:${c.path}</span>
-        ${!c.matched && html`<span class="badge badge-nomatch" title=${t('ex.noMatchTip')}>${t('ex.noMatch')}</span>`}</span>
+        ${!c.matched && html`<span class="badge badge-nomatch" title=${t('ex.noMatchTip')}>${t('ex.noMatch')}</span>`}
+        ${c.staged && html`<span class="ex-staged" data-testid="ex-staged" title=${t('sel.stagedTip')}>
+          <${Icon} name="arrow" size=${12} /> ${t('sel.stagedTo', { where: `${c.staged.remote}:${c.staged.path}` })}</span>`}</span>
       <span class="ex-copy-mtime muted" role="cell">${fmtDay(c.mtime)}</span>
       <span class="ex-copy-actions"><button class="btn btn-tiny" data-testid="ex-reveal" onClick=${() => onReveal({ remote: c.remote, path: c.path })}>
         <${Icon} name="jump" size=${12} /> ${t('ex.reveal')}</button>
@@ -95,24 +99,62 @@ function Copies({ r, remotes, onReveal, onCompare, onDedupe, onRules }) {
   </div>`;
 }
 
-function ResultRow({ r, remotes, open, onToggle, onReveal, onCompare, onDedupe, onRules }) {
+function ResultRow({ r, remotes, open, selected, onSelect, onToggle, onReveal, onCompare, onDedupe, onRules }) {
   const counts = {};
   r.copies.forEach((c) => { counts[c.remote] = (counts[c.remote] || 0) + 1; });
   const cat = iconFor({ is_dir: false, category: r.category });
-  return html`<div class=${'ex-result' + (open ? ' open' : '')} role="rowgroup" data-testid="ex-result" data-key=${r.key}>
+  return html`<div class=${'ex-result' + (open ? ' open' : '') + (selected ? ' picked' : '')} role="rowgroup" data-testid="ex-result" data-key=${r.key}
+    data-selected=${selected ? 'true' : 'false'}>
     <div class="ex-row" role="row">
+      <span class="ex-pick" role="cell"><input type="checkbox" checked=${selected} data-testid=${'ex-select-' + r.key}
+        aria-label=${t('sel.pick', { name: r.name })} onChange=${(e) => onSelect(r.key, e.target.checked)} /></span>
       <span class="ex-name" role="cell">
         <button class="twisty-btn" aria-expanded=${open} aria-label=${t(open ? 'ex.collapse' : 'ex.expand', { name: r.name })}
           data-testid="ex-expand" onClick=${onToggle}><${Icon} name="chevron" size=${12} class=${open ? 'turned' : ''} /></button>
         <${Icon} name=${cat} size=${16} class=${'cat-' + (r.category || 'other')} />
         <span class="ex-title" title=${r.name}>${r.name}</span>
         ${r.copies_count > 1 && html`<span class="ex-copies-count" title=${t('ex.copiesTip')}>${t('ex.copiesN', { n: r.copies_count })}</span>`}
+        ${r.staged > 0 && html`<span class="badge badge-staged" data-testid="ex-staged-badge" title=${t('sel.stagedBadgeTip', { n: r.staged })}>${t('sel.staged')}</span>`}
       </span>
       <${PresenceCells} remotes=${remotes} counts=${counts} verified=${r.verified !== false} />
       <span class="ex-size num" role="cell">${fmtBytes(r.size)}</span>
       <span class="ex-mtime muted" role="cell">${fmtDay(r.mtime)}</span>
     </div>
     ${open && html`<${Copies} r=${r} remotes=${remotes} onReveal=${onReveal} onCompare=${onCompare} onDedupe=${onDedupe} onRules=${onRules} />`}
+  </div>`;
+}
+
+/** The selection bar (docs/BULK.md section 3): what the selection holds, from the server, and what to do with it. */
+function SelectionBar({ bar, remotes, count, onGather, onDedupe, onClear, onUseCurrent }) {
+  const d = bar.data;
+  const redundant = d ? d.redundant.copies : 0;
+  const err = bar.error;
+  return html`<div class=${'sel-bar' + (bar.loading ? ' busy' : '')} role="region" aria-label=${t('sel.bar')} data-testid="ex-selection-bar">
+    <div class="sel-stats">
+      <strong data-testid="ex-sel-count">${t('sel.count', { n: fmtNum(d ? d.total : count) })}</strong>
+      ${d && html`<span class="sel-dot" aria-hidden="true">·</span>
+        <span data-testid="ex-sel-copies">${t('sel.copies', { n: fmtNum(d.copies) })}</span><span class="sel-dot" aria-hidden="true">·</span>
+        <span data-testid="ex-sel-bytes" class="num">${fmtBytes(d.bytes)}</span>
+        <span class="sel-remotes">${d.by_remote.filter((r) => r.contents > 0).map((r) => html`<span key=${r.remote} class="sel-remote"
+          data-testid=${'ex-sel-remote-' + r.remote} title=${t('sel.remoteTip', { cloud: r.remote, n: fmtNum(r.contents), copies: fmtNum(r.copies), bytes: fmtBytes(r.bytes) })}>
+          <${CloudDot} remotes=${remotes} name=${r.remote} size=${8} />${r.remote} ${fmtNum(r.contents)}</span>`)}</span>
+        ${redundant > 0 && html`<span class="muted" data-testid="ex-sel-redundant" title=${t('sel.redundantTip', { bytes: fmtBytes(d.redundant.bytes) })}>
+          ${t('sel.redundant', { n: fmtNum(redundant) })}</span>`}
+        ${d.staged && d.staged.copies > 0 && html`<span class="badge badge-staged" data-testid="ex-sel-staged">${t('sel.stagedCopies', { n: fmtNum(d.staged.copies) })}</span>`}
+        ${d.gone > 0 && html`<span class="muted" data-testid="ex-sel-gone">${t('sel.gone', { n: fmtNum(d.gone) })}</span>`}`}
+      ${bar.loading && !d && html`<span class="spinner" aria-hidden="true"></span>`}
+    </div>
+    ${err && html`<p class="sel-error" role="alert" data-testid="ex-sel-error"><${Icon} name="alert" size=${14} /> ${errorText(err)}
+      ${err.code === 'SELECTION_CHANGED' && err.params && html` <button class="link" data-testid="ex-sel-update"
+        onClick=${() => onUseCurrent(err.params.total)}>${t('sel.useCurrent', { n: fmtNum(err.params.total) })}</button>`}</p>`}
+    <div class="sel-actions">
+      <button class="btn btn-primary btn-small" data-testid="ex-sel-gather" disabled=${!!err || (!d && bar.loading)} onClick=${onGather}>
+        <${Icon} name="folder" size=${14} /> ${t('sel.gather')}</button>
+      <button class="btn btn-small" data-testid="ex-sel-dedupe" disabled=${!!err || !d || redundant === 0}
+        title=${d && redundant === 0 ? t('sel.noDuplicates') : undefined} onClick=${onDedupe}>
+        <${Icon} name="copy" size=${14} /> ${t('sel.dedupe')}</button>
+      <button class="btn btn-small" data-testid="ex-sel-clear" onClick=${onClear}>${t('sel.clear')}</button>
+    </div>
   </div>`;
 }
 
@@ -136,6 +178,21 @@ export function Explore({ params }) {
   const parsed = useMemo(() => parseQuery(text, names), [text, names]);
   const sendKey = JSON.stringify([parsed.params, sort]);
 
+  // The selection belongs to the query (not to the sort): kept per query for the visit, so Back finds it again.
+  const queryKey = JSON.stringify(parsed.params);
+  const selRef = useRef(null);
+  const selKey = useRef(queryKey);
+  if (selRef.current === null) selRef.current = recall(queryKey, text.trim(), parsed.params);
+  const [, setRev] = useState(0);
+  const [cleared, setCleared] = useState(false);
+  const [limitNote, setLimitNote] = useState(false);
+  const [bar, setBar] = useState({ loading: false, error: null, data: null });
+  const [gathering, setGathering] = useState(false);
+  const barSeq = useRef(0);
+  const sel = selRef.current;
+  const draftId = ctx.draft ? ctx.draft.id : undefined;
+  const draftVersion = ctx.draft ? ctx.draft.version : undefined;
+
   // Back / Forward / a link from another view: the address bar is the source of truth for the text.
   useEffect(() => {
     if (urlQ !== written.current.q) { written.current.q = urlQ; setText(urlQ); }
@@ -145,6 +202,52 @@ export function Explore({ params }) {
   useEffect(() => {
     if (pending.exploreFocus && input.current) { pending.exploreFocus = false; input.current.focus(); input.current.select(); }
   }, []);
+
+  /** Change the selection through `fn` (which returns '' or the refusal); the bar asks the server for the new numbers. */
+  const mutate = (fn) => {
+    const next = selRef.current.clone();
+    if (!next.text) next.text = text.trim();
+    const refusal = fn(next);
+    setLimitNote(!!refusal);
+    if (refusal) return;
+    selRef.current = next;
+    remember(selKey.current, next);
+    if (!next.empty) setCleared(false);
+    setRev((x) => x + 1);
+  };
+
+  // A new query: the selection of the old one is kept for when it comes back, the new query starts with its own.
+  useEffect(() => {
+    if (selKey.current === queryKey) return;
+    const old = selRef.current;
+    remember(selKey.current, old);
+    const next = recall(queryKey, text.trim(), parsed.params);
+    selKey.current = queryKey;
+    selRef.current = next;
+    setLimitNote(false);
+    setCleared(!old.empty && next.empty);
+    if (!next.empty) setCleared(false);
+    setRev((x) => x + 1);
+  }, [queryKey]);
+  useEffect(() => () => remember(selKey.current, selRef.current), []);
+
+  // The bar's numbers come from the server (debounced after each change); an answer to an older selection is dropped.
+  const signature = sel.signature;
+  useEffect(() => {
+    barSeq.current += 1;
+    const mine = barSeq.current;
+    if (selRef.current.empty) { setBar({ loading: false, error: null, data: null }); return undefined; }
+    setBar((b) => ({ ...b, loading: true, error: null }));
+    const timer = setTimeout(async () => {
+      try {
+        const data = await api.selection({ selection: selRef.current.body(), draft: draftId });
+        if (mine === barSeq.current) setBar({ loading: false, error: null, data });
+      } catch (e) {
+        if (mine === barSeq.current) setBar({ loading: false, error: e, data: null });
+      }
+    }, DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+  }, [signature, draftId, draftVersion]);
 
   /** Edit the query from a control (facet, chip, reset, Enter): a new history entry, so Back undoes it. */
   const commit = (next) => {
@@ -157,7 +260,7 @@ export function Explore({ params }) {
     const id = (reqId.current += 1);
     if (offset) setMore(true); else setState((s) => ({ ...s, loading: true, error: '' }));
     try {
-      const data = await api.explore({ ...parsed.params, sort: sort || undefined, limit: PAGE, offset });
+      const data = await api.explore({ ...parsed.params, sort: sort || undefined, limit: PAGE, offset, draft: draftId });
       if (id !== reqId.current) return;  // a newer request was sent meanwhile: this answer is stale
       setState((s) => ({ loading: false, error: '', data, results: offset ? [...s.results, ...data.results] : data.results }));
     } catch (e) {
@@ -175,6 +278,20 @@ export function Explore({ params }) {
     const timer = setTimeout(() => load(0), delay);
     return () => clearTimeout(timer);
   }, [sendKey]);
+
+  // The draft changed (a gather, an undo, a drag elsewhere): the "staged" marks are read again for the rows on show.
+  const draftSeen = useRef(draftVersion);
+  useEffect(() => {
+    if (draftSeen.current === draftVersion) return;
+    draftSeen.current = draftVersion;
+    if (draftId === undefined || state.results.length === 0) return;
+    const id = reqId.current;
+    const limit = Math.min(200, Math.ceil(state.results.length / PAGE) * PAGE);
+    api.explore({ ...parsed.params, sort: sort || undefined, limit, offset: 0, draft: draftId }).then((fresh) => {
+      if (id !== reqId.current) return;
+      setState((s) => ({ ...s, data: fresh, results: [...fresh.results, ...s.results.slice(fresh.results.length)] }));
+    }, () => { /* the marks stay as they were */ });
+  }, [draftVersion]);
 
   // The address bar follows the text (replacing the entry: Back should leave the view, not undo each letter).
   useEffect(() => {
@@ -221,6 +338,15 @@ export function Explore({ params }) {
       ctx.toast('error', errorText(e));
     }
   };
+
+  const keysOnPage = state.results.map((r) => r.key);
+  const pickedOnPage = keysOnPage.filter((k) => sel.has(k)).length;
+  const allPicked = keysOnPage.length > 0 && pickedOnPage === keysOnPage.length;
+  const pick = (key, on) => mutate((s) => s.toggle(key, on));
+  const pickPage = (on) => mutate((s) => { if (on) return s.selectPage(keysOnPage); s.deselectPage(keysOnPage); return ''; });
+  const pickAll = () => mutate((s) => { s.selectAllMatching(parsed.params, total, text.trim()); return ''; });
+  const clearSelection = () => { setCleared(false); mutate((s) => { s.clear(); return ''; }); };
+  const cleanUp = () => ctx.nav(plansHash('/new/dedupe', sel.toDedupeParams()));
 
   const order = (list) => [...list].sort((a, b) => names.indexOf(a.name) - names.indexOf(b.name));
 
@@ -281,23 +407,39 @@ export function Explore({ params }) {
             ${SORTS.map((s) => html`<option value=${s}>${t(`ex.sort.${s}`)}</option>`)}
           </select>
         </div>
+        ${cleared && html`<p class="sel-note" role="status" data-testid="ex-sel-cleared"><${Icon} name="info" size=${14} /> ${t('sel.cleared')}
+          <button class="icon-btn" aria-label=${t('common.close')} onClick=${() => setCleared(false)}><${Icon} name="x" size=${12} /></button></p>`}
+        ${limitNote && html`<p class="sel-note warn" role="alert" data-testid="ex-sel-limit"><${Icon} name="alert" size=${14} /> ${t('sel.limit', { n: fmtNum(PICK_LIMIT) })}
+          ${sel.mode === 'keys' && total > 0 && html`<button class="link" data-testid="ex-limit-all-matching" onClick=${pickAll}>${t('sel.allMatching', { n: fmtNum(total) })}</button>`}</p>`}
+        ${shown > 0 && allPicked && sel.mode === 'keys' && total > 0 && html`<p class="sel-note" data-testid="ex-select-all-line">
+          ${t('sel.pageAll', { n: fmtNum(shown) })}
+          <button class="link" data-testid="ex-select-all-matching" onClick=${pickAll}>${t('sel.allMatching', { n: fmtNum(total) })}</button></p>`}
+        ${sel.mode === 'query' && !sel.empty && html`<p class="sel-note" data-testid="ex-select-all-line">
+          ${t('sel.allPicked', { n: fmtNum(sel.count) })}${sel.except.size > 0 && ` ${t('sel.excluded', { n: fmtNum(sel.except.size) })}`}</p>`}
         ${data && data.truncated && html`<p class="ex-truncated" role="status" data-testid="ex-truncated"><${Icon} name="alert" size=${14} /> ${t('ex.truncated')}</p>`}
         ${state.error && html`<p class="view-error" role="alert" data-testid="ex-error">${errorText(state.error)}</p>`}
         <div class="ex-table" role="table" aria-label=${t('ex.results')} style=${{ '--presence': remotes.length }}>
           <div class="ex-head" role="row">
+            <span role="columnheader" class="ex-pick"><input type="checkbox" data-testid="ex-select-page" checked=${allPicked}
+              ref=${(el) => { if (el) el.indeterminate = pickedOnPage > 0 && !allPicked; }} disabled=${keysOnPage.length === 0}
+              aria-label=${t('sel.pickPage')} title=${t('sel.pickPage')} onChange=${(e) => pickPage(e.target.checked)} /></span>
             <span role="columnheader">${t('ex.col.name')}</span>
             <${PresenceHeads} remotes=${remotes} />
             <span role="columnheader" class="num">${t('ex.col.size')}</span>
             <span role="columnheader">${t('ex.col.modified')}</span>
           </div>
-          ${state.results.map((r) => html`<${ResultRow} key=${r.key} r=${r} remotes=${remotes} open=${!!open[r.key]}
+          ${state.results.map((r) => html`<${ResultRow} key=${r.key} r=${r} remotes=${remotes} open=${!!open[r.key]} selected=${sel.has(r.key)} onSelect=${pick}
             onToggle=${() => setOpen((o) => ({ ...o, [r.key]: !o[r.key] }))} onReveal=${reveal} onCompare=${compare} onDedupe=${dedupe} onRules=${rulesFor} />`)}
         </div>
         ${!state.loading && !state.error && data && shown === 0 && html`<p class="empty-hint" data-testid="ex-none">${t('ex.none')}</p>`}
         ${data && shown < total && html`<div class="ex-more"><button class="btn" data-testid="ex-load-more" disabled=${more}
           onClick=${() => load(shown)}>${more ? t('common.loading') : t('ex.loadMore')}</button></div>`}
+        ${!sel.empty && html`<${SelectionBar} bar=${bar} remotes=${remotes} count=${sel.count} onGather=${() => setGathering(true)}
+          onDedupe=${cleanUp} onClear=${clearSelection} onUseCurrent=${(n) => mutate((s) => { s.useCurrent(n); return ''; })} />`}
       </section>
     </div>
     ${help && html`<${QueryHelp} onClose=${() => setHelp(false)} />`}
+    ${gathering && html`<${GatherDialog} getSelection=${() => selRef.current.body()} count=${bar.data ? bar.data.total : sel.count}
+      onClose=${() => setGathering(false)} />`}
   </main>`;
 }
